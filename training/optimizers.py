@@ -24,8 +24,15 @@ OPTIMIZERS: dict[str, Callable[[float], optax.GradientTransformation]] = {
     "muon": optax_contrib.muon,
 }
 
+# Optimizers whose factory accepts a `weight_decay` kwarg.
+WEIGHT_DECAY_OPTIMIZERS = frozenset({"adamw", "muon"})
 
-def build_optimizer(name: str, learning_rate: float) -> optax.GradientTransformation:
+
+def build_optimizer(name: str, learning_rate: float, weight_decay: float = 0.0) -> optax.GradientTransformation:
     if name not in OPTIMIZERS:
         raise ValueError(f"Unknown optimizer {name!r}, expected one of {sorted(OPTIMIZERS)}")
+    if name in WEIGHT_DECAY_OPTIMIZERS:
+        return OPTIMIZERS[name](learning_rate, weight_decay=weight_decay)
+    if weight_decay != 0.0:
+        raise ValueError(f"optimizer {name!r} does not support weight_decay, expected one of {sorted(WEIGHT_DECAY_OPTIMIZERS)}")
     return OPTIMIZERS[name](learning_rate)

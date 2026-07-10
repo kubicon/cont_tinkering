@@ -23,6 +23,7 @@ optimizer:
   learning_rate: 0.001
   max_grad_norm: 0.5
   optimizer: adam
+  weight_decay: 0.01  # only used by "adamw" and "muon"
 
 ppo:
   clip_eps: 0.1

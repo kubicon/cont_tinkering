@@ -31,7 +31,7 @@ LossFn = Callable[..., tuple[chex.Array, dict[str, chex.Array]]]
 def create_train_state(network: nn.Module, params, hyperparams: PPOHyperparams) -> TrainState:
     tx = optax.chain(
         optax.clip_by_global_norm(hyperparams.max_grad_norm),
-        build_optimizer(hyperparams.optimizer, hyperparams.learning_rate),
+        build_optimizer(hyperparams.optimizer, hyperparams.learning_rate, hyperparams.weight_decay),
     )
     return TrainState.create(apply_fn=network.apply, params=params, tx=tx)
 

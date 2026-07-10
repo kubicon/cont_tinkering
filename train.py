@@ -54,6 +54,7 @@ def build_hyperparams(game: ZeroSumGame, player: int, config: RunConfig) -> Mixt
         learning_rate=optimizer.learning_rate,
         max_grad_norm=optimizer.max_grad_norm,
         optimizer=optimizer.optimizer,
+        weight_decay=optimizer.weight_decay,
         clip_eps=ppo.clip_eps,
         value_coef=ppo.value_coef,
         num_envs=ppo.batch_size,

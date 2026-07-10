@@ -31,6 +31,7 @@ class OptimizerConfig:
     learning_rate: float = 1e-3
     max_grad_norm: float = 0.5
     optimizer: str = "adam"
+    weight_decay: float = 0.0  # only supported by "adamw" and "muon"; see `training.optimizers.WEIGHT_DECAY_OPTIMIZERS`
 
 
 @dataclasses.dataclass

@@ -24,6 +24,7 @@ class PPOHyperparams:
     learning_rate: float = 3e-4
     max_grad_norm: float = 0.5
     optimizer: str = "adam"  # one of `training.optimizers.OPTIMIZERS`
+    weight_decay: float = 0.0  # only optimizers in `training.optimizers.WEIGHT_DECAY_OPTIMIZERS` support this
 
     # PPO.
     clip_eps: float = 0.2
