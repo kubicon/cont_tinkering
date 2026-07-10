@@ -10,6 +10,7 @@ though nothing here enforces that pairing.
 
 from __future__ import annotations
 
+import warnings
 from typing import Callable
 
 import optax
@@ -34,5 +35,7 @@ def build_optimizer(name: str, learning_rate: float, weight_decay: float = 0.0) 
     if name in WEIGHT_DECAY_OPTIMIZERS:
         return OPTIMIZERS[name](learning_rate, weight_decay=weight_decay)
     if weight_decay != 0.0:
-        raise ValueError(f"optimizer {name!r} does not support weight_decay, expected one of {sorted(WEIGHT_DECAY_OPTIMIZERS)}")
+        warnings.warn(
+            f"optimizer {name!r} does not support weight_decay (only {sorted(WEIGHT_DECAY_OPTIMIZERS)} do); ignoring it"
+        )
     return OPTIMIZERS[name](learning_rate)
