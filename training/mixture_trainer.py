@@ -36,11 +36,13 @@ EXPLOITABILITY_SAMPLES = 512
 
 
 def _strategy_str(network: MixtureActorCritic, params, obs: chex.Array) -> str:
-    """The full mixture strategy: each component's weight and mean action."""
-    logits, means, _, _ = network.apply(params, obs)
+    """The full mixture strategy: each component's weight, mean action, and action std."""
+    logits, means, log_stds, _ = network.apply(params, obs)
     probs = jax.nn.softmax(logits)
+    stds = jnp.exp(log_stds)
     components = ", ".join(
-        f"{float(p):.2f}x{tuple(round(float(x), 3) for x in mean)}" for p, mean in zip(probs, means)
+        f"{float(p):.2f}x{tuple(round(float(x), 3) for x in mean)}±{tuple(round(float(s), 3) for s in std)}"
+        for p, mean, std in zip(probs, means, stds)
     )
     return components
 
@@ -213,6 +215,10 @@ class MixturePPOTrainer:
             obs = self.game.observation(self.perspective, jax.random.PRNGKey(0))
             opponent_sample = jnp.squeeze(self.opponent_action_fn(jax.random.PRNGKey(0), 1), axis=0)
             print(f"  player {self.perspective} strategy: {_strategy_str(self.network, self.state.params, obs)}")
+            print(
+                f"  player {self.perspective} target strategy: "
+                f"{_strategy_str(self.network, self.state.target_params, obs)}"
+            )
             print(f"  opponent sample: {tuple(round(float(x), 3) for x in opponent_sample)}")
 
             if checkpoint_dir is not None:
@@ -388,6 +394,8 @@ class MixtureSelfPlayPPOTrainer:
             obs_2 = self.game.observation(1, jax.random.PRNGKey(0))
             print(f"  p1 strategy: {_strategy_str(self.network_1, self.state_1.params, obs_1)}")
             print(f"  p2 strategy: {_strategy_str(self.network_2, self.state_2.params, obs_2)}")
+            print(f"  p1 target strategy: {_strategy_str(self.network_1, self.state_1.target_params, obs_1)}")
+            print(f"  p2 target strategy: {_strategy_str(self.network_2, self.state_2.target_params, obs_2)}")
 
             if checkpoint_dir is not None:
                 self.save(checkpoint_dir, chunk + 1)
