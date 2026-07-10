@@ -1,0 +1,8 @@
+game:
+  name: multi_point
+  peaks: [0.0, 1.0, 2.0]
+  width: 0.1
+  coupling: 1.0
+
+train:
+  mode: self_play

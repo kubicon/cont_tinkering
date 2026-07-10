@@ -1,0 +1,7 @@
+game:
+  name: matching_pennies
+
+train:
+  mode: self_play
+  steps: 20
+  epochs: 100

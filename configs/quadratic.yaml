@@ -1,0 +1,16 @@
+game:
+  name: quadratic
+  dim: 2
+  coupling: 0.1
+  bound: 3.0
+
+network:
+  num_components: 3
+
+ppo:
+  target_tau: 0.01
+  magnet_interval: 200
+
+train:
+  mode: fixed_opponent
+  opponent: random

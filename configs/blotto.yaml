@@ -1,0 +1,7 @@
+game:
+  name: blotto
+  fronts: 5
+
+train:
+  mode: self_play
+  checkpoint_dir: checkpoints/blotto

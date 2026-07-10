@@ -1,0 +1,54 @@
+sweep:
+  cartesian:
+    optimizer.learning_rate: [0.001, 0.0003]
+    network.num_components: [2, 3]
+  zip:
+    - ppo.category_entropy_coef: [0.1, 0.05, 0.0]
+      ppo.gaussian_entropy_coef: [0.1, 0.05, 0.0]
+
+game:
+  name: multi_point
+  peaks: [0.0, 1.0, 2.0]
+  weights: null       # null -> uniform over peaks
+  width: 0.1
+  coupling: 1.0
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 2
+
+optimizer:
+  learning_rate: 0.001
+  max_grad_norm: 0.5
+  optimizer: adam
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 256
+  ppo_epochs: 2
+
+  # Target/magnet parameter tracking.
+  target_tau: 0.001
+  magnet_interval: 500
+
+  # Entropy bonus, split per head.
+  category_entropy_coef: 0.1
+  gaussian_entropy_coef: 0.1
+
+  # KL regularization, split per head (0 disables a term).
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  mode: self_play    # "self_play" or "fixed_opponent"
+  perspective: 0      # fixed_opponent: which player trains
+  opponent: random     # fixed_opponent: "random" or "static"
+  steps: 5
+  epochs: 20
+  checkpoint_dir: sweeps/multi_point
+  seed: 0
