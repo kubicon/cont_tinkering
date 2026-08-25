@@ -1,0 +1,1253 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage{enumitem}
+\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue]{hyperref}
+
+% Long tags for the class conditions: a plain itemize sets \item[...] labels
+% right-aligned in a fixed-width box, so anything longer than \labelwidth runs
+% off the left margin. `style=unboxed' lets the tag flow into the body instead.
+\newlist{conditions}{description}{1}
+\setlist[conditions]{style=unboxed, leftmargin=0pt, labelsep=0.35em,
+                     itemsep=5pt, parsep=2pt, font=\normalfont}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{assumption}{Assumption}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{example}{Example}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\cA}{\mathcal{A}}
+\newcommand{\cB}{\mathcal{B}}
+\newcommand{\cP}{\mathcal{P}}
+\newcommand{\cN}{\mathcal{N}}
+\newcommand{\ip}[2]{\left\langle #1, #2 \right\rangle}
+\newcommand{\KL}{\mathrm{KL}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator{\supp}{supp}
+\DeclareMathOperator{\conv}{conv}
+
+\title{A Game Class for Convergence of Magnetic Mirror Descent\\
+on Gaussian-Mixture Policies}
+\author{\texttt{cont\_tinkering} / \texttt{theory2}}
+\date{July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We define a class of continuous-action two-player zero-sum games on which
+Magnetic Mirror Descent (MMD) with a $K$-component Gaussian-mixture policy is
+expected to converge to a Nash equilibrium, under the standing assumptions that
+the equilibrium has finite support of size $M$ and that $K \ge M$. The class is
+built from a single observation: with a mixture policy, the categorical head
+plays a finite matrix game \emph{exactly}, and tabular MMD solves finite matrix
+games globally; therefore every obstruction to convergence lives in the
+\emph{mean} dynamics, which are natural-gradient ascent on a smoothed effective
+landscape. The class accordingly imposes one condition --- a uniform
+one-point-attraction (star-concavity) condition on the family of smoothed,
+magnet-regularised effective landscapes, uniformly over opponent policies and
+over the admissible range of component scales --- together with capacity,
+identifiability and step-size conditions. This one condition subsumes the three
+empirically separate failure edges of the previous theory (decoy capture,
+coupling ejection, dead-zone freeze), is stated in a way that is dimension-free
+and asymmetric in the two players, and is sharp in the sense that its qualitative
+failure produces an exponentially stable non-Nash attractor with an open basin.
+The conditions are imposed on scales bounded below by the implementation's
+variance floor, which is what allows the payoff itself to be merely bounded and
+measurable and what makes the class tolerant of landscape structure finer than
+the floor; exactness is recovered separately, as a corollary in which the floor
+is released and the scale dynamics drive the representation bias to zero at rate
+$\Theta(1/t)$ --- a prediction confirmed numerically here, together with a closed
+form for how the Gaussian magnet rescales it. Section~\ref{sec:suff} gives the argument for why the class suffices,
+in the form of a three-block input-to-state-stability decomposition intended as
+the skeleton of a future proof; Section~\ref{sec:check} gives checkable
+sufficient conditions (finite-rank couplings, Gaussian-bump landscapes, separable
+multidimensional games).
+\end{abstract}
+
+\tableofcontents
+
+\section{Setting}
+
+\subsection{Game}
+
+Player $0$ maximises and player $1$ minimises a payoff
+$u : \cA \times \cB \to \R$, where $\cA \subset \R^{n_0}$ and
+$\cB \subset \R^{n_1}$ are compact convex bodies and $u$ is \emph{bounded and
+measurable} (Remark~\ref{rem:reg} explains why nothing stronger is needed).
+\emph{No symmetry between the players is assumed}: the action sets,
+dimensions, landscapes, support sizes, component counts and all hyperparameters
+may differ. Mixed strategies are $\mu \in \cP(\cA)$, $\nu \in \cP(\cB)$ and
+$U(\mu,\nu) = \E_{\mu \otimes \nu} u$.
+
+The \emph{effective landscapes} are
+\begin{equation}\label{eq:eff}
+  Q_\nu(a) \coloneqq \int u(a,b)\,d\nu(b), \qquad
+  W_\mu(b) \coloneqq -\int u(a,b)\,d\mu(a),
+\end{equation}
+so both players \emph{maximise}: player $0$ maximises $\E_\mu Q_\nu$, player $1$
+maximises $\E_\nu W_\mu$. For a function $\Lambda$ on $\R^n$ and a scale vector
+$s \in \R^n_{>0}$ we write $\Lambda_s \coloneqq \Lambda * \cN(0, \operatorname{diag}(s^2))$.
+
+We fix a mixed Nash equilibrium $(\mu^\star,\nu^\star)$ and assume throughout ---
+this is a standing assumption, not something we derive --- that both equilibrium
+measures are \emph{purely atomic with finite support}:
+\begin{equation}\label{eq:finite}
+  \mu^\star = \sum_{j=1}^{M_0} w^\star_j\, \delta_{p_j},
+  \qquad
+  \nu^\star = \sum_{l=1}^{M_1} v^\star_l\, \delta_{r_l},
+  \qquad
+  w^\star \in \Delta_{M_0},\ v^\star \in \Delta_{M_1},\ w^\star, v^\star > 0 .
+\end{equation}
+\textbf{The points $p_1,\dots,p_{M_0} \in \cA$ and $r_1,\dots,r_{M_1} \in \cB$
+are called the \emph{atoms}} of the equilibrium (the term is the measure-theoretic
+one: an atom of a measure is a point carrying strictly positive mass). They are
+distinct, $M_i$ denotes their number, and
+\[
+  \supp\mu^\star = \{\,p_j : j = 1,\dots,M_0\,\}, \qquad
+  \supp\nu^\star = \{\,r_l : l = 1,\dots,M_1\,\}
+\]
+--- throughout, $j$ indexes player $0$'s atoms and $l$ indexes player $1$'s, and
+both are bound indices ranging over the whole set. The two atom sets are
+unrelated: they live in different spaces and $M_0 \ne M_1$ is allowed. Finding the atoms --- their
+locations, via the component means --- is what the mean dynamics must do; finding
+their weights $w^\star, v^\star$ is what the categorical heads must do.
+
+\begin{remark}[The atoms are automatically maxima]\label{rem:support}
+By the support characterisation of a best response,
+$\supp\mu^\star \subseteq \argmax_{\cA} Q_{\nu^\star}$ and
+$\supp\nu^\star \subseteq \argmax_{\cB} W_{\mu^\star}$. So ``the equilibrium
+atoms sit at maxima of the effective landscape'' is a theorem, not a hypothesis.
+Everything the class must assume about the atoms is (i) nondegeneracy of those
+maxima and (ii) that the landscape has \emph{no other} local maxima --- see
+Definition~\ref{def:class}(C) and Proposition~\ref{prop:sharp}.
+\end{remark}
+
+\subsection{Policy and update}
+
+Player $i$ uses a $K_i$-component diagonal-Gaussian mixture
+\begin{equation}
+  \pi_{\theta_i} = \sum_{k=1}^{K_i} w^{(i)}_k\,
+  \cN\!\big(m^{(i)}_k, \operatorname{diag}(\sigma^{(i)}_k)^2\big),
+  \qquad w^{(i)} = \mathrm{softmax}(\ell^{(i)}),
+\end{equation}
+with each $\sigma^{(i)}_{k,d}$ clipped to a range
+$\Sigma_i \coloneqq [s^{\min}_i, s^{\max}_i]$ (both bounds exist in the
+implementation: \texttt{idealized\_mmd.py} clips $\log\sigma$ to
+$[\log 10^{-3}, \log 1]$). The update, per player, per step, with step size
+$\eta_i$, categorical magnet temperature $\tau_i^{\mathrm{cat}}$, Gaussian magnet
+temperature $\tau_i^{\mathrm{g}} \ge 0$, and magnet snapshot $\bar\theta_i$
+refreshed every $T$ steps, is
+\begin{align}
+  \ell^{(i),+} &= \frac{\eta_i q^{(i)} + \eta_i \tau^{\mathrm{cat}}_i
+    \log \bar w^{(i)} + \log w^{(i)}}{1 + \eta_i \tau^{\mathrm{cat}}_i},
+  \label{eq:cat}\\
+  m^{(i),+}_k &= m^{(i)}_k + \eta_i (\sigma^{(i)}_k)^2 \odot
+    \nabla_{m_k} \Phi_i, \qquad
+  \rho^{(i),+}_k = \rho^{(i)}_k + \tfrac{\eta_i}{2} \nabla_{\rho_k} \Phi_i,
+  \label{eq:gauss}
+\end{align}
+where $\rho = \log\sigma$ and
+$\Phi_i = (\pm)U - \tau^{\mathrm{g}}_i \KL(\pi_{\theta_i} \| \pi_{\bar\theta_i})$.
+
+The floor $s^{\min}_i > 0$ is \emph{strict} and is used throughout. It is not a
+numerical detail: it is the hypothesis that makes the class both broad and
+checkable, as the next remark and Section~\ref{sec:floor} explain.
+
+\begin{remark}[Why bounded measurable suffices]\label{rem:reg}
+Every landscape the algorithm evaluates is smoothed at a scale bounded below by
+$s^{\min}_i > 0$. For bounded measurable $u$ and any $s \ge s^{\min}$,
+differentiating under the integral sign onto the Gaussian kernel gives
+\begin{equation}\label{eq:derivbound}
+  \big\|\nabla^k (Q_\nu)_s\big\|_\infty \;\le\;
+  C_k\, \|u\|_\infty \,/\, (s^{\min})^{k} \;<\; \infty
+  \qquad \text{for every } k,
+\end{equation}
+uniformly in $\nu$ and in $s \in \Sigma_0$. So $(Q_\nu)_s$ is $C^\infty$ with
+uniformly bounded derivatives no matter how irregular $u$ is, and every
+hypothesis of Definition~\ref{def:class} --- all of which are stated on smoothed
+objects --- has finite constants. This admits payoffs that are not $C^2$ and not
+even continuous: $|a-b|$, $\min(a,b)$, hard-threshold Blotto payoffs, indicators.
+Smoothness of $u$ is needed at exactly one point in the development, the
+\emph{exponent} of the representation bias, and only near the equilibrium atoms;
+it is isolated as condition (B) below. Note the price of dropping the floor:
+\eqref{eq:derivbound} degrades as $s^{\min} \to 0$, and the hypotheses would have
+to be imposed on the raw payoff.
+\end{remark}
+
+\subsection{The structural fact the whole class is built on}
+\label{sec:structure}
+
+\begin{lemma}[Exact decomposition of the update]\label{lem:decomp}
+For any bounded measurable $u$, define the \emph{component matrix}
+\begin{equation}\label{eq:Abar}
+  \bar A_{kl}(m,\sigma) \coloneqq
+  \E_{a \sim \cN(m^{(0)}_k, \sigma^{(0)2}_k),\; b \sim \cN(m^{(1)}_l, \sigma^{(1)2}_l)}
+  \big[u(a,b)\big], \qquad
+  \bar A \in \R^{K_0 \times K_1}.
+\end{equation}
+Then
+\begin{equation}
+  U(\pi_{\theta_0}, \pi_{\theta_1}) = (w^{(0)})^\top \bar A\, w^{(1)}
+  = \sum_k w^{(0)}_k\, (Q_{\pi_{\theta_1}})_{\sigma_k}\!\big(m^{(0)}_k\big),
+\end{equation}
+and consequently
+\begin{enumerate}
+\item[(i)] $q^{(0)} = \bar A w^{(1)}$ and $q^{(1)} = -\bar A^\top w^{(0)}$, so
+  \eqref{eq:cat} is \emph{verbatim} tabular MMD on the finite zero-sum matrix
+  game $\bar A$;
+\item[(ii)] the mean update \eqref{eq:gauss} is
+  $m^{(0),+}_k = m^{(0)}_k + \eta_0\, \sigma_k^2 w^{(0)}_k
+   \nabla (Q_{\pi_{\theta_1}})_{\sigma_k}(m^{(0)}_k) + (\text{magnet term})$,
+  i.e.\ preconditioned gradient ascent on the smoothed effective landscape at the
+  component's own scale.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+Immediate from Fubini and the definition of the mixture; (i) is the observation
+that $Q$ is linear in $\nu$ and the component expectations are exactly the matrix
+entries; (ii) is $\nabla_{m_k} U = w_k \nabla (Q_\nu)_{\sigma_k}(m_k)$ together
+with the per-component inverse Fisher factor $\sigma_k^2$.
+\end{proof}
+
+Lemma~\ref{lem:decomp}(i) is the decisive one: \textbf{the categorical heads
+solve a finite matrix game, and tabular MMD on a finite zero-sum matrix game
+converges last-iterate from any initialisation} (the lifted game is bilinear,
+hence monotone; Sokota et al.\ 2023). There is no basin structure and no
+initialisation dependence in that block. Therefore:
+
+\begin{center}
+\emph{Every obstruction to global convergence of mixture-MMD lives in the mean
+dynamics of Lemma~\ref{lem:decomp}(ii).}
+\end{center}
+
+The class below consists of exactly the hypotheses needed to make the mean
+dynamics find the atoms, plus the standard bookkeeping (capacity,
+identifiability, step size).
+
+\begin{remark}[The $w_k$ factor is an implementation artifact]\label{rem:wk}
+The factor $w_k$ in Lemma~\ref{lem:decomp}(ii) is \emph{not} part of the natural
+gradient of the mixture policy. The Fisher metric of the hierarchical law
+$p(k,a) = w_k \cN(a \mid m_k, \sigma_k^2)$ has $m_k$-block $w_k/\sigma_k^2$, so
+the exact natural gradient is $\sigma_k^2 \nabla (Q_\nu)_{\sigma_k}(m_k)$, with no
+$w_k$. The implemented preconditioner $\sigma_k^2$ is the inverse Fisher metric
+of the \emph{conditional} law only. The discrepancy is the entire
+weight-starvation freeze: a component losing weight also loses mobility and
+freezes at a non-atom. We carry hypothesis~(W) of Definition~\ref{def:class} to handle it,
+and note that the hypothesis is vacuous if the preconditioner is corrected to
+$\sigma_k^2/w_k$.
+\end{remark}
+
+\section{The class}
+
+\subsection{Auxiliary objects}
+
+\paragraph{Reachable policy set.} Let $\cN_1 \subseteq \cP(\cB)$ be a set of
+opponent policies containing $\nu^\star$, the initial policy, and every policy
+the run visits. Any forward-invariant superset works; the safe default is
+$\cN_1 = \cP(\cB)$, and under a finite-rank coupling the quantifier
+``for all $\nu \in \cN_1$'' collapses to a quantifier over a compact convex
+subset of $\R^m$ (Section~\ref{sec:check}). Define $\cN_0 \subseteq \cP(\cA)$
+symmetrically.
+
+\paragraph{Regularised landscape.} For a magnet centre $\bar a$ and Gaussian
+magnet temperature $\tau^{\mathrm g}_0$, put
+\begin{equation}\label{eq:reg}
+  Q^{\mathrm{reg}}_{\nu, s, \bar a}(a) \coloneqq (Q_\nu)_s(a)
+  \;-\; \frac{\tau^{\mathrm g}_0}{2}\,\big\|a - \bar a\big\|^2_{\bar\sigma^{-2}} ,
+\end{equation}
+the quadratic term being the mean-dependent part of
+$\KL\big(\cN(a,\sigma^2)\,\|\,\cN(\bar a,\bar\sigma^2)\big)$. With
+$\tau^{\mathrm g}_0 = 0$ this is just the smoothed effective landscape;
+allowing $\tau^{\mathrm g}_0 > 0$ is what lets the class cover games whose
+landscape supplies no curvature at all (Remark~\ref{rem:flat}).
+
+\paragraph{Star-concavity modulus.} A continuous $\rho : [0,\infty) \to
+[0,\infty)$ with $\rho(0) = 0$ and $\rho(r) > 0$ for $r > 0$.
+
+\subsection{Definition}
+
+\begin{definition}[Uniformly attracting game, $\mathfrak{G}(M,\Sigma,\cN,\rho)$]
+\label{def:class}
+The game $u$ belongs to the class if the following hold. We state them for
+player $0$; player $1$'s conditions are the same statements applied to $W_\mu$,
+$\cB$, $M_1$, $\Sigma_1$, $\cN_0$, with its own constants.
+
+\begin{conditions}
+\item[\textbf{(C) Uniform attracting cell structure.}] There are open sets
+  $\cA_1,\dots,\cA_{M_0} \subset \cA$ with disjoint closures whose union has full
+  measure in $\cA$, and \emph{branch maps}
+  $\xi_j : \cN_1 \times \Sigma_0 \times \cA_j \to \cA_j$,
+  $(\nu, s, \bar a) \mapsto \xi_j(\nu,s,\bar a)$, such that for every
+  $\nu \in \cN_1$, every $s \in \Sigma_0^{n_0}$, every magnet centre
+  $\bar a \in \cA_j$ and every $a \in \cA_j$,
+  \begin{equation}\label{eq:star}
+    \big\langle \nabla Q^{\mathrm{reg}}_{\nu,s,\bar a}(a),\;
+      \xi_j - a \big\rangle \;\ge\; \rho\big(\|\xi_j - a\|\big)\,\|\xi_j - a\| .
+  \end{equation}
+  (Star-concavity, a.k.a.\ quasar-concavity, toward the branch point, uniformly
+  in the opponent, the scale and the magnet.) When $\tau^{\mathrm g}_0 = 0$ the
+  dependence on $\bar a$ is absent.
+\item[\textbf{(D) Branch regularity and small gain.}] Each $\xi_j$ is Lipschitz
+  in $(\nu, s, \bar a)$, with $\nu$ measured in a metric metrising weak
+  convergence on $\cP(\cB)$ --- i.e.\ the weak-$*$ topology
+  $\nu_k \to \nu \iff \int f \, d\nu_k \to \int f \, d\nu$ for all
+  $f \in C(\cB)$, which is metrizable because $\cB$ is compact metric (any
+  Lévy--Prokhorov or Wasserstein metric will do; the condition does not depend on
+  the choice) --- and the round-trip gain of the branch maps is a contraction:
+  \begin{equation}\label{eq:smallgain}
+    g_0 \cdot g_1 < 1, \qquad
+    g_0 \coloneqq \sup_j \operatorname{Lip}_\nu \xi_j, \quad
+    g_1 \coloneqq \sup_l \operatorname{Lip}_\mu \zeta_l ,
+  \end{equation}
+  where $\zeta_l$ are player $1$'s branch maps and $\operatorname{Lip}_\nu$ is
+  taken with respect to the displacement of the opponent's component means.
+\item[\textbf{(M) Modal match.}] $M_0 = |\supp \mu^\star|$ and, after
+  relabelling,
+  \begin{equation}
+    \xi_j\big(\nu^\star, s^{\min}_0, \cdot\big) = p_j + O\big((s^{\min}_0)^2\big)
+    \qquad \text{for each } j :
+  \end{equation}
+  the branch endpoints at equilibrium and at the \emph{floor} scale are the
+  equilibrium atoms, up to the smoothing displacement. (Anchoring at the floor
+  rather than at scale $0$ is forced by the fact that the run never reaches
+  scale $0$; the displacement is $O(s^2)$ under (B) and $O(s)$ without it.)
+\item[\textbf{(B) Atom regularity} --- \emph{for the bias exponent only}.]
+  $Q_{\nu^\star}$ is $C^2$ in a neighbourhood of each $p_j$, with
+  $\nabla^2 Q_{\nu^\star}(p_j) \prec 0$. This condition is used \emph{nowhere}
+  except to give the representation bias the exponent $2$ in
+  Theorem~\ref{thm:main}; dropping it costs an order in the floor and nothing
+  else (Remark~\ref{rem:biasexp}).
+\item[\textbf{(I) Nondegeneracy.}] The $M_0 \times M_1$ matrix game
+  $A_{jl} = u(p_j, r_l)$ --- the payoff table between the two players' atoms ---
+  has a \emph{nondegenerate} equilibrium: equivalently, its Nash equilibrium is
+  unique. Used only for well-posedness and to name the limit; see
+  Remark~\ref{rem:nondeg}, which shows the conclusion survives its failure with
+  ``a Nash of $A$'' in place of $(w^\star, v^\star)$.
+\item[\textbf{(K) Capacity and covering.}] $K_i \ge M_i$, and the initial
+  component means of player $i$ meet every cell: each $\cA_j$ contains at least
+  one $m^{(0)}_k(0)$, each $\cB_l$ at least one $m^{(1)}_k(0)$. Initial scales lie
+  in $\Sigma_i$.
+\item[\textbf{(S) Algorithmic caps.}] $\tau^{\mathrm{cat}}_i > 0$; the step sizes
+  $\eta_i$ are below the threshold set by the Lipschitz constant of the
+  component-matrix game and of $\nabla Q^{\mathrm{reg}}$ on the relevant sets.
+\item[\textbf{(W) Weight non-degeneracy.}] Along the trajectory,
+  at least one component in each cell keeps weight $\ge w_{\min} > 0$. (Vacuous
+  under the corrected preconditioner of Remark~\ref{rem:wk}; otherwise implied by
+  (I) plus a categorical entropy floor $\tau^{\mathrm{ent}} > 0$, which bounds
+  $w$ below by $\propto e^{-\mathrm{range}(q)/\tau^{\mathrm{ent}}}$.)
+\end{conditions}
+\end{definition}
+
+\begin{lemma}[Resolution at the floor; a design rule for $s^{\min}$]
+\label{lem:resolution}
+Definition~\ref{def:class} forces the equilibrium atoms to be resolvable at the
+bottom of the scale range: (C) provides $M_0$ cells with distinct branch points
+at every $s \in \Sigma_0$, in particular at $s^{\min}_0$, and (M) identifies
+those branch points with the atoms there. Hence
+$(Q_{\nu^\star})_{s^{\min}_0}$ has $M_0$ distinct local maxima. For a landscape
+of equal Gaussian bumps of width $\bar w_0$ this is the explicit inequality
+\begin{equation}\label{eq:resolution}
+  \sqrt{\bar w_0^2 + (s^{\min}_0)^2} \;<\; \tfrac12
+  \min_{j \ne j'} \|p_j - p_{j'}\| .
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+The first statement is the implication just given. For \eqref{eq:resolution}:
+a bump of width $\bar w$ smoothed at scale $s$ has width
+$W = \sqrt{\bar w^2 + s^2}$, and the sum of two equal Gaussians of width $W$ at
+separation $d$ is bimodal if and only if $d > 2W$ --- the classical
+separation threshold for an equal-weight, equal-variance Gaussian mixture.
+Applying it to the closest pair of atoms gives \eqref{eq:resolution}.
+\end{proof}
+
+\begin{remark}[How to read Lemma~\ref{lem:resolution}]\label{rem:resolution}
+It is stated separately not because it is an independent hypothesis --- it is
+not, it is a consequence of (C) and (M) --- but because of its \emph{role}. Every
+condition in Definition~\ref{def:class} constrains the game given the scale
+range; read in the other direction, \eqref{eq:resolution} constrains a
+\emph{hyperparameter} given the game: \emph{do not choose a floor larger than
+half the atom spacing}. Definition~\ref{def:class} encodes that silently, and it
+is the only part of the class with a one-line closed-form check.
+
+Note also which term binds. For the codebase's two-peak game
+($\bar w_0 = 0.1$, $s^{\min}_0 = 10^{-3}$, $d = 1$) the left side is
+$\sqrt{10^{-2} + 10^{-6}} = 0.1000005$ against $d/2 = 0.5$: the floor's
+contribution $10^{-6}$ is negligible beside the bump width $10^{-2}$. So in
+practice \eqref{eq:resolution} is a statement about the \emph{landscape} --- the
+peaks must be narrower than half their spacing, i.e.\ be visibly separate peaks
+at all --- and holds with a factor $5$ to spare. The floor becomes the binding
+term only when $s^{\min}$ is pushed up to the scale of the atom separation,
+which is what an annealing schedule that never anneals down would do.
+\end{remark}
+
+\subsection{Reading the definition}
+
+Condition (C) is the whole content; everything else is bookkeeping. Four
+comments on what it does and does not say.
+
+\begin{remark}[The target of (C) is an atom, not an equilibrium]
+\label{rem:atomnotnash}
+Since $M_0 > 1$, no single action is a Nash equilibrium, and \eqref{eq:star}
+never claims one is: its target $\xi_j$ is \emph{one atom} --- one of the $M_0$
+points the equilibrium mixes over --- not the equilibrium. The problem the class
+addresses splits in two, and (C) is responsible for only the first:
+\begin{center}
+\begin{tabular}{@{}l p{0.36\textwidth} p{0.34\textwidth}@{}}
+\hline
+& \emph{where are the atoms?} & \emph{how much mass on each?}\\
+\hline
+solved by & the Gaussian heads & the categorical heads\\
+mechanism & $M_i$ parallel single-target problems, one per cell, each governed
+  by \eqref{eq:star} & one finite matrix game $\bar A$, solved globally by
+  tabular MMD (Lemma~\ref{lem:decomp})\\
+needs & condition (C) & condition (I)\\
+\hline
+\end{tabular}
+\end{center}
+This is why (C) is imposed \emph{cellwise on a partition} rather than globally:
+the landscape has $M_0$ maxima, so no global star-concavity can hold, whereas on
+each cell there is a single target and the standard one-point machinery applies
+verbatim. The mixing is not a geometric phenomenon at all --- it is a property of
+the weights, and the weights solve an ordinary matrix game.
+
+The two halves meet at equilibrium in the following way. By
+Remark~\ref{rem:support} every atom attains $\max Q_{\nu^\star}$, so the $M_0$
+targets are \emph{tied}:
+$Q_{\nu^\star}(\xi_1) = \dots = Q_{\nu^\star}(\xi_{M_0}) = \max Q_{\nu^\star}$.
+Off equilibrium they are not tied; it is the \emph{opponent's} weights that tilt
+the landscape until they are --- the classical indifference condition of a mixed
+equilibrium. So each $\xi_j$ is a global maximiser at equilibrium, of a landscape
+the opponent has arranged to be flat-topped across all $M_0$ cells.
+
+This also locates \eqref{eq:star} against the literature it is borrowed from. As
+an inequality it is standard: \emph{quasar-convexity} (equivalently weak
+quasi-convexity) in nonconvex optimization, and \emph{variational stability} in
+learning-in-games. The optimization line is single-target, static and
+game-free --- we borrow the inequality and its Lyapunov argument, and apply them
+$M_i$ times to a landscape that moves. The game-theoretic line \emph{does} cover
+mixed equilibria, but only because there the strategy set is convex, so
+$\mu^\star$ is a single point of it; that is the measure-space picture, in which
+a one-point condition is immediately available and no partition is needed. The
+parametric update does not live in that space --- the mixture manifold is
+nonconvex and a component mean is a point of $\cA$, where no equilibrium
+lives --- and the cellwise form of (C) is exactly the repair: descend to the level
+at which the target \emph{is} single-valued, and recover the mixing from the
+categorical head.
+\end{remark}
+
+\begin{remark}[What (I) is and is not for]\label{rem:nondeg}
+Two clauses one might expect in (I) are free rather than assumed. That
+$(w^\star, v^\star)$ is a Nash of $A$ is automatic --- $(\mu^\star,\nu^\star)$ is a
+Nash of the continuous game, so in particular no reshuffling of mass among the
+atoms helps --- and that it is fully mixed is already declared in
+\eqref{eq:finite}, the atoms being the support. The whole content of (I) is
+therefore nondegeneracy, and it is worth separating what that buys.
+
+\emph{It is not needed for the conclusion.} Zero-sum equilibria are
+\emph{interchangeable}: the optimal-strategy sets are convex, any pair of
+optimal strategies is a Nash, and all have the same value. So converging to
+\emph{some} equilibrium of $A$ is, in exploitability, exactly as good as
+converging to a designated one; and Lemma~\ref{lem:weight} needs only
+monotonicity of the matrix game, which holds regardless of how many equilibria
+it has (the magnet's QRE path selects one). Dropping (I) weakens
+Theorem~\ref{thm:main} from ``converges to $(w^\star,v^\star)$'' to ``converges
+to a Nash of $A$'', which by interchangeability is the same statement about
+$\varepsilon$.
+
+\emph{It is needed for well-posedness in $s$.} The algorithm never faces $A$; it
+faces the smoothed component matrix $\bar A = A + O(s^2)$ of \eqref{eq:Abar},
+because a component is a Gaussian of width $s$ and not a point mass. If $A$'s
+equilibrium is nondegenerate --- an open condition --- then $\bar A$'s is unique too
+and lies $O(s^2)$ away, so the weights are continuous in the floor and the limit
+can be named. If instead $A$ carries a continuum of equilibria, an arbitrarily
+small perturbation can slide the solution to an extreme point of that continuum:
+the weights become $O(1)$-sensitive to the smoothing scale and no statement of
+the form ``the limit is near $w^\star$'' survives. \emph{(I) is a conditioning
+requirement, not a convergence requirement.}
+
+In the codebase's games it holds by construction rather than by luck: the
+$K-1$ moment features of \texttt{MultiPointGame} make $w \mapsto \sum_j w_j
+\varphi(p_j)$ injective on distributions over the peaks (a Vandermonde system in
+the normalised peak coordinates, nonsingular because the peaks are distinct), so
+exactly one weight vector matches the target moments --- see
+Proposition~\ref{prop:moments}.
+\end{remark}
+
+\begin{remark}[(C) is much weaker than concavity]
+Concavity of $(Q_\nu)_s$ on $\cA_j$ would be far too strong: a Gaussian bump
+$h e^{-x^2/2w^2}$ smoothed to width $W = \sqrt{w^2+s^2}$ is concave only on
+$|x| \le W$, yet mixture-MMD converges on the two-peak game from means far
+outside that radius. Condition~\eqref{eq:star} only asks that the gradient have a
+positive component \emph{toward} the branch point --- it permits arbitrarily flat
+regions (small $\rho$), inflection, and anisotropy. What it forbids is exactly
+(a) a second attractor inside the cell and (b) the gradient pointing away from
+$\xi_j$ anywhere in the cell, which also makes $\cA_j$ forward invariant.
+\end{remark}
+
+\begin{remark}[(C) is uniform in the opponent, and that is the point]
+Basins of a \emph{time-varying} flow are not forward invariant: a component in
+the right basin at time $t$ can be in the wrong one at $t+1$ because the opponent
+moved. So ``initialise each mean in the basin of its atom'' --- assumption A2 of
+the previous theory --- is not a closable hypothesis on its own.
+Condition~\eqref{eq:star} instead supplies a Lyapunov function
+$V(a) = \tfrac12\|a - \xi_j\|^2$ that is \emph{the same function for every
+opponent policy and every scale}, which is what makes the transport argument of
+Section~\ref{sec:suff} go through.
+\end{remark}
+
+\begin{remark}[Flat landscapes are covered]\label{rem:flat}
+If $u$ has no self-term ($u(a,b) = \ip{\varphi(a)}{C\psi(b)}$, the
+``pure-coupling'' games of \texttt{gaussian\_magnet/THEORY.md}), then at
+equilibrium $Q_{\nu^\star} \equiv \mathrm{const}$ and \eqref{eq:star} fails for
+$\tau^{\mathrm g}_0 = 0$. With $\tau^{\mathrm g}_0 > 0$ the regularised landscape
+\eqref{eq:reg} is strongly concave, \eqref{eq:star} holds with a single cell and
+$\rho(r) = (\tau^{\mathrm g}_0/\bar\sigma^2) r$, and the class applies. The
+conclusion then degrades in the expected way: the atoms are unidentified (any
+moment-matched configuration is a fixed point), so convergence must be read as
+convergence of the \emph{induced measure} and of exploitability, not of the
+parameters. This is the correct unification of the ``magnet redundant'' (curved)
+and ``magnet necessary'' (flat) regimes: they are the two extremes of a single
+condition on the regularised landscape, and the generic game --- curvature in
+some directions, flatness in others --- needs no separate treatment.
+\end{remark}
+
+\section{Why the class is the right one}
+
+\subsection{Sharpness: (C) cannot be dropped}
+
+\begin{proposition}[Spurious attractors are fatal]\label{prop:sharp}
+Suppose there are $\hat a \in \cA$, $\hat b \in \cB$ and scales
+$\hat s_0 \in \Sigma_0$, $\hat s_1 \in \Sigma_1$ such that, with
+$\hat\mu = \cN(\hat a, \hat s_0^2)$ and $\hat\nu = \cN(\hat b, \hat s_1^2)$,
+$\hat a$ is a nondegenerate local maximum of $(Q_{\hat\nu})_{\hat s_0}$ and
+$\hat b$ a nondegenerate local maximum of $(W_{\hat\mu})_{\hat s_1}$. Let
+$\hat z$ be the parameter configuration with all of player $0$'s means at
+$\hat a$, all of player $1$'s at $\hat b$, and scales at $\hat s_i$. Then
+$\hat z$ is a fixed point of \eqref{eq:cat}--\eqref{eq:gauss} with the magnet at
+itself, and it is locally exponentially stable --- \emph{regardless of whether it
+realises a Nash equilibrium}. Hence it has an open basin of initialisations from
+which mixture-MMD does not converge to Nash.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+Fixed point: all component $q$-values coincide (all components are identical), so
+\eqref{eq:cat} is stationary; the mean gradients vanish because $\hat a$, $\hat b$
+are critical points of the respective smoothed landscapes; the scale gradient is
+the one-signed quantity of Lemma~\ref{lem:scale} and is inactive at the floor.
+Stability: the own-parameter Hessian of each player is negative definite on the
+active face (nondegenerate maximum), and by the block-skew structure of zero-sum
+parametric games the symmetric part of the Jacobian of the pseudo-gradient field
+is block diagonal with these two blocks; a negative definite symmetric part
+remains Hurwitz after any positive-definite block-diagonal preconditioning,
+because $G(G^{-1}J) + (G^{-1}J)^\top G = J + J^\top \prec 0$ exhibits
+$V(z) = z^\top G z$ as a Lyapunov function. The magnet only adds
+$-\eta\tau I$, improving the margin.
+\end{proof}
+
+Proposition~\ref{prop:sharp} is why the class must forbid \emph{all} spurious
+local maxima of the effective landscape, not merely dominated ones. It also
+corrects a reading of the previous theory: assumption A1 there (``every spurious
+Gaussian bump is dominated by the atoms in both height and mass'') controls
+which branch is the \emph{global} maximum at each scale, but the mean dynamics
+perform local ascent and never compare global amplitudes. A dominated spurious
+bump still captures any component that enters its basin. Height-and-mass
+dominance is therefore neither necessary nor sufficient for convergence; it is a
+proxy for branch persistence along the particular symmetric broad initialisation
+used in those experiments.
+
+\subsection{The three empirical failure edges are one condition}
+
+The previous theory measured three independent-looking window edges. Under
+Definition~\ref{def:class} they are three ways for \eqref{eq:star} to fail:
+
+\begin{center}
+\begin{tabular}{@{}l p{0.30\textwidth} p{0.40\textwidth}@{}}
+\hline
+edge & previous reading & failure of \eqref{eq:star}\\
+\hline
+$s_{\mathrm{dom}}$ (decoy) & spurious mass overtakes at large $s$ &
+  $\xi_j(\nu,s)$ leaves $\cA_j$: wrong attractor\\
+$s_{\mathrm{ej}}$ (ejection) & coupling expels a component &
+  fails for some $\nu \in \cN_1$: opponent-dependent\\
+$s_{\mathrm{reach}}$ (dead zone) & gradient $\sim e^{-d^2/2s^2}$ &
+  \eqref{eq:star} \emph{holds}; $\rho$ is tiny --- a rate, not a failure\\
+\hline
+\end{tabular}
+\end{center}
+
+The demotion of $s_{\mathrm{reach}}$ from an assumption to a rate is substantive:
+it says the dead zone never breaks convergence asymptotically, it only makes it
+exponentially slow, which matches the observation that the boundary cases
+converge at $150$k steps and not at $40$k. Correspondingly the class does not
+assume a reach condition; a finite-horizon corollary would have to quantify
+$\rho$.
+
+\subsection{Sufficiency argument}\label{sec:suff}
+
+We give the argument in the form we believe a proof should take: three
+input-to-state-stable (ISS) blocks composed by a small-gain theorem. This is
+\emph{not} a completed proof; the gaps are listed in Section~\ref{sec:gaps}.
+
+\begin{lemma}[Mean block: tracking]\label{lem:mean}
+Fix a component $k$ of player $0$ lying in cell $\cA_j$, and let
+$r(t) = \|m_k(t) - \xi_j(t)\|$ where $\xi_j(t) = \xi_j(\nu_t, \sigma_k(t),
+\bar a(t))$. Under (C), (W) and small enough $\eta_0$,
+\begin{equation}\label{eq:iss}
+  r(t+1) \;\le\; r(t) \;-\; \eta_0\, \underline\sigma^2 w_{\min}\, \rho\big(r(t)\big)
+  \;+\; \big\|\xi_j(t+1) - \xi_j(t)\big\| \;+\; O(\eta_0^2).
+\end{equation}
+Consequently $\cA_j$ is forward invariant for $m_k$, and if the drift
+$\|\dot\xi_j\| \to 0$ then $r(t) \to 0$.
+\end{lemma}
+
+\begin{proof}
+Expand $\tfrac12 r^2$ along \eqref{eq:gauss} and apply \eqref{eq:star} to the
+inner product; the drift term is the displacement of the target between steps.
+Forward invariance follows because \eqref{eq:star} makes the radial component of
+the step strictly inward, in particular on $\partial \cA_j$.
+\end{proof}
+
+\begin{lemma}[Scale block: scales fall]\label{lem:scale}
+Let $\Lambda \in C^2(\R^n)$ and $\xi(s) \in \argmax_{\cA_j} \Lambda_s$ be
+isolated. Then, with $\Lambda_s = \Lambda * \cN(0,s^2 I)$,
+\begin{equation}
+  \frac{d}{d(s^2/2)}\Big[\Lambda_s\big(\xi(s)\big)\Big]
+  = \Delta \Lambda_s\big(\xi(s)\big) \;\le\; 0,
+\end{equation}
+with strict inequality at a nondegenerate maximum. Hence at (or near) a branch
+point the log-scale natural gradient in \eqref{eq:gauss} is strictly negative and
+$\sigma_k$ decreases monotonically to the floor $s^{\min}_0$.
+\end{lemma}
+
+\begin{proof}
+$\partial_{(s^2/2)} \Lambda_s = \Delta \Lambda_s$ is the heat equation; the
+envelope theorem kills the $\dot\xi$ term; $\Delta \Lambda_s \le 0$ at an interior
+maximum.
+\end{proof}
+
+Lemma~\ref{lem:scale} replaces the empirical ``self-annealing'' story with a
+proof, and it holds in any dimension. It also explains why an explicit annealing
+schedule is never needed for $\sigma \to s^{\min}$: a schedule only changes
+\emph{which} branch you are attracted to on the way down, which is precisely the
+mechanism by which annealing delivers a component into a decoy in games outside
+the class.
+
+\begin{lemma}[Weight block]\label{lem:weight}
+Let $\bar A(t)$ be the component matrix \eqref{eq:Abar}. The categorical updates
+\eqref{eq:cat} are tabular MMD on $\bar A(t)$; for fixed $\bar A$ and fixed
+magnet they contract to the $\tau^{\mathrm{cat}}$-regularised equilibrium (QRE) at
+rate $1 - \Theta(\eta\tau^{\mathrm{cat}})$, and the magnet refresh drives the QRE
+to the Nash of $\bar A$. For time-varying $\bar A(t)$ the block is ISS with gain
+$O(1/\tau^{\mathrm{cat}})$ in $\|\dot{\bar A}\|$ (the QRE map is
+$1/\tau^{\mathrm{cat}}$-Lipschitz in the payoff matrix).
+\end{lemma}
+
+\begin{theorem}[Sufficiency, modulo the gaps of §\ref{sec:gaps}]\label{thm:main}
+Let $u \in \mathfrak{G}(M,\Sigma,\cN,\rho)$ in the sense of
+Definition~\ref{def:class}. Then the iterates of
+\eqref{eq:cat}--\eqref{eq:gauss} satisfy: every component mean converges to a
+branch point of its cell; every scale converges to the floor; the induced
+component matrix converges to the smoothed atom matrix
+$\bar A_{jl} \to A^{s}_{jl}$; the categorical heads converge to the unique Nash
+of that matrix; and the induced policy pair is an $\varepsilon$-Nash equilibrium
+of the continuous game with, \emph{under} (B),
+\begin{equation}\label{eq:bias}
+  \varepsilon = O\big((s^{\min}_0)^2 + (s^{\min}_1)^2\big),
+\end{equation}
+the constant being $\tfrac12 \sum_j w^\star_j\, |\nabla^2 Q_{\nu^\star}(p_j)|$
+for player $0$ and analogously for player $1$.
+\end{theorem}
+
+\begin{proof}[Proof skeleton]
+\emph{Step 1 (transport).} By (K) each cell contains a mean; by
+Lemma~\ref{lem:mean} each mean stays in its cell and tracks its branch with error
+governed by the branch drift. By (D) the round-trip gain between the two players'
+branch maps is $g_0 g_1 < 1$, so the small-gain theorem applied to the two mean
+blocks gives that the joint tracking error contracts up to the input from the
+weight and scale blocks.
+
+\emph{Step 2 (scales).} By Lemma~\ref{lem:scale} the scales are eventually
+monotonically decreasing once the tracking error is small enough that the
+components sit near their branch maxima; they converge to the floor, and their
+drift $\to 0$, removing one input to Step 1.
+
+\emph{Step 3 (weights).} By Lemma~\ref{lem:weight} the categorical heads track
+the Nash of the drifting component matrix with gain $O(\|\dot{\bar A}\|/
+\tau^{\mathrm{cat}})$. By Steps 1--2, $\dot{\bar A} \to 0$, so the weights
+converge; by (M) the limiting matrix is the atom matrix $A^s$. Nondegeneracy is
+an \emph{open} condition, so the $O(s^2)$-perturbed matrix $A^s$ still has a
+unique fully-mixed equilibrium and, by (I), the weights converge to
+$(w^\star, v^\star) + O(s^2)$. Without (I) they still converge, to \emph{some}
+Nash of $A^s$ (Remark~\ref{rem:nondeg}).
+
+\emph{Step 4 (bias).} At the limit each component sits at an atom with scale
+$s^{\min}$, so the exploitability is the smoothing deficit
+$\max_a Q_{\nu} - \E_{\pi} Q_\nu$ per player. Under (B) a second-order Taylor
+expansion of $Q_{\nu^\star}$ at $p_j$ against the Gaussian gives
+$\tfrac12 \sum_j w_j |\nabla^2 Q(p_j)| (s^{\min})^2 + O(s^4)$, i.e.\
+\eqref{eq:bias}. In the Gaussian-bump case this is
+$\sum_j w_j h_j\big(1 - w_j/\sqrt{w_j^2 + s^2}\big)$ exactly.
+
+\emph{Step 5 (duplicates).} If a cell receives several components, all of them
+converge to the same branch point; the induced matrix has duplicated rows, whose
+Nash equilibrium is non-unique in $w$ but unique as a measure on the atoms. The
+conclusion is stated for the induced measure and is unaffected.
+\end{proof}
+
+\begin{corollary}[Overcapacity helps, inside the class]
+Under Definition~\ref{def:class}, taking $K_i \gg M_i$ with a space-filling
+initialisation makes the covering condition in (K) automatic, at no cost to the
+conclusion (Step 5). This is the opposite of the behaviour observed on the decoy
+game, where extra components are captured by the spurious attractor of
+Proposition~\ref{prop:sharp} --- a game \emph{outside} the class. Overcapacity is
+therefore the cheap way to discharge the only genuinely initialisation-dependent
+hypothesis, provided the game is in the class.
+\end{corollary}
+
+\subsection{The floor, and how exactness is recovered}\label{sec:floor}
+
+The floor is a hypothesis, not an approximation, and it is worth being explicit
+about what it buys and what it costs. It buys three things:
+
+\begin{enumerate}
+\item \textbf{Breadth in the payoff}: Remark~\ref{rem:reg} --- bounded measurable
+  instead of $C^2$.
+\item \textbf{Breadth in the landscape}: condition (C) is imposed from
+  $s^{\min}$ upward, not from $0$. In one dimension Gaussian smoothing never
+  creates an extremum, so a landscape carrying structure finer than the floor ---
+  ripple, discretisation noise, a Monte-Carlo estimate of $D$ --- can have very
+  many local maxima at scale $0$ and exactly $M_0$ at scale $s^{\min}$. Such a
+  game is inside the class with a floor and outside it without. \emph{A positive
+  floor makes the class strictly broader}, which is the main reason to adopt it.
+\item \textbf{Uniform constants}, hence a checkable condition (a compact scale
+  range) and a linear local rate $1 - \Theta(\eta\tau)$ rather than a degrading
+  one.
+\end{enumerate}
+
+It costs the resolution requirement of Lemma~\ref{lem:resolution}: structure
+finer than the floor is invisible, so atoms finer than the floor are
+unrepresentable.
+
+The apparent cost --- that the conclusion is $\varepsilon$-Nash rather than Nash
+--- is not real, because the floor is not what drives the bias down. The scale
+dynamics do that by themselves, and releasing the floor turns
+Theorem~\ref{thm:main}'s $O(s^2)$ into a rate in $t$.
+
+\begin{corollary}[Unfloored: $\varepsilon = O(1/t)$]\label{cor:unfloored}
+Suppose the hypotheses of Theorem~\ref{thm:main} have delivered transport and
+equilibration --- every mean at its branch point, weights at the matrix-game
+equilibrium --- and the floor is then released ($s^{\min} \to 0$). Assume (B).
+Writing $\kappa_j = |\Delta Q_{\nu^\star}(p_j)| > 0$, the log-scale update
+\eqref{eq:gauss} gives, from $\partial_{\log \sigma}(Q)_\sigma(\xi) = \sigma^2
+\Delta Q(\xi) + O(\sigma^4)$,
+\begin{equation}
+  \dot\sigma_k = -c_k\,\sigma_k^3 + O(\sigma^5),
+  \qquad c_k = \tfrac{\eta}{2}\, w_k\, \kappa_k ,
+\end{equation}
+hence $\sigma_k(t) = \big(\sigma_k(0)^{-2} + 2c_k t\big)^{-1/2} = \Theta(t^{-1/2})$
+and, by Step 4 of Theorem~\ref{thm:main},
+\begin{equation}
+  \varepsilon(t) \;=\; \Theta(1/t).
+\end{equation}
+Transport survives the collapse, but only marginally: the mean contraction rate
+carries the preconditioner $\sigma^2 \sim 1/t$, so the accumulated contraction is
+$\int^t \sigma^2 \,d\tau = \Theta(\log t)$ --- divergent, hence still convergent,
+but logarithmically.
+\end{corollary}
+
+\begin{lemma}[The Gaussian magnet time-rescales the Gaussian-head flow]
+\label{lem:brake}
+Let the Gaussian-head magnet have temperature $\tau^{\mathrm g}$ and be refreshed
+every $T$ steps, and set
+\begin{equation}\label{eq:brake}
+  \beta \;\coloneqq\; \frac{1 - e^{-\eta \tau^{\mathrm g} T}}
+                            {\eta \tau^{\mathrm g} T} \;\in\; (0, 1] ,
+  \qquad \beta \to 1 \text{ as } \tau^{\mathrm g} \to 0 .
+\end{equation}
+Then, to leading order in the per-cycle displacement, \emph{both} Gaussian-head
+coordinates are slowed by the same factor $\beta$:
+\begin{enumerate}
+\item[(i)] the cycle-averaged mean velocity is $\beta$ times its
+  $\tau^{\mathrm g} = 0$ value;
+\item[(ii)] Corollary~\ref{cor:unfloored} holds verbatim with
+  $c_{\mathrm{eff}} = \beta\, c$.
+\end{enumerate}
+Consequently the $(m,\sigma)$ flow with magnet is, to this order, the
+magnet-free flow under the time reparameterisation $t \mapsto \beta t$.
+\end{lemma}
+
+\begin{proof}
+(i) Within a cycle write $x = m - \bar m$. The magnet contributes
+$-\eta\tau^{\mathrm g}(\sigma^2/\bar\sigma^2)\,x \approx
+-\eta\tau^{\mathrm g} x$ to the update, so $\dot x = g - \eta\tau^{\mathrm g}x$
+with $g$ the magnet-free step; from $x(0) = 0$,
+$x(T) = (g/\eta\tau^{\mathrm g})(1 - e^{-\eta\tau^{\mathrm g}T})$, and the
+average velocity $x(T)/T$ is $\beta g$.
+
+(ii) Within one cycle $\sigma$ is constant to $O(1/t)$. Writing
+$x = \rho - \bar\rho$, the magnet's log-scale gradient is
+$B(1 - e^{2x})$ with $B = \tfrac{\eta}{2}\tau^{\mathrm g}$ (from
+$\partial_\rho \KL = -1 + \sigma^2/\bar\sigma^2$), so with $g = c\,\sigma^2$,
+$\dot x = -g + B(1 - e^{2x}) = A - Be^{2x}$, $A = B - g$. In $u = e^{2x}$ this
+is logistic, $\dot u = 2u(A - Bu)$, and from $u(0) = 1$,
+$x(T) = \tfrac12 \log\!\big[(1-\varepsilon)/(1 - \varepsilon e^{-2AT})\big]$ with
+$\varepsilon = g/B$, giving decay per cycle
+$|x(T)| = \tfrac{\varepsilon}{2}(1 - e^{-2BT}) + O(\varepsilon^2)$, i.e.\
+$c_{\mathrm{eff}} = \beta c$ on dividing by $T$ (note
+$2BT = \eta\tau^{\mathrm g}T$, the same exponent as in (i) --- which is why the
+two coordinates share one factor).
+\end{proof}
+
+The brake \emph{saturates} inside the refresh cycle whenever
+$\eta\tau^{\mathrm g}T \gtrsim 1$, which is the regime the defaults sit in
+($\eta\tau T = 2$). A linear-response estimate --- which is what one writes down
+first --- misses this and gives $\beta = 1/2$, an error of $15\%$ at the defaults
+and unbounded as $\eta\tau^{\mathrm g}T$ grows.
+
+\begin{remark}[The bias exponent is a certificate of (B)]\label{rem:biasexp}
+Without (B) the exponent degrades rather than the conclusion failing. At a corner
+maximum ($Q \sim -|a - p|$ near the atom) the deficit is
+$\E|\cN(0,s^2)| = s\sqrt{2/\pi} = O(s)$, so $\varepsilon = O(s^{\min})$ and, in
+Corollary~\ref{cor:unfloored}, $\varepsilon = O(t^{-1/2})$. So the exponent $2$
+measured empirically (log--log slope $2.002$ in the previous theory's
+experiment~5) is evidence that the landscape is $C^2$ at its atoms, not a
+universal law.
+\end{remark}
+
+\subsection{Numerical verification}\label{sec:verify}
+
+Corollary~\ref{cor:unfloored} and Lemma~\ref{lem:brake} are sharp enough to test
+directly, and \texttt{theory2/check\_scale\_law.py} does so on
+\texttt{TWO\_POINT} ($h = 1$, $\bar w = 0.1$, coupling $1$, $K = 2$), whose
+predicted free constant is $c = \tfrac{\eta}{2} w_k h/\bar w^2 = 1.25$. The run
+loop is a transcription of \texttt{idealized\_mmd.run} exposing two knobs the
+original hard-codes (the floor, and a separate $\tau^{\mathrm g}$); run~A
+verifies it reproduces \texttt{run} bit-for-bit and reproduces the previous
+theory's experiment~2 to all printed digits. Exploitability is measured on a
+$3\times10^5$-point grid, because at the repo's default $4001$ points neither
+peak is a grid point and the best-response value is short of the true maximum by
+$\sim 7\times10^{-6}$ per player --- the same order as the quantities being
+measured.
+
+\begin{center}
+\begin{tabular}{lccc}
+\hline
+run ($2\times 10^6$ steps, floor $10^{-12}$) & fitted $c$ & predicted $c$ &
+  ratio\\
+\hline
+B: $\tau^{\mathrm g} = 0$ (free decay) & $1.249835$ & $1.25$ & $0.9999$\\
+C: $\tau^{\mathrm g} = 0.2$, atom init & $0.541092$ & $0.540415$ & $1.0013$\\
+D: $\tau^{\mathrm g} = 0.2$, spread init $(-0.3, 1.3)$ & $0.541092$ &
+  $0.540415$ & $1.0013$\\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent Fitting $\sigma^{-2}$ against $t$ over the last two decades gives
+$R^2 \ge 1 - 3\times10^{-8}$ in every run: the trajectory is affine in
+$\sigma^{-2}$, exactly as $\dot\sigma = -c\sigma^3$ requires. The log--log slopes
+are $\sigma$: $-0.502$ to $-0.506$ (predicted $-0.5$) and $\varepsilon$:
+$-1.003$ to $-1.011$ (predicted $-1$), and $\varepsilon = 100\,\sigma^2$ holds to
+five significant figures throughout, confirming that the residual is pure
+representation bias. Run~D differs from run~C only in the fitted intercept: a
+transport phase changes where the law starts, not the law.
+
+Lemma~\ref{lem:brake}'s factor was checked by sweeping $\tau^{\mathrm g}$ and $T$
+over a $16\times$ range in $\eta\tau^{\mathrm g}T$; the two configurations sharing
+$\eta\tau^{\mathrm g}T = 0.5$ (namely $\tau^{\mathrm g}=0.2, T=50$ and
+$\tau^{\mathrm g}=0.05, T=200$) collapse onto the same $c$, confirming the factor
+depends only on that product:
+
+\begin{center}
+\begin{tabular}{cccccc}
+\hline
+$\tau^{\mathrm g}$ & $T$ & $\eta\tau^{\mathrm g}T$ & factor & $c$ measured &
+  ratio\\
+\hline
+$0.2$ & $50$ & $0.5$ & $0.78694$ & $0.98715$ & $1.0035$\\
+$0.05$ & $200$ & $0.5$ & $0.78694$ & $0.98429$ & $1.0006$\\
+$0.2$ & $200$ & $2.0$ & $0.43233$ & $0.54092$ & $1.0009$\\
+$0.2$ & $800$ & $8.0$ & $0.12496$ & $0.15583$ & $0.9976$\\
+$0.8$ & $200$ & $8.0$ & $0.12496$ & $0.15586$ & $0.9979$\\
+$0$ & $200$ & $0$ & $1$ & $1.24967$ & $0.9997$\\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{remark}[The floor is typically inactive]\label{rem:inactive}
+The same runs settle a reading of the previous theory's measurements. Its
+experiment~2 reports, at $2\times10^4$ steps with the floor at $10^{-3}$, a
+converged $\sigma = 0.0069105$ --- which is $6.9\times$ the floor. \emph{The floor
+was never active}: that run's scale was still falling, at the rate
+\eqref{eq:brake} predicts, and its reported exploitability $0.0047574$ is the
+smoothing deficit $2h(1 - \bar w/\sqrt{\bar w^2 + \sigma^2}) = 0.0047$ at that
+$\sigma$. So the residual exploitabilities quoted throughout that work are
+snapshots of a $\Theta(1/t)$ decay rather than floor-set constants, and comparing
+two runs' residuals compares their step counts unless the floor is verified
+active in both.
+\end{remark}
+
+\subsection{The Gaussian magnet and the class}\label{sec:magnet}
+
+Because condition (C) is imposed on the regularised landscape \eqref{eq:reg},
+$\tau^{\mathrm g}$ sits inside the class definition and it is fair to ask whether
+the class is larger with it. The answer is directional, and it is different in
+the two regimes of the previous theory's magnet dichotomy.
+
+\paragraph{Flat directions: strictly broader.} For a pure-coupling game
+$u(a,b) = \ip{\varphi(a)}{C\psi(b)}$ with no self-term, at equilibrium
+$Q_{\nu^\star} \equiv \mathrm{const}$, so $\nabla Q \equiv 0$ and \eqref{eq:star}
+fails at every $a$ for $\tau^{\mathrm g} = 0$: these games are \emph{outside} the
+class. With $\tau^{\mathrm g} > 0$ the quadratic in \eqref{eq:reg} makes
+$Q^{\mathrm{reg}}$ strongly concave, (C) holds with a single cell and
+$\rho(r) = (\tau^{\mathrm g}/\bar\sigma^2)\,r$, and they are admitted. So the
+magnet does enlarge the class --- by exactly the games whose landscape supplies no
+curvature. The price is the one recorded in Remark~\ref{rem:flat}: the branch
+point is $\bar a$, the previous iterate, so (M) has no content, the atoms are
+unidentified, and the conclusion is convergence of the induced measure rather
+than of the parameters.
+
+\paragraph{Curved directions: no broadening, and a cost.} Here the magnet cannot
+buy membership, because the obstruction to (C) is a spurious local maximum and
+the magnet does not remove one:
+
+\begin{proposition}[Spurious attractors are magnet-invariant]\label{prop:magnetinv}
+The configuration $\hat z$ of Proposition~\ref{prop:sharp} is a fixed point of
+\eqref{eq:cat}--\eqref{eq:gauss} for \emph{every} $\tau^{\mathrm g} \ge 0$, and
+its local contraction rate is \emph{increasing} in $\tau^{\mathrm g}$.
+\end{proposition}
+
+\begin{proof}
+At $\hat z$ the magnet is refreshed to $\hat z$ itself, so $\bar a = \hat a$ and
+the magnet's mean gradient $-\tau^{\mathrm g}(\hat a - \bar a)/\bar\sigma^2$
+vanishes identically; the fixed-point property is therefore unchanged. The
+magnet adds $-\eta\tau^{\mathrm g}I$ to the Jacobian, which strictly improves the
+stability margin of an already-stable fixed point.
+\end{proof}
+
+So the magnet makes a trap \emph{deeper}, never shallower --- the analytic form
+of the previous theory's ``no magnet fixes transport'', and of its observation
+that a stronger magnet is worse on the multidimensional decoy game.
+
+\paragraph{What the cost is, exactly.} By Lemma~\ref{lem:brake} the magnet
+time-rescales the whole Gaussian-head flow by $\beta$. Two consequences for the
+hypotheses:
+\begin{itemize}
+\item \emph{Asymptotic basins are unchanged.} A time reparameterisation does not
+  alter which initialisations converge, so the covering condition (K), read
+  asymptotically, is insensitive to $\tau^{\mathrm g}$.
+\item \emph{Finite-horizon reach shrinks by $\beta$.} At a fixed step budget, the
+  set of initialisations that actually arrive contracts, and by
+  Corollary~\ref{cor:unfloored} the bias at a fixed step count is worse by
+  $1/\beta$. This is the sense --- the only sense --- in which the magnet narrows
+  things.
+\end{itemize}
+
+Run~F of \texttt{check\_scale\_law.py} measures the transport time from the
+spread initialisation $(-0.3, 1.3)$ against the prediction $1/\beta$:
+
+\begin{center}
+\begin{tabular}{cccc}
+\hline
+$\tau^{\mathrm g}$ & $\beta$ & measured $t_{\mathrm{arrive}}$ ratio &
+  predicted $1/\beta$\\
+\hline
+$0$ & $1$ & $1.00$ & $1.00$\\
+$0.2$ & $0.43233$ & $2.67$ & $2.31$\\
+$2.0$ & $0.05000$ & $20.18$ & $20.00$\\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent The $\tau^{\mathrm g} = 2$ row is the clean test ($0.9\%$); the
+$\tau^{\mathrm g} = 0.2$ row is looser because early transport happens at large
+$\sigma$, before the per-cycle displacement is small enough for the leading-order
+rescaling to apply.
+
+\begin{remark}[The dichotomy is per direction, not per game]\label{rem:perdir}
+At an interior equilibrium the own-parameter Hessian is negative semidefinite, so
+each own-direction is either curved (magnet redundant, and costly) or flat
+(magnet necessary). The generic game mixes the two --- e.g.\ a two-dimensional
+action with a well in one coordinate and matching pennies in the other --- and the
+correct prescription, ``magnet on the flat null-space only'', is not expressible
+with a scalar $\tau^{\mathrm g}$. If any direction is flat, one pays the friction
+$\beta$ in \emph{all} of them. A direction-aware magnet (a $\KL$ weighted by a
+projector onto the null-space of the own-Hessian) is the obvious remedy and, as
+far as we know, untried.
+\end{remark}
+
+\subsection{What is not proved}\label{sec:gaps}
+
+\begin{enumerate}
+\item \textbf{The small-gain composition.} Lemmas~\ref{lem:mean}--\ref{lem:weight}
+  are individually routine; composing three ISS blocks requires the gains to be
+  simultaneously small, and the weight block's gain $O(1/\tau^{\mathrm{cat}})$
+  pushes toward large $\tau^{\mathrm{cat}}$ while the bias argument pushes toward
+  the magnet refresh driving regularisation away. The ordering of limits
+  (refresh period $T$ versus gain margins) is not settled.
+\item \textbf{Quantitative $\rho$.} The class gives asymptotic convergence. A
+  finite-horizon statement --- the honest form of the old $s_{\mathrm{reach}}$
+  edge --- needs $\rho$ explicitly, and for Gaussian-bump landscapes $\rho$ is
+  exponentially small at long range.
+\item \textbf{Verification of (C).} Checking a condition quantified over all
+  opponent policies and all scales is the practical cost of the class;
+  Section~\ref{sec:check} reduces it in useful special cases but does not
+  eliminate it.
+\item \textbf{The flat case} (Remark~\ref{rem:flat}) is covered by the definition
+  but Theorem~\ref{thm:main}'s Steps 1 and 3 must be reread in moment
+  coordinates, since the fixed-point set is a manifold rather than a point.
+\item \textbf{Steps 1 and 2 are not sequential.} Theorem~\ref{thm:main} is
+  written as though transport completes and then the scales fall, but the mean
+  update carries the preconditioner $\sigma^2$, so the scale collapse of
+  Lemma~\ref{lem:scale} \emph{throttles} transport as it proceeds: at
+  $\sigma = 0.1$ the mean contraction is $\approx 0.025$ per step, at
+  $\sigma = 10^{-3}$ it is $\approx 2.5 \times 10^{-6}$ --- four orders of
+  magnitude, i.e.\ a component that has not arrived before the scale collapses is
+  effectively frozen where it stands. With a floor the rate is merely small and
+  the argument is unaffected; unfloored (Corollary~\ref{cor:unfloored}) both the
+  contraction and the branch drift vanish together and the ISS estimate
+  \eqref{eq:iss} needs their \emph{ratio} controlled, not each separately. This
+  is the one place where the two-block decomposition is genuinely coupled and I
+  have not verified the ratio is favourable in general.
+\end{enumerate}
+
+\section{Checkable sufficient conditions}\label{sec:check}
+
+Condition (C) quantifies over $\nu \in \cN_1$. Two standard structures make that
+quantifier finite-dimensional and the whole condition checkable.
+
+\subsection{Finite-rank coupling}
+
+Suppose
+\begin{equation}\label{eq:G1}
+  u(a,b) = D_0(a) - D_1(b) + \ip{\varphi(a)}{C\,\psi(b)},
+  \qquad \varphi : \cA \to \R^{m_0},\ \psi : \cB \to \R^{m_1},
+\end{equation}
+with $D_i, \varphi, \psi \in C^2$. Then $Q_\nu(a) = D_0(a) + \ip{\varphi(a)}{Cy}
++ \mathrm{const}$ with $y = \E_\nu \psi$, so the opponent enters through
+$m_1$ numbers and $\cN_1$ collapses to the compact convex \emph{moment body}
+$Y = \conv \psi(\cB) \subset \R^{m_1}$. Condition (C) becomes: for all $y \in Y$
+and all $s \in \Sigma_0^{n_0}$, the function
+$D_{0,s} + \ip{\varphi_s(\cdot)}{Cy}$ is star-concave toward $\xi_j(y,s)$ on
+$\cA_j$. Two consequences.
+
+\begin{proposition}[Curvature-dominates-coupling]\label{prop:cap}
+Suppose $D_{0,s}$ satisfies \eqref{eq:star} on $\cA_j$ with modulus $\rho_0$ and
+that the branch $\xi_j^{0}(s)$ of $D_{0,s}$ has curvature $\nabla^2 D_{0,s} \preceq
+-\alpha_0 I$ near it. If
+\begin{equation}
+  \sup_{y \in Y} \|C y\| \cdot \sup_{\cA_j} \|\nabla \varphi_s\| \;<\;
+  \inf_{r>0} \rho_0(r),
+\end{equation}
+then \eqref{eq:star} holds for the coupled landscape with modulus
+$\rho_0 - \|Cy\|\|\nabla\varphi_s\|$, and the branch drift satisfies
+$\|\partial \xi_j/\partial y\| \le \|\nabla \varphi_s\|\,\|C\|/\alpha_0$ by the
+implicit function theorem. Combining the two players, the small-gain condition
+\eqref{eq:smallgain} is implied by
+\begin{equation}\label{eq:cap}
+  \alpha_0\, \alpha_1 \;>\; \|C\|^2\, \sup\|\nabla\varphi\|\, \sup\|\nabla\psi\| .
+\end{equation}
+\end{proposition}
+
+For the codebase games, $u = D(a) - D(b) + c\ip{f(a)}{f(b)}$ with Gaussian bumps
+of height $h$ and width $w$, so $\alpha \approx h/w^2$ and \eqref{eq:cap} reads
+$c\,\|f'\|^2 < (h/w^2)^2$ --- the same $O(h/w^2)$ coupling cap that the previous
+theory measured locally, now doing global work.
+
+\begin{example}[The cap on the codebase games, with numbers]\label{ex:cap}
+\texttt{TWO\_POINT} has $h = 1$, $w = 0.1$, hence $\alpha = h/w^2 = 100$; its
+feature is $f(a) = 2a - 1$, so $\|f'\| = 2$; and $c = 1$. Then
+\[
+  g_0 \;=\; \frac{c\,\|f'\|}{\alpha} \;=\; \frac{2}{100} \;=\; 0.02,
+  \qquad
+  g_0 g_1 \;=\; 4 \times 10^{-4} \;\lll\; 1 ,
+\]
+and \eqref{eq:cap} would first bite at $c \approx \alpha/\|f'\| = 50$. The
+coupling in that game is therefore three orders of magnitude away from being able
+to destabilise the branch chase --- which is why no experiment at $c = 1$ has ever
+shown coupling-induced trouble, and why the two players' targets settle rather
+than chase.
+
+Consistency check against the previous theory's coupling sweep, which used the
+three-peak game ($w = 0.08$, so $\alpha \approx 156$) with a quadratic feature:
+\eqref{eq:cap} predicts trouble from $c \approx \alpha/\|f'\| \approx 78$, and the
+certified region there was measured flat in $c$ through $c = 8$ and degrading
+between $c = 32$ and $c = 300$. Same scale and same $O(h/w^2)$ form, from a
+condition that --- unlike the measured one --- is a statement about the whole
+transit rather than a neighbourhood of the equilibrium.
+\end{example}
+
+\begin{proposition}[Nondegeneracy from moments]\label{prop:moments}
+In the symmetric-coupling case $C = cI$, $\psi = \varphi$, condition (I) holds
+iff the vectors $\{\varphi(p_1),\dots,\varphi(p_{M_0})\}$ are affinely
+independent and
+$0 \in \mathrm{relint}\,\conv\{\varphi(p_1),\dots,\varphi(p_{M_0})\}$. This is the
+general form of the Vandermonde argument in \texttt{MultiPointGame}: with
+$\varphi_j = \iota^j - t_j$ the moment map is a Vandermonde system in the
+normalised peak coordinates, injective because the peaks are distinct.
+\end{proposition}
+
+\subsection{Gaussian-bump landscapes in one dimension}
+
+If $D_0 = \sum_b h_b \exp(-(x-c_b)^2/2w_b^2)$ then:
+\begin{itemize}
+\item \emph{Mode counting suffices at one scale --- the floor.} In one dimension
+  Gaussian smoothing never creates a local extremum (scale-space causality), so
+  the mode count of $D_{0,s}$ is non-increasing in $s$. Condition (C)'s
+  ``exactly $M_0$ attractors at every scale in $\Sigma_0$'' therefore reduces to
+  a count at the \emph{bottom} of the range plus a merge check: \emph{$D_{0,s}$
+  has exactly $M_0$ local maxima at $s = s^{\min}_0$, and no two of them merge
+  below $s^{\max}_0$}. Both are one-dimensional root counts.
+\item \emph{Structure finer than the floor is free.} Because the count is taken
+  at $s^{\min}_0$ and not at $0$, a landscape of the form ``$M_0$ clean bumps
+  $+$ ripple of wavelength $\ll s^{\min}_0$'' passes: the ripple contributes
+  arbitrarily many local maxima to $D_0$ and none to $D_{0,s^{\min}}$. This is
+  the concrete content of the claim that the floor broadens the class, and it is
+  what makes the class usable when $D$ is only available as an estimate.
+\item \emph{The decoy game is excluded immediately}: its landscape has three
+  local maxima (two peaks and the decoy) while $|\supp\mu^\star| = 2$, so (M)
+  fails at $M_0 = 3 \ne 2$ --- no smoothing or dominance computation needed. This
+  is the cleanest available statement of why that game is a counterexample.
+\item \emph{The two- and three-peak games are included} (number of maxima
+  $=$ support size), subject to \eqref{eq:cap} and (I).
+\end{itemize}
+
+\subsection{Multidimensional actions}\label{sec:multidim}
+
+Definition~\ref{def:class} is dimension-free: cells are subsets of $\R^{n}$,
+\eqref{eq:star} is an inner-product inequality, the scale range is a box
+$\Sigma^n$ for the diagonal-covariance policy (and \eqref{eq:star} is imposed for
+every anisotropic scale in that box), and Lemma~\ref{lem:scale} uses the
+Laplacian. What changes is verification and cost:
+
+\begin{enumerate}
+\item \textbf{No scale-space causality.} For $n \ge 2$, Gaussian smoothing
+  \emph{can} create local maxima, and a sum of $\ge 3$ Gaussians can have more
+  modes than components. So the mode count at $s^{\min}$ does not certify the
+  ladder; (C) must be imposed on the entire range, and the honest certificate is
+  a numerical mode-ladder check, not a bump-wise inequality.
+\item \textbf{Wide-low structures are exponentially worse.} An isotropic bump
+  $(h,w)$ smoothed at scale $s$ has amplitude $h\,(w^2/(w^2+s^2))^{n/2}$, so its
+  effective mass is $h w^n$. Any spurious structure that is wide relative to the
+  atoms gains an exponential-in-$n$ advantage at large scale, which in the
+  language of the class means the branch maps $\xi_j(\nu,s)$ leave their cells at
+  a scale $s^{\max}$ decreasing in $n$: the admissible scale range shrinks with
+  dimension.
+\item \textbf{Covering costs more.} (K) asks that every cell contain an initial
+  mean; in $\R^n$ this needs $K$ growing with the number of cells and with the
+  geometry, which is the multidimensional price of the only
+  initialisation-dependent hypothesis.
+\item \textbf{Bias grows linearly in $n$}: the trace in Step 4 of
+  Theorem~\ref{thm:main} runs over $n$ axes, so $\varepsilon = O(n\,s^2)$ and the
+  floor must shrink like $1/\sqrt n$ for a fixed target.
+\item \textbf{Separable games and the policy class.} If
+  $u(a,b) = \sum_{d=1}^{n} u_d(a_d, b_d)$, then (C) factorises: verifying the
+  one-dimensional condition per axis suffices, and the equilibrium is a product
+  of the per-axis equilibria. But then the \emph{policy} must factorise too: a
+  joint mixture with a shared categorical head makes the per-axis component
+  values add, so one axis's weight preference drags the weights of all axes
+  simultaneously, and (I) --- nondegeneracy of the induced matrix game's equilibrium
+  --- is stated for a joint matrix of size $K^n$ that a $K$-component joint
+  mixture cannot represent. The correct statement is a dichotomy:
+  \begin{itemize}
+  \item genuinely $M$-atom equilibrium in $\R^n$ $\Rightarrow$ joint
+    $K \ge M$-component mixture, class applies verbatim;
+  \item separable game with per-axis support $M$ $\Rightarrow$ \emph{per-axis
+    factorised} categorical head with $K \ge M$ per axis, class applies per axis.
+    A joint mixture with a shared head is outside the analysis, and is the
+    documented source of the dimension-amplified weight-starvation failure.
+  \end{itemize}
+\end{enumerate}
+
+\section{Relation to the previous theory}
+
+\begin{center}
+\begin{tabular}{p{0.30\textwidth} p{0.62\textwidth}}
+\hline
+previous object & status here\\
+\hline
+Lifted skewness (Lemma 1) & used, unchanged; it is why the categorical block
+  \eqref{eq:cat} is globally convergent.\\
+Block-skew structure (Lemma 2) & used only \emph{locally}, in
+  Proposition~\ref{prop:sharp}, and repaired for the Fisher metric via the
+  Lyapunov identity $GM + M^\top G = J + J^\top$. Global monotonicity of the
+  parametric field is not claimed: the flow that is run is $G^{-1}F$, and
+  monotonicity of $F$ does not survive a state-dependent preconditioner.\\
+Local island theorem (Thm.\ 4) & the $r \to 0$ endpoint of
+  Lemma~\ref{lem:mean}; the linear rate $1 - \Theta(\eta\tau)$ is
+  Lemma~\ref{lem:weight}.\\
+$O(s^2)$ bias (Lemma 3) & Step 4 of Theorem~\ref{thm:main}, restated for a
+  general landscape via $\nabla^2 Q$, and \emph{conditional on} (B): the
+  exponent $2$ certifies $C^2$ at the atoms rather than holding universally
+  (Remark~\ref{rem:biasexp}). Released from the floor it becomes
+  $\varepsilon = \Theta(1/t)$ (Corollary~\ref{cor:unfloored}), a law verified numerically to four digits in
+\S\ref{sec:verify}.\\
+Variance floor $s^{\min}$ & promoted from an implementation detail to a
+  hypothesis: it is what allows $u$ merely bounded measurable
+  (Remark~\ref{rem:reg}) and what makes (C) tolerant of landscape structure
+  finer than the floor (§\ref{sec:floor}). Its only cost is the new
+  Lemma~\ref{lem:resolution}.\\
+A1 scale dominance & \emph{demoted}: neither necessary nor sufficient
+  (§\ref{sec:suff}); replaced by (C)+(M).\\
+A2 reach & \emph{demoted} to a rate statement carried by $\rho$.\\
+A3 coupling caps & Proposition~\ref{prop:cap}, now serving the global argument.\\
+A4 step size & (S), unchanged.\\
+A5 capacity/genericity & split into (K) capacity+covering, (I) nondegeneracy,
+  (W) weight non-degeneracy --- with (W) identified as an artifact of the
+  preconditioner (Remark~\ref{rem:wk}).\\
+$\sigma$-niceness & (C) is its uniform, opponent-aware, dimension-free
+  strengthening: the ``path property'' (no branch jumping) is automatic because a
+  star-concave cell has one attractor, and ``local strong concavity'' is
+  weakened to star-concavity with modulus $\rho$.\\
+Magnet dichotomy (curvature vs.\ magnet) & absorbed: (C) is imposed on the
+  \emph{regularised} landscape \eqref{eq:reg}, so curved and flat directions are
+  handled by one condition, per direction, with no case split.\\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Summary}
+
+The class is: \emph{zero-sum, bounded measurable, compact; the family of smoothed
+magnet-regularised effective landscapes has exactly $M_i$ one-point-attracting
+cells, uniformly over opponent policies and over the scale range
+$[s^{\min}_i, s^{\max}_i]$ with $s^{\min}_i > 0$, with branch maps whose
+round-trip drift gain is a contraction; the atoms are resolved at the floor; the
+branch endpoints at equilibrium and at the floor scale are the Nash atoms; the
+induced atom matrix game has a unique equilibrium; capacity $K_i \ge M_i$ with an
+initialisation meeting every cell; and the usual step-size and magnet
+conditions.} Nothing is assumed about symmetry between the players, about the
+algebraic form of the payoff, about smoothness of the payoff, about concavity, or
+about the action dimension.
+
+The strict variance floor is load-bearing in both directions. It is what lets the
+payoff be merely bounded measurable and what lets the landscape carry structure
+finer than the floor, so it \emph{widens} the class rather than restricting it to
+the implemented algorithm; and it costs only Lemma~\ref{lem:resolution}, the requirement that
+the equilibrium atoms be resolved at that scale. Exactness is not sacrificed:
+released from the floor, the scale dynamics are $\sigma \sim t^{-1/2}$ and the
+representation bias vanishes as $\Theta(1/t)$
+(Corollary~\ref{cor:unfloored}), a law verified numerically to four digits in
+\S\ref{sec:verify}.
+
+The reason to believe it suffices is Lemma~\ref{lem:decomp}: the categorical
+heads solve a finite matrix game exactly and globally, so the only thing left to
+assume is that the means find the atoms --- and \eqref{eq:star} is the weakest
+standard condition under which a preconditioned gradient method finds a
+prescribed point, made uniform in the opponent so that it survives the game
+dynamics. The reason to believe it cannot be much broader is
+Proposition~\ref{prop:sharp}: the qualitative failure of \eqref{eq:star} produces
+an exponentially stable non-Nash configuration with an open basin, so no
+initialisation-robust class can permit it.
+
+\end{document}

@@ -1,0 +1,22 @@
+# Exp 1 -- simplest multidim case: 2-D, two peaks per axis, NO decoys.
+# Separable => each axis is a plain 2-point MultiPoint game. K=2 (diagonal init).
+# Expectation: MMD converges to a diagonal Nash (expl -> 0).
+game:
+  name: multidim_decoy_well
+  dim: 2
+  peaks: [-1.0, 1.0]
+  decoys: []
+  peak_width: 0.1
+  coupling: 1.0
+  action_margin: 1.0
+mmd:
+  lr: 0.05
+  steps: 6000
+  magnet_interval: 200
+  magnet_coef: 0.2
+  num_components: 2
+init:
+  means: spread
+log:
+  every: 200
+  rows: 10

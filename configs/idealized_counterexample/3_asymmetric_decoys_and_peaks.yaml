@@ -1,0 +1,71 @@
+# Idealized (noise-free, exact-gradient) MMD.  Run: python run_idealized.py <this file>
+#
+# Attempt 3: generalize 1_decoys_to_sides.yaml (which broke the sweep) to a fully
+# asymmetric layout -- peaks NOT mirrored around 0, and the two outside decoys with
+# different centers/heights/widths from each other. Tests whether the direction-lock
+# argument from file 1 (repulsion only pushes outward, so it fails whenever a decoy
+# sits further out than its peak) still holds once left/right symmetry is gone, or
+# whether symmetry was secretly doing some of the work.
+#
+# Layout (all distances/heights/widths deliberately unequal so nothing cancels by
+# symmetry):
+#   peaks:   -1.5  and  0.8      (uneven distance from 0: 1.5 vs 0.8)
+#   weights: uniform (0.5/0.5)   -- keep freeze_weights valid; asymmetric WEIGHTS is a
+#                                    separate axis, not tested here (see file's own
+#                                    caveat in 2_attraction_sweep_fix.yaml)
+#   decoys:  left  @ -2.4, height 0.60, width 0.50  (mass 0.30, outside the -1.5 peak)
+#            right @ +1.5, height 0.80, width 0.30  (mass 0.24, outside the +0.8 peak)
+#   init:    means start ON the decoys: [-2.4, 1.5]
+#
+# Expect (per file 1's argument): positive repulsion_coef pushes both means further
+# outward, i.e. deeper into their respective decoys / toward the box edge, same
+# failure mode as file 1. This file uses `repulsion_coef: 3.0` (the value that solved
+# the ORIGINAL center-decoy game) as the baseline failure case before trying the
+# attraction fix in 4_attraction_fix_asymmetric.yaml.
+#
+# Every settable field is listed; "(default)" marks values left at the schema default.
+
+game:
+  name: decoy_well
+  peaks: [-1.5, 0.8]
+  weights: null                                    # (default) uniform -> Nash 0.5/0.5
+  peak_width: 0.05                                  # (default)
+  peak_height: 1.0                                  # (default)
+  decoys: [[-2.4, 0.60, 0.50], [1.5, 0.80, 0.30]]   # <- asymmetric: different offsets,
+                                                     #    heights, and widths on each side
+  coupling: 1.0                                     # (default)
+  action_margin: 2.0                                # (default) -> box [-3.5, 2.8]
+
+mmd:
+  lr: 0.05
+  steps: 40000
+  magnet_interval: 200
+  magnet_coef: 0.05
+  entropy_coef: 0.0
+  num_components: 2
+
+  train_means: true
+  train_std: true
+  freeze_weights: true
+
+  anneal_std_from: 0.0
+  std_min: 0.001
+  std_max: 0.10
+
+  repulsion_coef: 3.0      # baseline: the value that solved the ORIGINAL (center-decoy)
+                            # counterexample -- expected to fail here, as in file 1
+  repulsion_ramp: 0.2
+  repulsion_hold: 0.5
+
+  backend: auto
+  grid_points: 801
+
+init:
+  means: [-2.4, 1.5]        # start ON the outside decoys
+  weights: null
+  log_std: 0.05
+
+log:
+  every: 500
+  rows: 10
+  out: null

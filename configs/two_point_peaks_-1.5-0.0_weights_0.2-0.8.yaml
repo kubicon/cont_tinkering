@@ -1,0 +1,55 @@
+sweep:
+  cartesian:
+    network.num_components:
+    - 2
+    - 3
+    - 4
+    train.seed:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+game:
+  name: multi_point
+  peaks:
+  - -1.5
+  - 0.0
+  weights:
+  - 0.2
+  - 0.8
+  width: 0.1
+  coupling: 1.0
+network:
+  hidden_dims:
+  - 64
+  - 64
+  activation: gelu
+  normalization: rms_norm
+  num_components: 2
+optimizer:
+  learning_rate: 0.0003
+  max_grad_norm: 1.0
+  optimizer: muon
+  weight_decay: 0.01
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 256
+  ppo_epochs: 2
+  target_tau: 0.001
+  magnet_interval: 500
+  category_entropy_coef: 0.1
+  gaussian_entropy_coef: 0.1
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+train:
+  mode: self_play
+  perspective: 0
+  opponent: random
+  steps: 100
+  epochs: 500
+  checkpoint_dir: sweeps/two_point_peaks_-1.5-0.0_weights_0.2-0.8
+  seed: 0

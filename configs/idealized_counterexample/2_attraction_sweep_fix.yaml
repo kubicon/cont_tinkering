@@ -1,0 +1,85 @@
+# Idealized (noise-free, exact-gradient) MMD.  Run: python run_idealized.py <this file>
+#
+# HYPERPARAMETER FIX for 1_decoys_to_sides.yaml (outside-the-peaks decoys). Same game,
+# same init, same everything -- the only change is `repulsion_coef: -1.0` instead of
+# a positive value. This is not a new knob: it's the existing `repulsion_coef` field
+# with its sign flipped, turning the ramp/hold/anneal "mean-repulsion sweep" (push
+# means APART) into a "mean-attraction sweep" (pull means TOGETHER).
+#
+# Why sign-flipping fixes it: in 1_decoys_to_sides.yaml the decoys sit OUTSIDE the
+# peaks (+-1.5 vs peaks at +-1), and repulsion only ever pushes outward -- so it drives
+# components deeper into (or straight through) the decoy, away from the peak, no
+# matter the magnitude (see that file's full coefficient sweep, all of which failed).
+# Attraction pulls the opposite way: components start ON the decoys (+-1.5) and get
+# pulled INWARD, toward 0 -- which means they pass directly *through* +-1, the peak
+# location, on the way. Exactly like the original (positive-repulsion) sweep, this
+# works because "the direction the sweep travels" and "the direction from decoy to
+# peak" coincide -- just mirrored, since the decoy/peak roles swapped sides.
+#
+# Verified: coefficient window measured (40k steps, all else identical to file 1):
+#     -0.5   too weak, stalls short of the peak     (+-1.30, expl 1.494)
+#     -1.0   NASH                                    (+-1.00, expl 0.008)
+#     -1.5   near-Nash, slightly past center of peak (+-1.00, expl 0.016)
+#     -2.0   near-Nash, more residual                (+-0.99, expl 0.028)
+#     -3.0   still captured, more residual            (+-0.99, expl 0.064)
+#     -4.0   still captured, more residual            (+-0.99, expl 0.114)
+#     -5.0   captured but noisy                        (+-0.98, expl 0.183)
+#     -8.0   overshoots the peak                       (+-0.68, expl 2.489)
+#    -15.0   blows straight through to the center      (~0.00, expl 2.746)
+# So the window is roughly [-2.0, -0.5], centered near -1.0 -- same "beats the decoy's
+# pull, loses to the peak's holding force" logic as the original sweep, just mirrored
+# in sign. -1.0 gives the cleanest Nash (expl 0.008, on par with the 0.06 the original
+# sweep achieved on the center-decoy game).
+#
+# Caveat: this is a fix for THIS symmetric outside-decoy placement specifically -- it
+# works because the fixed point at the game's center (a=0) is not itself a trap here
+# (no bump sits there), so pulling inward is safe. An asymmetric decoy layout, or one
+# with something sitting at the game's center, would need re-deriving the sign/magnitude
+# from scratch -- there's no a-priori rule for which sign of repulsion_coef to use
+# without knowing where the decoys sit relative to the peaks and the origin.
+#
+# Every settable field is listed; "(default)" marks values left at the schema default.
+
+game:
+  name: decoy_well
+  peaks: [-1.0, 1.0]
+  weights: null
+  peak_width: 0.05
+  peak_height: 1.0
+  decoys: [[-1.5, 0.7, 0.45], [1.5, 0.7, 0.45]]
+  coupling: 1.0
+  action_margin: 2.0
+
+mmd:
+  lr: 0.05
+  steps: 40000
+  magnet_interval: 200
+  magnet_coef: 0.05
+  entropy_coef: 0.0
+  num_components: 2
+
+  train_means: true
+  train_std: true
+  freeze_weights: true
+
+  anneal_std_from: 0.0
+  std_min: 0.001
+  std_max: 0.10
+
+  # --- the fix: attraction instead of repulsion ---
+  repulsion_coef: -1.0    # <- negative = attraction. The one change from file 1.
+  repulsion_ramp: 0.2     # (default)
+  repulsion_hold: 0.5     # (default)
+
+  backend: auto
+  grid_points: 801
+
+init:
+  means: [-1.5, 1.5]
+  weights: null
+  log_std: 0.05
+
+log:
+  every: 500
+  rows: 10
+  out: null

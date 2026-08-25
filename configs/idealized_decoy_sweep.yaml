@@ -1,0 +1,75 @@
+# Idealized (noise-free, exact-gradient) MMD.  Run: python run_idealized.py <this file>
+#
+# The same counterexample as idealized_decoy_well.yaml, but with the annealed
+# mean-repulsion SWEEP tuned -- the one K=2, gradient-only, no-search method that escapes
+# the decoy (convergence_experiments/counterexample/COUNTEREXAMPLE.md section 4c).
+# Verified: means +-1.01, std 0.002, exploitability ~0.06.
+#
+# Why it works: the marginal-entropy bonus conflates SEPARATING the modes (coverage, what
+# you want) with WIDENING them (resolution loss, what blinds you). This separates them --
+# repel the MEANS only, and force the components to stay NARROW (std_max) so that a
+# component sweeping across a narrow peak actually FEELS it and is captured.
+#
+# repulsion_coef must sit in a window: it must BEAT the decoy's restoring force (|D'|max
+# ~0.94) but LOSE to a true peak's holding force (~12). Measured:
+#     <= 2.0  stalls at +-0.6 (never escapes the decoy)
+#     3.0     NASH  (+-1.012, sharp)
+#     5.0     on the peaks, exploitability 0.185
+#     8.0     rips straight past them to the box edges (+-3.0)
+#
+# Cost: the sweep pays ~1/peak_width^2 in steps (travel speed ~ sigma^2, and sigma must
+# track the peak width). Halving peak_width needs 4x the steps. It is coverage in a new
+# costume -- but it IS gradient-driven, at K = |Nash support|.
+#
+# Every settable field is listed; "(default)" marks values left at the schema default.
+
+game:
+  name: decoy_well
+  peaks: [-1.0, 1.0]
+  weights: null                # (default) uniform -> Nash 0.5/0.5 on the peaks
+  peak_width: 0.05             # (default) <- narrow this and the sweep needs ~1/w^2 more steps
+  peak_height: 1.0             # (default)
+  decoys: [[0.0, 0.7, 0.45]]   # (default)
+  coupling: 1.0                # (default)
+  action_margin: 2.0           # (default) -> box [-3, 3]
+
+mmd:
+  # --- core MMD ---
+  lr: 0.05                # (default)
+  steps: 40000            # the sweep needs time to travel (see the 1/w^2 cost above)
+  magnet_interval: 200    # (default)
+  magnet_coef: 0.05       # LIGHT: the magnet's gradient on the mean is a BRAKE on the sweep
+  entropy_coef: 0.0       # (default)
+  num_components: 2       # (default) == |Nash support|
+
+  # --- which heads train ---
+  train_means: true       # (default)
+  train_std: true         # (default)
+  freeze_weights: true    # pin the categorical head at uniform: isolates the Gaussian head,
+                          #   and stops a starved component from freezing (its mean's natural
+                          #   gradient is scaled by its own weight -- weight-starvation freeze)
+
+  # --- std bounds: the crux. NARROW components can resolve a width-0.05 peak; wide ones cannot ---
+  anneal_std_from: 0.0    # (default) not used here -- widening is exactly what we must avoid
+  std_min: 0.001          # (default)
+  std_max: 0.10           # <- keep components NARROW. Raise this and they go blind and
+                          #    sail past the peaks (that is how the entropy bonus fails).
+
+  # --- the sweep ---
+  repulsion_coef: 3.0     # <- the knob. See the measured window in the header.
+  repulsion_ramp: 0.2     # (default) fraction of training ramping 0 -> coef
+  repulsion_hold: 0.5     # (default) fraction held at coef; the rest anneals back to 0
+
+  # --- payoff backend ---
+  backend: auto           # (default) -> closed_form
+  grid_points: 801        # (default) quadrature only
+
+init:
+  means: [-0.05, 0.05]    # start ON the decoy -- the sweep must carry them out of it
+  weights: null           # (default) uniform (and frozen, see freeze_weights)
+  log_std: 0.05           # narrow from the start
+
+log:
+  every: 500
+  rows: 10
+  out: null               # (default)

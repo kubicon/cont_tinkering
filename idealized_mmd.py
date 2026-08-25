@@ -41,22 +41,50 @@ class Params(NamedTuple):
     log_std: jnp.ndarray  # (K,) each component's log-std
 
 
-def well_expectation(means, log_std, game: ZeroSumGame):
-    """E_{a~N(mu,s)}[ sum_j exp(-(a-p_j)^2/(2 w^2)) ] per component (Gaussian conv).
+def _bumps(game: ZeroSumGame):
+    """`(centers, heights, widths)` of the well's Gaussian bumps, or `None`.
 
-    Games without a double-well shaping term (e.g. `ContinuousMatchingPennies`,
-    which has no `.peaks`) contribute zero here -- their payoff is the
-    coupling/bilinear term alone.
+    `MultiPointGame` has uniform-height, uniform-width bumps and exposes only
+    `.peaks`/`.width`, so it is lifted to the general form here. `DecoyWellGame`
+    exposes `.bump_centers`/`.bump_heights`/`.bump_widths` directly, because its
+    decoy bumps have their *own* heights and widths -- which is the whole point of
+    that game (a broad, low bump can dominate the *smoothed* landscape while
+    being strictly suboptimal unsmoothed). Games with no well (e.g.
+    `ContinuousMatchingPennies`) return `None`.
     """
+    centers = getattr(game, "bump_centers", None)
+    if centers is not None:
+        return (
+            jnp.asarray(centers, dtype=jnp.float64),
+            jnp.asarray(game.bump_heights, dtype=jnp.float64),
+            jnp.asarray(game.bump_widths, dtype=jnp.float64),
+        )
     peaks = getattr(game, "peaks", None)
     if peaks is None:
-        return jnp.zeros_like(means)
+        return None
     peaks = jnp.asarray(peaks, dtype=jnp.float64)
-    width = game.width
-    var = jnp.exp(2 * log_std)[:, None] + width**2  # (K, 1)
-    amp = width / jnp.sqrt(var)
-    bumps = amp * jnp.exp(-(means[:, None] - peaks[None, :]) ** 2 / (2 * var))
-    return jnp.sum(bumps, axis=-1)  # (K,)
+    return peaks, jnp.ones_like(peaks), jnp.full_like(peaks, float(game.width))
+
+
+def well_expectation(means, log_std, game: ZeroSumGame):
+    """E_{a~N(mu,s)}[ sum_j h_j exp(-(a-c_j)^2/(2 w_j^2)) ] per component (Gaussian conv).
+
+    Closed form: convolving a bump of height `h`, width `w` with `N(0, s^2)` gives
+    a bump of height `h * w / sqrt(w^2 + s^2)` and width `sqrt(w^2 + s^2)`. Note the
+    smoothed height decays like the bump's **mass** `h*w`, not its height -- see
+    `DecoyWellGame`.
+
+    Games without a well (e.g. `ContinuousMatchingPennies`) contribute zero here --
+    their payoff is the coupling/bilinear term alone.
+    """
+    bumps = _bumps(game)
+    if bumps is None:
+        return jnp.zeros_like(means)
+    centers, heights, widths = bumps
+    var = jnp.exp(2 * log_std)[:, None] + widths[None, :] ** 2  # (K, B)
+    amp = heights[None, :] * widths[None, :] / jnp.sqrt(var)
+    contributions = amp * jnp.exp(-(means[:, None] - centers[None, :]) ** 2 / (2 * var))
+    return jnp.sum(contributions, axis=-1)  # (K,)
 
 
 def _feature_geometry(game: MultiPointGame):
@@ -120,11 +148,14 @@ def _action_grid(game: ZeroSumGame, n: int = 4001):
 
 
 def _well_grid(a, game: ZeroSumGame):
-    peaks = getattr(game, "peaks", None)
-    if peaks is None:
+    bumps = _bumps(game)
+    if bumps is None:
         return jnp.zeros_like(a)
-    peaks = jnp.asarray(peaks, dtype=jnp.float64)
-    return jnp.sum(jnp.exp(-(a[:, None] - peaks[None, :]) ** 2 / (2 * game.width**2)), axis=-1)
+    centers, heights, widths = bumps
+    return jnp.sum(
+        heights[None, :] * jnp.exp(-(a[:, None] - centers[None, :]) ** 2 / (2 * widths[None, :] ** 2)),
+        axis=-1,
+    )
 
 
 def _feat_grid(a, mid, half_range, max_order, target):

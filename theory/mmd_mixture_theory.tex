@@ -1,0 +1,851 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue]{hyperref}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{assumption}{Assumption}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{prediction}{Prediction}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\cA}{\mathcal{A}}
+\newcommand{\cB}{\mathcal{B}}
+\newcommand{\cP}{\mathcal{P}}
+\newcommand{\cM}{\mathcal{M}}
+\newcommand{\ip}[2]{\left\langle #1, #2 \right\rangle}
+\newcommand{\KL}{\mathrm{KL}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+
+\title{Why Magnetic Mirror Descent on Gaussian--Mixture Policies\\
+Converges to Mixed Nash Equilibria of Continuous Games:\\
+Lifted Monotonicity and Local Monotone Islands}
+\author{Theory notes for \texttt{cont\_tinkering}}
+\date{July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Magnetic Mirror Descent (MMD) provably converges to Nash equilibria only for
+\emph{monotone} games, yet empirically it converges on continuous-action
+zero-sum games with mixed equilibria when the policy is a $K$-component
+Gaussian mixture (categorical head over component means/scales) --- a setting in
+which the game, viewed in policy \emph{parameters}, is far from monotone. We
+explain this with a three-layer argument. (1)~The mixed extension of \emph{any}
+zero-sum game over probability measures is bilinear, hence its pseudo-gradient
+operator is monotone --- in fact exactly skew; the measure-space MMD dynamics are
+therefore squarely inside the standard convergence theory, and all
+non-monotonicity is an artifact of the parameterization. (2)~The implemented
+update is mirror descent in the Kullback--Leibler geometry of the hierarchical
+policy (exact simplex MMD on the categorical head, Fisher--Rao natural gradient
+on the Gaussian heads): it is the restriction of the lifted monotone flow to
+the mixture submanifold. (3)~For zero-sum games the symmetrized Jacobian of the
+parametric pseudo-gradient field is block-diagonal (cross-player blocks are
+skew), so the field is monotone on any region where each player's payoff is
+concave in its own parameters. At a Nash-realizing configuration each player's
+\emph{effective landscape} --- its own payoff term plus the coupling evaluated
+at the opponent's generalized moments --- has a strict local maximum at every
+component mean, so the payoff is locally strongly concave in own parameters,
+the field is locally (strongly, once the magnet is added) monotone, and MMD
+converges linearly. Convergence is therefore \emph{local by nature}: other
+locally-monotone ``islands'' (a mass-dominated decoy, symmetric ties,
+simplex-boundary freezes) coexist, and the initialization selects among them.
+Nothing in the development assumes the game is symmetric under exchange of the
+players: the two players may have different action sets, different landscapes,
+different feature maps, different numbers of mixture components and different
+hyperparameters. Every quantitative prediction of this theory is verified
+numerically in the accompanying experiments (\texttt{theory/exp1--exp5}).
+\end{abstract}
+
+\section{Setting and notation}
+
+\subsection{Game class}\label{sec:class}
+
+Throughout, player~$0$ is the maximizer with compact action set
+$\cA \subset \R^{n_0}$ and player~$1$ is the minimizer with compact action set
+$\cB \subset \R^{n_1}$. The two sets need not coincide, and $n_0 \ne n_1$ is
+allowed. We consider three nested levels of structure, and we will be explicit
+about which level each statement needs.
+
+\paragraph{(G0) Arbitrary zero-sum.} $u : \cA \times \cB \to \R$ bounded and
+measurable. Nothing else. This is all that Section~\ref{sec:layer1} uses.
+
+\paragraph{(G1) Finite rank plus own landscapes.} There are $C^2$ functions
+$\varphi_1,\dots,\varphi_m : \cA \to \R$ and $\psi_1,\dots,\psi_m : \cB \to \R$
+and $C^2$ \emph{landscapes} $D_0 : \cA \to \R$, $D_1 : \cB \to \R$ with
+\begin{equation}\label{eq:game}
+  u(a,b) \;=\; D_0(a) \;-\; D_1(b) \;+\; \sum_{j=1}^{m}
+  \varphi_j(a)\, \psi_j(b)
+  \;=\; D_0(a) - D_1(b) + \ip{\varphi(a)}{\psi(b)} .
+\end{equation}
+The defining property is that the opponent enters each player's utility only
+through the finite-dimensional \emph{moment vector}
+$\E_\nu \psi \in \R^m$ (resp.\ $\E_\mu \varphi \in \R^m$); the rank $m$ may be
+arbitrary but is finite. A coupling of the form $c\,\ip{f(a)}{M g(b)}$ with a
+constant matrix $M$ and a scalar strength $c$ is the special case
+$\varphi = c f$, $\psi = M g$, so writing the strength explicitly is a matter
+of taste; we keep $c$ visible where the experiments sweep it, i.e.\ we write
+$\varphi = c\, f$ with $\|f\|$ normalized. Section~\ref{sec:local} uses (G1)
+only to make its hypotheses \emph{checkable}; the theorem itself is stated
+under abstract hypotheses that (G1) implies.
+
+\paragraph{(G2) The codebase class.} (G1) with $\cA = \cB = [a_{\min},
+a_{\max}] \subset \R$, each landscape a finite sum of Gaussian bumps
+$D_i(x) = \sum_j h^{(i)}_j \exp\big({-}(x - p^{(i)}_j)^2 / 2 (w^{(i)}_j)^2\big)$,
+and $\varphi_j(a) = c\,(\iota(a)^j - t_j)$, $\psi_j(b) = \iota(b)^j - t'_j$
+normalized monomials in a rescaled coordinate $\iota$, with the shifts
+$t, t'$ chosen so that the equilibrium moments vanish (see
+Remark~\ref{rem:centering}: the shifts are a normalization, not a restriction).
+This class contains \texttt{MultiPointGame} and \texttt{DecoyWellGame}. It is
+used only to obtain closed forms: the smoothed landscape, the smoothed
+features, and the explicit constants of Lemma~\ref{lem:bias} and
+Assumption~\ref{ass:curv}. The multidimensional separable case is
+Remark~\ref{rem:multidim}.
+
+\begin{remark}[No symmetry is assumed]\label{rem:asym}
+The classical instances in the codebase happen to satisfy $D_0 = D_1$,
+$\varphi = c\,f$, $\psi = f$, $\cA = \cB$, hence $u(a,b) = -u(b,a)$: the game
+is symmetric under exchange of the players. \emph{None of the results below use
+this.} What is used is that the game is \emph{zero-sum}: a single payoff $u$
+enters the two players' objectives with opposite signs. Where the symmetric
+case would let one write ``and player~1 is symmetric'', we instead carry the
+second player's own objects ($D_1$, $\psi$, $K_1$, $\eta_1$, $\tau_1$, floor
+$s_1$) explicitly. The one place where player-exchange symmetry does more than
+save notation is discussed in Remark~\ref{rem:where-symmetry-helps}, and it
+concerns the \emph{global} transit analysis, not any statement proved here.
+\end{remark}
+
+\begin{remark}[Centering convention]\label{rem:centering}
+Under (G1), let $(\mu^\star, \nu^\star)$ be a mixed equilibrium and put
+$\bar\psi \coloneqq \E_{\nu^\star} \psi$, $\bar\varphi \coloneqq
+\E_{\mu^\star} \varphi$. Replacing
+\[
+  D_0 \leftarrow D_0 + \ip{\varphi(\cdot)}{\bar\psi}, \quad
+  D_1 \leftarrow D_1 + \ip{\bar\varphi}{\psi(\cdot)}, \quad
+  \varphi \leftarrow \varphi - \bar\varphi, \quad
+  \psi \leftarrow \psi - \bar\psi
+\]
+changes $u$ by the constant $-\ip{\bar\varphi}{\bar\psi}$ and leaves the game
+strategically identical, while enforcing
+$\E_{\nu^\star}\psi = 0$ and $\E_{\mu^\star}\varphi = 0$. Hence the statement
+``at the equilibrium the coupling term vanishes identically'' is a
+\emph{normalization}, available in every game of class (G1), and not an extra
+hypothesis --- in particular it is not a consequence of symmetry. What is
+\emph{not} free, and is the real hypothesis of Section~\ref{sec:local}, is that
+the atoms of $\mu^\star$ are strict local maxima of the \emph{recentered}
+landscape $D_0$ (and the atoms of $\nu^\star$ strict local minima of the
+recentered $D_1$). In the codebase this recentering is what the target shifts
+$t_j$ implement.
+\end{remark}
+
+\begin{remark}[Scope map: how much structure each result needs]\label{rem:scope}
+\begin{center}
+\begin{tabular}{lll}
+\hline
+result & needs & does \emph{not} need\\
+\hline
+Lemma~\ref{lem:lift} (lifted skewness) & (G0), zero-sum & structure of $u$,
+symmetry, $\cA = \cB$\\
+Cor.~\ref{cor:measure-mmd} & (G0) + Lipschitz field & anything parametric\\
+Lemma~\ref{lem:skewblock} (block-skew) & zero-sum, $C^2$ in parameters &
+(G1), equal parameter dimensions\\
+Lemma~\ref{lem:bias} (bias) & (G2) for the constant; (G1) + $C^2$ for
+$O(s^2)$ & symmetry, equal floors\\
+Thm.~\ref{thm:local} (islands) & Assumptions \ref{ass:reg}--\ref{ass:curv} &
+(G1)/(G2); these are implied by, not equivalent to, (G1)\\
+Prop.~\ref{prop:islands} (coexisting islands) & Assumptions
+\ref{ass:reg}--\ref{ass:curv} & moment matching, symmetry\\
+\hline
+\end{tabular}
+\end{center}
+In words: Layers 1--2 are structure-free consequences of the zero-sum property;
+Layer~3 needs only that each player's \emph{effective landscape} is $C^2$ and
+strongly concave (resp.\ convex) near the realized atoms, uniformly in the
+opponent's policy; class (G1) is what makes ``uniformly in the opponent's
+policy'' checkable, because the opponent enters through $m$ numbers; class (G2)
+is what makes the constants explicit.
+\end{remark}
+
+\subsection{Mixed extension}
+For $\mu \in \cP(\cA)$, $\nu \in \cP(\cB)$ (Borel probability measures),
+\begin{equation}\label{eq:mixed}
+  U(\mu, \nu) = \E_{a \sim \mu,\, b \sim \nu}\, u(a,b) .
+\end{equation}
+By Glicksberg's theorem a mixed Nash equilibrium exists whenever $u$ is
+continuous on the compact $\cA \times \cB$. We write the two \emph{effective
+landscapes} --- the object each player actually climbs, given the opponent ---
+as
+\begin{equation}\label{eq:effective}
+  Q_\nu(a) \coloneqq \int u(a,b)\, d\nu(b), \qquad
+  W_\mu(b) \coloneqq -\int u(a,b)\, d\mu(a),
+\end{equation}
+so that player~0 maximizes $\E_\mu Q_\nu$ and player~1 maximizes
+$\E_\nu W_\mu$. Under (G1) and up to additive constants (which are irrelevant
+to both the dynamics and the equilibrium),
+\begin{equation}\label{eq:effective-G1}
+  Q_\nu(a) = D_0(a) + \ip{\varphi(a)}{\E_\nu \psi}, \qquad
+  W_\mu(b) = D_1(b) - \ip{\E_\mu \varphi}{\psi(b)} .
+\end{equation}
+Note the \emph{opposite signs} of the two coupling terms: this is the point at
+which a symmetric treatment silently conflates the two players. All statements
+below are made separately for $Q$ and $W$.
+
+\subsection{Policy class and the implemented update}
+Player $i$ uses a $K_i$-component Gaussian mixture (the numbers $K_0, K_1$ need
+not agree)
+\begin{equation}
+  \pi_{\theta_i} = \sum_{k=1}^{K_i} w^{(i)}_k\,
+  \mathcal{N}\big(\mu^{(i)}_k, (\sigma^{(i)}_k)^2\big), \qquad
+  \theta_i = (\ell^{(i)}, \mu^{(i)}, \rho^{(i)}), \quad
+  w^{(i)} = \mathrm{softmax}(\ell^{(i)}),
+\end{equation}
+with $\sigma^{(i)}_k = e^{\rho^{(i)}_k}$ subject to a hard floor
+$\sigma^{(i)}_k \ge s_i$ ($s_i = 10^{-3}$ in the code). The update
+(\texttt{idealized\_mmd.py}) is, per player $i$, with step $\eta_i$, magnet
+temperature $\tau_i$, magnet policy $\pi_{\bar\theta_i}$ refreshed every $T$
+steps:
+\begin{align}
+  \text{categorical head:}\quad
+  & \ell^{(i),+} = \frac{\eta_i\, q^{(i)} + \eta_i \tau_i \log \bar w^{(i)}
+    + \log w^{(i)}}{1 + \eta_i\tau_i},
+  \label{eq:cat}\\[2pt]
+  & \qquad q^{(0)}_k = \E_{a \sim \mathcal{N}(\mu^{(0)}_k, (\sigma^{(0)}_k)^2)}
+    Q_\nu(a), \qquad
+    q^{(1)}_k = \E_{b \sim \mathcal{N}(\mu^{(1)}_k, (\sigma^{(1)}_k)^2)}
+    W_\mu(b), \notag\\
+  \text{Gaussian heads:}\quad
+  & \mu^{(i),+} = \mu^{(i)} + \eta_i\, (\sigma^{(i)})^2 \odot
+    \nabla_{\mu^{(i)}} \Phi_i, \qquad
+    \rho^{(i),+} = \rho^{(i)} + \tfrac{\eta_i}{2}\,
+    \nabla_{\rho^{(i)}} \Phi_i,
+  \label{eq:gauss}
+\end{align}
+where $\Phi_0 = U - \tau_0 \KL(\pi_{\theta_0} \| \pi_{\bar\theta_0})$ and
+$\Phi_1 = -U - \tau_1 \KL(\pi_{\theta_1} \| \pi_{\bar\theta_1})$ (each player
+ascends its own objective), and the preconditioners $(\sigma^{(i)})^2$ and
+$\tfrac12$ are the inverse Fisher metric of $\mathcal{N}(\mu, e^{\rho})$.
+Equation~\eqref{eq:cat} is the \emph{exact closed-form} MMD proximal step on
+the simplex (Sokota et al., 2023); equation~\eqref{eq:gauss} is its small-step
+(Fisher--Rao natural gradient) limit for the location--scale heads. Thus each
+player's update is mirror descent in the KL geometry of its own hierarchical
+policy $(k \sim \mathrm{Cat}(w^{(i)}),\ x \sim \mathcal{N}(\mu^{(i)}_k,
+(\sigma^{(i)}_k)^2))$. Note that \eqref{eq:cat}--\eqref{eq:gauss} are
+\emph{decoupled across players} given the opponent's policy: nothing in the
+algorithm presumes the two players run the same $\eta$, $\tau$, $K$ or floor.
+
+\section{Layer 1: the lifted game is monotone --- exactly skew}
+\label{sec:layer1}
+
+\begin{definition}[Monotone game]
+Let $z = (\mu, \nu) \in \cP(\cA) \times \cP(\cB)$ and let
+$F(z) = \big({-}\nabla_{\mu} U(\mu,\nu),\ \nabla_{\nu} U(\mu,\nu)\big)$
+be the descent field of the min--max problem $\max_\mu \min_\nu U$. The game is
+\emph{monotone} on a convex set $S$ if
+$\ip{F(z) - F(z')}{z - z'} \ge 0$ for all $z, z' \in S$.
+\end{definition}
+
+\begin{lemma}[Lifted monotonicity]\label{lem:lift}
+For \emph{any} bounded measurable $u : \cA \times \cB \to \R$ --- in particular
+with $\cA \ne \cB$, of different dimensions, and with no symmetry between the
+players --- the mixed extension \eqref{eq:mixed} is affine in $\mu$ for fixed
+$\nu$ and affine in $\nu$ for fixed $\mu$, and its pseudo-gradient field is
+monotone on $\cP(\cA) \times \cP(\cB)$ with equality:
+\[
+  \ip{F(z) - F(z')}{z - z'} = 0 \qquad
+  \forall\, z, z' \in \cP(\cA) \times \cP(\cB) .
+\]
+\end{lemma}
+
+\begin{proof}
+We spell the argument out in five steps. Throughout, the pairing between a
+bounded measurable function $g$ and a finite signed measure $\delta$ is
+$\ip{g}{\delta} \coloneqq \int g\, d\delta$ --- the measure plays the role of
+the vector, the function the role of the gradient (in the finite-dimensional
+discretization this is literally $\ip{g}{\delta} = \sum_i g_i \delta_i$, and
+the whole proof below reduces to: $U(p,q) = p^\top\! A q$ with $A$ an arbitrary
+\emph{rectangular} matrix, $F(p,q) = (-Aq,\, A^\top\! p)$, and
+$-\delta p^\top\! A\, \delta q + \delta q^\top\! A^\top \delta p = 0$ because a
+scalar equals its own transpose --- squareness of $A$, i.e.\ $|\cA| = |\cB|$,
+is never used, and neither is $A = -A^\top$, i.e.\ symmetry of the game).
+
+\emph{Step 1 (linearity and gradients).} By Fubini,
+\[
+  U(\mu, \nu) = \iint u(a,b)\, d\mu(a)\, d\nu(b)
+  = \int \Big[\underbrace{\textstyle\int u(a,b)\, d\nu(b)}_{=\, Q_\nu(a)}
+  \Big]\, d\mu(a) = \ip{Q_\nu}{\mu}.
+\]
+For fixed $\nu$, $U$ is therefore a \emph{linear} functional of $\mu$ with
+coefficient function $Q_\nu$; its G\^ateaux derivative at any $\mu$ in the
+direction of a signed measure $\delta$ is
+$\tfrac{d}{dt} U(\mu + t\delta, \nu)\big|_{t=0} = \ip{Q_\nu}{\delta}$,
+so $\nabla_\mu U = Q_\nu$ --- a function on $\cA$ only, independent of $\mu$
+itself. In the same way $\nabla_\nu U = -W_\mu$, a function on $\cB$ only,
+with $W_\mu$ as in \eqref{eq:effective}. The two objects live on different
+spaces and are computed from different sections of $u$; no relation between
+them is needed.
+
+\emph{Step 2 (the field).} Player $0$ maximizes and player $1$ minimizes, so
+the descent field of the min--max problem is
+$F(\mu, \nu) = \big({-}Q_\nu,\ -W_\mu\big)$; note each block depends only on
+the \emph{opponent's} measure.
+
+\emph{Step 3 (blockwise expansion).} With $z = (\mu,\nu)$, $z' = (\mu',\nu')$,
+$\delta\mu \coloneqq \mu - \mu'$, $\delta\nu \coloneqq \nu - \nu'$, the inner
+product on the product space is the sum of the per-player pairings:
+\[
+  \ip{F(z) - F(z')}{z - z'}
+  = \ip{-Q_\nu + Q_{\nu'}}{\delta\mu} + \ip{-W_\mu + W_{\mu'}}{\delta\nu}.
+\]
+
+\emph{Step 4 (each block is the same double integral).} By linearity of the
+integral in the measure,
+\[
+  Q_\nu(a) - Q_{\nu'}(a) = \int u(a,b)\, d(\delta\nu)(b),
+\]
+and pairing this function of $a$ against $\delta\mu$ means integrating it
+against $d(\delta\mu)(a)$:
+\[
+  \ip{Q_\nu - Q_{\nu'}}{\delta\mu}
+  = \int\!\Big[\int u(a,b)\, d(\delta\nu)(b)\Big]\, d(\delta\mu)(a)
+  = \iint u\; d(\delta\mu)\, d(\delta\nu) \eqqcolon I .
+\]
+The second block is the mirrored computation: $W_{\mu'}(b) - W_\mu(b) =
+\int u(a,b)\, d(\delta\mu)(a)$, and pairing against $\delta\nu$ gives, by
+Fubini, the \emph{identical} scalar $I$.
+
+\emph{Step 5 (cancellation).} The first block carries the minus sign from the
+field:
+\[
+  \ip{F(z) - F(z')}{z - z'} = -I + I = 0. \qedhere
+\]
+\end{proof}
+
+\begin{corollary}\label{cor:measure-mmd}
+Measure-space MMD (equivalently: tabular MMD on any finite discretization of
+$\cA$ and $\cB$, with the two grids independent) on any game of class (G0)
+satisfies the monotonicity assumption of Sokota et al.\ (2023, Thm.~3.4): with
+entropy regularization $\tau > 0$ it converges linearly to the
+$\tau$-regularized equilibrium provided the step size obeys the theorem's bound
+(of the form $\eta \le \tau / L^2$ with $L$ the operator's Lipschitz constant),
+and the magnet outer loop drives the regularized equilibria to a Nash
+equilibrium.
+\end{corollary}
+
+\begin{remark}
+Corollary~\ref{cor:measure-mmd} already dissolves half the puzzle: the games
+here (including the ``non-monotone'' \textsc{Forsaken} saddle and the decoy
+well) are \emph{monotone in measure space}. Classical non-convergence results
+for these games concern \emph{pure-strategy} (point) dynamics. Experiment~1
+confirms both halves: tabular MMD converges globally on all of them (even
+initialized on the decoy --- slowly, gaining $\Theta(\Delta q / \tau)$ log-mass
+per magnet cycle, but inevitably, because in measure space support never
+dies), and violating the step-size bound makes it cycle even in the exact
+lifted space, cleanly separating step-size failures from parameterization
+failures.
+\end{remark}
+
+\section{Layer 2: zero-sum structure of the parametric field}
+
+Restrict $U$ to the mixture families:
+$\widehat{U}(\theta_0, \theta_1) \coloneqq U(\pi_{\theta_0}, \pi_{\theta_1})$
+with $\theta_0 \in \R^{d_0}$, $\theta_1 \in \R^{d_1}$ and, in general,
+$d_0 \ne d_1$ (different $K_i$, different action dimensions). Let
+\[
+  F(\theta_0,\theta_1) =
+  \big({-}\nabla_{\theta_0}\widehat U,\ \nabla_{\theta_1}\widehat U\big)
+\]
+be the parametric descent field ($C^2$ on the interior of the parameter box).
+
+\begin{lemma}[Block-skew structure]\label{lem:skewblock}
+The Jacobian of $F$,
+\[
+  J = \begin{pmatrix}
+    -\nabla^2_{\theta_0\theta_0} \widehat U & -\nabla^2_{\theta_0\theta_1} \widehat U\\[2pt]
+    \ \ \nabla^2_{\theta_1\theta_0} \widehat U & \ \ \nabla^2_{\theta_1\theta_1} \widehat U
+  \end{pmatrix}
+  \in \R^{(d_0 + d_1) \times (d_0 + d_1)},
+\]
+has symmetric part
+$\tfrac12 (J + J^\top) = \mathrm{blockdiag}\!\big({-}\nabla^2_{\theta_0\theta_0}
+\widehat U,\ \nabla^2_{\theta_1\theta_1} \widehat U\big)$: the cross-player
+blocks cancel exactly. Consequently $F$ is monotone on a convex set $S$ if and
+only if $\widehat U(\cdot, \theta_1)$ is concave in $\theta_0$ and $\widehat
+U(\theta_0, \cdot)$ is convex in $\theta_1$ throughout $S$; and $F$ is
+$\alpha$-strongly monotone on $S$ iff the two own-blocks are uniformly
+$\alpha$-definite there.
+\end{lemma}
+
+\begin{proof}
+The off-diagonal blocks of $J$ are the $d_0 \times d_1$ matrix
+$-\nabla^2_{\theta_0\theta_1}\widehat U$ and the $d_1 \times d_0$ matrix
+$+\nabla^2_{\theta_1\theta_0}\widehat U = +\big(\nabla^2_{\theta_0\theta_1}
+\widehat U\big)^{\!\top}$ (equality of mixed partials of the single scalar
+$\widehat U$); in $\tfrac12(J + J^\top)$ they appear as
+$\tfrac12\big({-}\nabla^2_{\theta_0\theta_1}\widehat U +
+\nabla^2_{\theta_0\theta_1}\widehat U\big) = 0$. Monotonicity of a $C^1$ field
+on a convex set is equivalent to positive semidefiniteness of the symmetrized
+Jacobian on that set, which is now equivalent to the stated
+concavity/convexity. \emph{This uses only that the game is zero-sum} --- the
+single payoff $\widehat U$ appears with opposite signs for the two players, so
+whatever cross-curvature exists is antisymmetric between the blocks. It does
+not use $d_0 = d_1$, any correspondence between the two parameterizations, or
+any symmetry of $u$; the cancellation is between a matrix and the transpose of
+the \emph{same} matrix, which exists for rectangular blocks just as well.
+\end{proof}
+
+\begin{remark}[Where monotonicity is lost, and where it is not]
+Lemma~\ref{lem:skewblock} localizes the entire failure of monotonicity in the
+own-player curvature. The interaction between the players --- however strong the
+coupling --- never breaks monotonicity by itself. The mixture parameterization
+breaks it exactly where $\theta_i \mapsto \widehat U$ fails the required
+own-curvature sign, i.e.\ where a component mean sits in a convex region of its
+effective landscape \eqref{eq:effective}. Note also that the categorical heads
+never contribute: $\widehat U$ is \emph{exactly linear} in each player's own
+mixture weights $w^{(i)}$, and update~\eqref{eq:cat} operates on the simplex
+where this linearity lives (the softmax non-concavity in $\ell$ is absorbed by
+the mirror map). Because the lemma treats the two players independently, one
+player may be in a monotone region while the other is not; the field is
+monotone precisely on the intersection.
+\end{remark}
+
+\section{Layer 3: local monotone islands}\label{sec:local}
+
+\subsection{Effective landscapes and Nash-realizing configurations}
+
+Write $\Lambda_s \coloneqq \Lambda * \mathcal{N}(0, s^2)$ for the Gaussian
+smoothing of a function $\Lambda$ at scale $s$; under (G2) both $D_{i,s}$ and
+the smoothed features are available in closed form, which is what the code
+computes. Fix an equilibrium $(\mu^\star, \nu^\star)$, recentered as in
+Remark~\ref{rem:centering}, with finite supports
+\[
+  \mathrm{supp}(\mu^\star) = \{p_1, \dots, p_{K_0^\star}\} \subset \cA,
+  \qquad
+  \mathrm{supp}(\nu^\star) = \{r_1, \dots, r_{K_1^\star}\} \subset \cB,
+\]
+and weights $w^{(0)\star}, w^{(1)\star}$. The two supports are unrelated: they
+live in different spaces and may have different cardinalities.
+
+\begin{definition}[Nash-realizing configuration]
+Given scales $s_0, s_1$, the configuration $z^\star_s = (\theta^\star_0,
+\theta^\star_1)$ has $K_i = K_i^\star$, $\mathrm{softmax}(\ell^{(i)\star}) =
+w^{(i)\star}$, one component mean of player~0 at each $p_k$, one component mean
+of player~1 at each $r_l$, and $\sigma^{(i)} = s_i$ at the respective floor.
+\end{definition}
+
+\begin{assumption}[Regularity and identifiability]\label{ass:reg}
+(i) $u$ is $C^2$ on $\cA \times \cB$, with $\sup \|\nabla^2 u\| < \infty$.
+(ii) The $K_1^\star \times K_0^\star$ payoff matrix $A_{lk} = u(p_k, r_l)$ has
+$(w^{(0)\star}, w^{(1)\star})$ as its \emph{unique} Nash equilibrium, and both
+are fully mixed. (iii) Each $p_k$ is a strict local maximum of the recentered
+$D_0$, each $r_l$ a strict local maximum of the recentered $D_1$.
+\end{assumption}
+
+Part (ii) is the general form of the Vandermonde argument in the
+\texttt{MultiPointGame} docstrings: there, $A$ is generated by the moment
+features and its nonsingularity follows from distinctness of the support
+points. Stated as a property of the matrix $A$ it needs neither the monomial
+structure nor $K_0^\star = K_1^\star$: it is the standard condition that the
+support-restricted matrix game has a unique fully-mixed equilibrium.
+
+\begin{lemma}[Representation and smoothing bias]\label{lem:bias}
+Under Assumption~\ref{ass:reg} and class (G1), at $z^\star_s$ with
+$K_i = K_i^\star$:
+$\E_{\pi_{\theta_0^\star}} \varphi = O(s_0^2)$ and
+$\E_{\pi_{\theta_1^\star}} \psi = O(s_1^2)$ (exactly $0$ for features affine in
+the action), and the exploitability of the pair splits into a sum of
+\emph{per-player} smoothing deficits:
+\[
+  \mathrm{expl}(z^\star_s)
+  \;=\; \Big(\max_a D_0 - \E_{\pi_{\theta_0^\star}} D_0\Big)
+     +\; \Big(\max_b D_1 - \E_{\pi_{\theta_1^\star}} D_1\Big)
+     + O(s_0^4 + s_1^4) .
+\]
+Under (G2), with $\bar h_i, \bar w_i$ the heights and widths of the support
+bumps of player $i$, each term equals
+$\sum_k w^{(i)\star}_k h^{(i)}_k \big(1 - w^{(i)}_k /
+\sqrt{(w^{(i)}_k)^2 + s_i^2}\big)
+= \tfrac12 \bar h_i s_i^2 / \bar w_i^2 + O(s_i^4)$. In the symmetric two-peak
+game with a common floor $s$ this collapses to the familiar
+$2h\big(1 - w/\sqrt{w^2+s^2}\big)$.
+\end{lemma}
+
+\begin{proof}
+Gaussian convolution: a bump $(h, w, p)$ convolved with $\mathcal{N}(0,s^2)$
+has height $h w / \sqrt{w^2 + s^2} = h\,(1 - \tfrac{s^2}{2w^2} + O(s^4))$ and
+retains its center; features that are polynomial pick up central moments, which
+shift even-degree terms by $O(s^2)$ and odd-degree terms not at all (for a
+general $C^2$ feature, $\E_{\mathcal{N}(x,s^2)}\varphi = \varphi(x) +
+\tfrac{s^2}{2}\varphi'' + O(s^4)$, giving the same order). At $z^\star_s$ the
+coupling contribution to player~0's best-response problem is
+$\ip{\varphi(a)}{\E_{\pi_{\theta_1^\star}}\psi} = O(s_1^2)$ uniformly in $a$
+(compactness plus boundedness of $\varphi$), so player~0's best response is
+within $O(s_1^2)$ of a maximizer of $D_0$ and the loss against it is the
+smoothing deficit of $D_0$ at $\mu^\star$'s atoms; the same computation with
+$0 \leftrightarrow 1$ gives the second term. The two terms are computed from
+different landscapes and different floors and are simply added --- there is no
+factor $2$ except in the symmetric special case.
+\end{proof}
+
+Experiment 5 verifies the exact constant to $10^{-5}$ and the $s^2$ rate
+(measured log--log slope $2.002$) in the symmetric instance.
+
+\subsection{The local convergence theorem}
+
+\begin{assumption}[Curvature dominance at the realized scale]\label{ass:curv}
+There are radii $r_0 > 0$ and constants $\alpha_0, \alpha_1 > 0$ such that for
+every configuration $z = (\theta_0, \theta_1)$ with each component mean within
+$r_0$ of its assigned support point, each weight vector within $r_0$ of
+$w^{(i)\star}$, and $\sigma^{(i)}$ at the floor $s_i$:
+\[
+  w^{(0)}_k\, \big(Q_{\nu}\big)_{s_0}''\big(\mu^{(0)}_k\big) \le -\alpha_0
+  \quad \text{for all } k \le K_0,
+  \qquad
+  w^{(1)}_l\, \big(W_{\mu}\big)_{s_1}''\big(\mu^{(1)}_l\big) \le -\alpha_1
+  \quad \text{for all } l \le K_1,
+\]
+where $\nu = \pi_{\theta_1}$, $\mu = \pi_{\theta_0}$ and $Q, W$ are the
+effective landscapes \eqref{eq:effective}. (For multidimensional actions,
+read $''$ as the Hessian and $\le -\alpha$ as ``$\preceq -\alpha I$''.)
+\end{assumption}
+
+Under (G1) the effective landscapes are \eqref{eq:effective-G1}, so
+Assumption~\ref{ass:curv} reads, for player~0,
+\[
+  w^{(0)}_k\Big[ D_{0,s_0}''(\mu^{(0)}_k)
+  + \big\langle \varphi_{s_0}''(\mu^{(0)}_k),\, \E_{\pi_{\theta_1}}
+  \psi \big\rangle \Big] \le -\alpha_0 ,
+\]
+and for player~1 with $D_1$, $\psi$, and the moment $\E_{\pi_{\theta_0}}
+\varphi$ entering with the opposite sign. This is where finite rank pays off:
+the opponent's influence on player~0's curvature is entirely through the
+$m$-vector $\E_\nu \psi$, whose norm is $O(s_1^2 + r_0)$ on the neighborhood by
+Lemma~\ref{lem:bias} and continuity. Under (G2) the assumption holds with room
+to spare: $|D_{0,s}''(p)| \approx \bar h_0 / \bar w_0^2$ ($\approx 156$ for
+$\bar w_0 = 0.08$) while the coupling term is $O(c\, r_0 \|f''\|)$, so the
+inequality holds whenever
+\[
+  r_0 \;\lesssim\; \min\Big\{ \sqrt{\bar w_0^2 + s_0^2},\quad
+  \bar h_0 / \big(c\, \bar w_0^2 \|f''\|\big) \Big\},
+\]
+and symmetrically for player~1 with its own bumps. The first bound (the
+concavity cap of the Gaussian bump) is the binding one for all moderate $c$;
+the coupling can only bite once $c = \Omega(\bar h_0 / \bar w_0^2)$.
+Experiment~3 measures exactly this: the certified region is flat in $c$ through
+$c = 8$ and collapses only at extreme couplings. Note that in an asymmetric
+game the two radii can differ by orders of magnitude --- the certified island is
+the intersection, and the player with the flatter landscape is the binding one.
+
+\begin{theorem}[Local monotonicity and linear convergence]\label{thm:local}
+Under Assumptions~\ref{ass:reg} and~\ref{ass:curv}, let $N$ be the set of
+configurations described there (a convex neighborhood of $z^\star_s$ in the
+means and simplex coordinates). Then:
+\begin{enumerate}
+\item[(i)] The parametric field $F$, expressed in the mirror coordinates the
+update actually uses (simplex weights for each categorical head, Fisher--Rao
+metric for each set of means), is monotone on $N$; with magnet terms
+$\tau_i > 0$ centered at any $\bar z \in N$, the regularized field
+$F_\tau(z) = F(z) + \big(\tau_0 \nabla \KL_0,\ \tau_1 \nabla \KL_1\big)$ is
+$\tau'$-strongly monotone on $N$ with
+$\tau' \ge \min_i \tau_i\, \kappa_{N,i}$, where $\kappa_{N,i} > 0$ is the
+strong-convexity modulus of player $i$'s KL regularizer on $N$.
+\item[(ii)] The discrete update \eqref{eq:cat}--\eqref{eq:gauss} with magnets
+fixed at $\bar z$ is a local contraction: for $\eta_i$ below a threshold set by
+the Lipschitz constant of $F$ on $N$, the iterates converge linearly to the
+unique fixed point $z_\tau(\bar z) \in N$ of $F_\tau$, at rate
+$1 - \Theta(\min_i \eta_i \tau_i)$.
+\item[(iii)] The magnet outer loop (refresh $\bar z \leftarrow z$ every $T$
+steps) has $z^\star_s$ as its unique fixed point in $N$, and the composite
+iteration initialized in a sufficiently small neighborhood of $z^\star_s$
+converges to $z^\star_s$; by Lemma~\ref{lem:bias} the limiting policy pair is
+an $O(s_0^2 + s_1^2)$-Nash equilibrium of the underlying continuous game.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+(i) By Lemma~\ref{lem:skewblock} it suffices to show that each player's payoff
+is concave in its own coordinates on $N$, in the appropriate sign. We give
+player~0's computation; player~1's is the same computation applied to $W_\mu$
+in place of $Q_\nu$, with its own $K_1$, $s_1$, $\alpha_1$ --- \emph{not} an
+appeal to symmetry.
+
+Own coordinates are $(w^{(0)}, \mu^{(0)})$ with $\sigma^{(0)}$ pinned at the
+floor (the update pushes $\rho^{(0)}$ below the floor throughout $N$ ---
+widening a component strictly lowers the smoothed effective landscape near a
+strict local max --- so the clip is active and the $\rho$-block is inert;
+formally, monotonicity is needed only on the face of the box where the
+dynamics live). On $N$, writing $\bar Q(x) \coloneqq (Q_\nu)_{s_0}(x)$,
+\[
+  \widehat U(w^{(0)}, \mu^{(0)}; \nu)
+  = \sum_k w^{(0)}_k\, \bar Q\big(\mu^{(0)}_k\big)
+  + \text{terms without } (w^{(0)}, \mu^{(0)}).
+\]
+The Hessian in $(w^{(0)}, \mu^{(0)})$ has blocks: $\partial^2_{ww} = 0$
+(linear), $\partial^2_{\mu_k \mu_k} = w^{(0)}_k \bar Q''(\mu^{(0)}_k) \le
+-\alpha_0$ by Assumption~\ref{ass:curv}, $\partial^2_{w_k \mu_k} =
+\bar Q'(\mu^{(0)}_k)$, and zero between distinct components. Each
+$2 \times 2$ block
+$\begin{psmallmatrix} 0 & \bar Q' \\ \bar Q' & w \bar Q'' \end{psmallmatrix}$
+is negative semidefinite iff $\bar Q' = 0$; on $N$,
+$\bar Q'(\mu^{(0)}_k) = O(r_0 + s_1^2)$ rather than exactly zero, so we argue
+in the mirror geometry instead. The update~\eqref{eq:cat} never uses curvature
+of $\widehat U$ in $w^{(0)}$ --- it is the exact proximal step of the
+\emph{linear} functional $\ip{w^{(0)}}{q^{(0)}}$ --- and the monotonicity gap
+decomposes as
+\[
+  \ip{F(z) - F(z')}{z - z'} =
+  \underbrace{\textstyle\sum_i \sum_k
+  \big(w^{(i)}_k - w^{(i)\prime}_k\big)\big(q^{(i)\prime}_k - q^{(i)}_k\big)}
+  _{\text{categorical, both players}}
+  \;+\; \underbrace{\text{mean terms}}
+  _{\ \ge\ \alpha_0 \|\mu^{(0)} - \mu^{(0)\prime}\|^2_{w}
+    + \alpha_1 \|\mu^{(1)} - \mu^{(1)\prime}\|^2_{w}} .
+\]
+In the categorical sum, the part of $q^{(i)}$ that depends on the
+\emph{opponent} is linear in the opponent's policy, and the two players'
+contributions cancel in pairs by the computation of Lemma~\ref{lem:lift}
+(Step~4--5 applied to the discretization induced by the two component sets ---
+a $K_1 \times K_0$ rectangular matrix game, no squareness needed). The
+remaining categorical--own-mean interaction is
+$O(r_0)\,\|w^{(i)} - w^{(i)\prime}\|\,\|\mu^{(i)} - \mu^{(i)\prime}\|$ and is
+dominated by $\alpha_i\|\mu^{(i)}-\mu^{(i)\prime}\|^2 +
+\tau_i \kappa_{N,i}\|w^{(i)}-w^{(i)\prime}\|^2$ once $\tau_i > 0$ and
+$r_0 \le \min_i \sqrt{\alpha_i \tau_i \kappa_{N,i}}$. Shrinking $r_0$
+accordingly gives (i); the strong monotonicity constant is inherited from the
+KL magnets, each $\kappa_{N,i}$-strongly convex on the truncated simplex and
+Fisher--Rao ball, and the pair is $\min_i \tau_i \kappa_{N,i}$-strongly
+monotone.
+
+(ii) is the standard convergence of mirror descent / the forward step for
+strongly monotone, Lipschitz variational inequalities (Sokota et al.\ 2023,
+Thm.~3.4, applied on the convex set $N$; their proof is local and only needs
+the VI restricted to $N$, plus the iterates staying in $N$, guaranteed for
+small $\eta_i$ by the contraction toward $z_\tau(\bar z) \in N$). Distinct
+per-player step sizes are absorbed by treating the product update as a
+preconditioned forward step with block-diagonal preconditioner
+$\mathrm{blockdiag}(\eta_0 I, \eta_1 I)$, whose condition number enters the
+threshold; the rate is set by the slower player.
+
+(iii) Fixed points of the outer loop satisfy $z = z_\tau(z)$, i.e.\ $z$ is the
+$\tau$-regularized equilibrium with magnet at itself, which holds iff $F(z) =
+0$ on $N$'s active face. On $N$ the only zero of $F$ is $z_s^\star$: for the
+means, $\bar Q'$ has the sign of $p_k - \mu^{(0)}_k$ near each $p_k$ by
+Assumption~\ref{ass:curv} (and likewise for player~1 near each $r_l$); for the
+weights, stationarity of \eqref{eq:cat} forces the $q^{(i)}$ to be constant on
+the support, which by Assumption~\ref{ass:reg}(ii) --- uniqueness of the fully
+mixed equilibrium of the support-restricted matrix game $A$ --- pins
+$w^{(i)} = w^{(i)\star}$ up to the $O(s^2)$ smoothing perturbation of $A$
+(nonsingularity is an open condition, so the perturbed matrix game still has a
+unique fully mixed equilibrium, at distance $O(s^2)$). Local convergence of the
+composite follows from (ii) plus continuity of $\bar z \mapsto z_\tau(\bar z)$
+with $\|z_\tau(\bar z) - z^\star\| \le \gamma\|\bar z - z^\star\|$,
+$\gamma < 1$ (the magnet fixed-point map is a contraction toward the
+equilibrium on monotone games).
+\end{proof}
+
+\begin{remark}[What the experiments certify]
+Experiment~2 measures, at the numerically-obtained fixed point of the two-peak
+game: own-mean Hessian eigenvalues $-49.64$ (matching $-w_k \bar h\,
+\bar w/(\bar w^2+s^2)^{3/2}$ to four digits), cross term
+$\bar Q'(\mu_k) = \mp 0.023 \approx 0$, one-step residual $10^{-4}$, and
+spectral radius $\rho = 0.9913$ of the linearized update --- with
+$1 - \rho \approx 0.0087 \approx \eta\tau/(1 + \eta\tau) = 0.0099$: the
+contraction is exactly the magnet's strong monotonicity, as (ii) predicts. That
+instance is symmetric, so the two players' constants coincide; the theorem
+predicts that in an asymmetric instance the measured rate is set by
+$\min_i \eta_i \tau_i$ and the certified radius by $\min_i r_{0,i}$.
+\end{remark}
+
+\subsection{Multiple islands: the same theorem explains the failures}
+
+\begin{proposition}[Coexisting monotone islands]\label{prop:islands}
+Let $\hat a \in \cA$ and $\hat b \in \cB$ and let $\hat z$ be the configuration
+in which every component of player~0 sits at $\hat a$ and every component of
+player~1 at $\hat b$ (any weights, $\sigma$ at the floors). Write
+$\hat\mu = \delta_{\hat a}$-smoothed, $\hat\nu = \delta_{\hat b}$-smoothed for
+the induced policies. Suppose
+\begin{itemize}
+\item[(a)] $\hat a$ is a strict local maximum of $(Q_{\hat\nu})_{s_0}$ and
+$\hat b$ is a strict local maximum of $(W_{\hat\mu})_{s_1}$.
+\end{itemize}
+Then $\hat z$ is a fixed point of the parametric MMD dynamics, and
+Assumption~\ref{ass:curv} holds in a neighborhood of $\hat z$ with
+$\alpha_0 = |(Q_{\hat\nu})_{s_0}''(\hat a)| - O(r_0)$ and $\alpha_1$
+analogously; hence $\hat z$ is locally monotone and locally exponentially
+stable by the argument of Theorem~\ref{thm:local} --- \emph{regardless of
+whether $\hat z$ realizes a Nash equilibrium}.
+\end{proposition}
+
+\begin{proof}
+At $\hat z$ each player faces a fixed effective landscape ((a) is a condition
+on that landscape, already including whatever the coupling contributes at the
+opponent's current policy), so the mean gradients vanish, all $q^{(i)}_k$ are
+equal within a player and the categorical step is stationary, and $\rho$ is
+pinned at the floor: $\hat z$ is a fixed point. The curvature claim is (a), and
+the neighborhood claims follow by continuity exactly as in
+Theorem~\ref{thm:local}.
+\end{proof}
+
+\begin{remark}[The moment-matching special case]\label{rem:momentmatch}
+Under (G1), a convenient sufficient condition for (a) is: $\E_{\hat\nu}\psi =
+0$ and $\E_{\hat\mu}\varphi = 0$ (both couplings vanish identically), together
+with $\hat a$ a strict local max of $D_{0,s_0}$ and $\hat b$ a strict local max
+of $D_{1,s_1}$. This is how the codebase's traps arise, and it is the form in
+which the phenomenon was first observed; but Proposition~\ref{prop:islands}
+shows moment matching is \emph{not} necessary --- any pair of points that are
+mutually stationary and curvature-dominated for the \emph{coupled} landscapes
+generates an island. Experiment~8D found exactly such a non-moment-matched
+trap (a mass-dominant decoy off the moment-matched point still captures the
+dynamics, at an uglier configuration), which the symmetric moment-matching
+statement could not account for.
+\end{remark}
+
+\begin{corollary}[The decoy trap]\label{cor:decoy}
+In \texttt{DecoyWellGame} with peaks $(\pm 1)$ and uniform equilibrium weights,
+the target first moment is $0 = \iota(0)$, so all mass at the decoy center
+satisfies the condition of Remark~\ref{rem:momentmatch}; the decoy is a strict
+local max of $D_s$ for every $s \ge 0$, giving (a). Hence ``everyone on the
+decoy'' is a locally-monotone, locally-stable non-Nash fixed point with
+exploitability $\approx (\max D_0 - D_0(0)) + (\max D_1 - D_1(0)) \approx 0.72$.
+\end{corollary}
+
+Experiment 4 confirms every claim numerically: at the trap endpoint the
+moments vanish exactly, own-Hessians $-1.71 < 0$, spectral radius $0.9902$;
+the Nash island of the same game coexists ($\rho = 0.9913$, Hessians
+$-197.9$). The same experiment isolates the selection mechanism: from
+identical means $\pm 1.5$, initial $\sigma = 1.5$ lands in the decoy island
+(mass beats height under smoothing: the smoothed height of a bump decays as
+its \emph{mass} $h w / s$) while initial $\sigma = 0.1$ lands in the Nash
+island.
+
+\begin{remark}[The other documented failures]
+The remaining counterexamples in the codebase are boundary phenomena of the
+same picture, not new mechanisms. \emph{Weight starvation}: the Fisher--Rao
+mean-update \eqref{eq:gauss} carries the factor $w^{(i)}_k$ through
+$\nabla_{\mu^{(i)}_k} \widehat U = w^{(i)}_k \bar Q'(\mu^{(i)}_k)$; as
+$w^{(i)}_k \to 0$ the component's mean field vanishes --- the island containing
+$z^\star$ requires all weights bounded away from $0$, and trajectories that hit
+the simplex boundary leave every such island (the mirror geometry makes the
+boundary repelling in $\log$-coordinates but the \emph{mean} freeze happens
+first). This can afflict one player alone. \emph{Symmetric ties}:
+configurations with exactly coincident components within a player are fixed by
+an invariance of that player's own field (a measure-zero invariant set --- an
+island of the degenerate kind); note this is a symmetry of the
+\emph{parameterization}, present regardless of whether the game is symmetric.
+\emph{Basin boundaries}: Experiment~2(D) shows the empirical basin of the Nash
+island on the two-peak game is the product of the peaks' Voronoi cells
+(predictor accuracy $96.7\%$, threshold insensitive on $[0.45, 0.55]$, i.e.\
+half the peak separation) --- strictly larger than the certified monotone region
+(the $\sqrt{\bar w^2 + s^2}$ concavity cap), as expected: monotonicity is
+sufficient, not necessary, and outside the cap the funnel is maintained by the
+(non-monotone but inward) effective-landscape pull.
+\end{remark}
+
+\begin{remark}[Where player-exchange symmetry \emph{would} buy
+something]\label{rem:where-symmetry-helps}
+The results above are local: they describe the islands, not which island a
+given initialization reaches. The global (transit) analysis in the companion
+notes reduces the two-player dynamics to $K$ independent single-component
+scale-space flows on the smoothed landscape, and that reduction rests on the
+coupling term vanishing \emph{along the whole trajectory}, not merely at the
+equilibrium. In the codebase that holds because of a \emph{reflection}
+symmetry --- even landscape, odd centered features, symmetrically placed
+initial means --- which makes $\E_{\nu_t}\psi \equiv 0$ for all $t$; it is
+strictly stronger than player-exchange symmetry and is broken by asymmetric
+equilibrium weights (which is precisely the regime where the experiments find
+the ``ejection'' failure mode that the flow reduction cannot see). Without it,
+the correct general statement treats $\varepsilon(t) \coloneqq
+\|\E_{\nu_t}\psi\|$ as an exogenous perturbation and requires a shadowing bound
+of size $O(\varepsilon \sup\|\varphi'\| / \alpha)$ around the flow. That bound
+is not proved here; it is the main open item. Nothing in
+Sections~\ref{sec:layer1}--\ref{sec:local} depends on it.
+\end{remark}
+
+\begin{remark}[Separable multidimensional games]\label{rem:multidim}
+For $u(a,b) = \sum_{d=1}^{n} u_d(a_d, b_d)$ with each $u_d$ of class
+\eqref{eq:game} --- the per-axis landscapes and features may differ between the
+players and between axes --- and policies that are $K_i$-mixtures of diagonal
+Gaussians with a \emph{shared} categorical head, Lemmas~\ref{lem:lift}
+and~\ref{lem:skewblock} apply verbatim, and Theorem~\ref{thm:local} holds at
+any configuration whose component means sit on distinct support-point
+\emph{vectors} (the own-mean Hessian is the direct sum of per-axis Hessians, so
+Assumption~\ref{ass:curv} is the per-axis assumption plus a minimum over axes).
+The shared head couples the axes only through $q^{(i)}_k = \sum_d q^{(i)}_{k,d}$,
+which is why the codebase's Exp.~3 (\texttt{MultiDim.md}) sees weight
+starvation \emph{amplified} by dimension --- a per-axis-factored head removes
+the summation and restores the 1-D picture per axis. Two further quantitative
+changes are recorded there: the smoothed amplitude of an isotropic bump decays
+as $h\,(w/s)^{n}$, so the dominance condition of Assumption~\ref{ass:curv}'s
+checkable form involves the effective mass $h w^{n}$; and the bias of
+Lemma~\ref{lem:bias} gains a factor $n$ (trace over axes).
+\end{remark}
+
+\section{Summary of predictions and their experimental status}
+
+\begin{enumerate}
+\item[P1.] Tabular (measure-space) MMD converges globally on the very games
+whose parametric versions have traps; skewness of the lifted field is exact.
+\emph{Confirmed} (exp1: skewness $\sim 10^{-16}$; decoy well converges even
+from the decoy; Forsaken converges under the step-size bound and cycles
+outside it).
+\item[P2.] The Nash-realizing configuration is a locally-monotone, locally
+exponentially stable fixed point; contraction rate $\approx \eta\tau$;
+own-Hessians match $-w_k D_s''(p_k)$. \emph{Confirmed} (exp2: $\rho = 0.9913$,
+$1-\rho \approx \eta\tau/(1{+}\eta\tau)$; Hessians match to 4 digits).
+\item[P3.] The decoy configuration is a second monotone island: mutually
+stationary, concave own-blocks, $\rho < 1$, exploitability $0.72$.
+\emph{Confirmed} (exp4), including the island-selection mechanism (initial
+$\sigma$); exp8D additionally confirms the non-moment-matched variant
+predicted by Proposition~\ref{prop:islands}.
+\item[P4.] The certified island radius is $\min\{\sqrt{\bar w^2+s^2},\,
+O(\bar h /(c \bar w^2))\}$ per player: flat in $c$ for moderate $c$, collapsing
+only at extreme $c$. \emph{Confirmed} (exp3, three-peak game,
+$\bar w = 0.08$): the certified radius is exactly $0.08 \approx
+\sqrt{\bar w^2+s^2}$ and \emph{identical} for $c \in [0.5, 8]$, degrading only
+at $c \in \{32, 100, 300\} = O(\bar h/\bar w^2) = O(156)$. The empirical basin
+\emph{grows} with $c$ (the coupling force is the only inward pull outside the
+well cap), and the total failure at $c = 8$, $\eta = 0.05$ is a \emph{step-size}
+violation, not an island failure: the same inits converge on all seeds at
+$\eta = 0.01$ (the Lipschitz constant grows with $c$, tightening
+$\eta \lesssim \tau/L^2$).
+\item[P5.] Residual exploitability at convergence is the sum of the two
+players' smoothing biases, $\Theta(s_0^2) + \Theta(s_1^2)$. \emph{Confirmed}
+(exp5, symmetric instance: matches to $10^{-5}$; log--log slope $2.002$).
+\end{enumerate}
+
+\paragraph{The one-sentence theory.} \emph{MMD converges on these games because
+the games are monotone in the space of mixed strategies --- a consequence of the
+zero-sum property alone, with no symmetry between the players --- and the
+Gaussian-mixture policy is locally a faithful (Fisher--Rao) chart of that
+space around any configuration at which each player's effective landscape is
+curvature-dominated at its component means; the Nash is one such
+configuration --- convergence to it is guaranteed exactly when the
+initialization (its means \emph{and} its smoothing scale) selects the Nash
+island rather than one of the finitely many other islands the same theorem
+stabilizes.}
+
+\begin{thebibliography}{9}
+\bibitem{sokota2023} S.~Sokota, R.~D'Orazio, J.~Z.~Kolter, N.~Loizou,
+M.~Lanctot, I.~Mitliagkas, N.~Brown, C.~Kroer.
+\emph{A Unified Approach to Reinforcement Learning, Quantal Response
+Equilibria, and Two-Player Zero-Sum Games.} ICLR 2023 (arXiv:2206.05825).
+\bibitem{hsieh2021} Y.-P.~Hsieh, P.~Mertikopoulos, V.~Cevher.
+\emph{The Limits of Min-Max Optimization Algorithms: Convergence to Spurious
+Non-Critical Sets.} ICML 2021.
+\bibitem{glicksberg1952} I.~L.~Glicksberg. \emph{A further generalization of
+the Kakutani fixed point theorem, with application to Nash equilibrium
+points.} Proc.\ AMS, 1952.
+\bibitem{amari1998} S.~Amari. \emph{Natural gradient works efficiently in
+learning.} Neural Computation, 1998.
+\bibitem{hazan2016} E.~Hazan, K.~Y.~Levy, S.~Shalev-Shwartz. \emph{On
+Graduated Optimization for Stochastic Non-Convex Problems.} ICML 2016
+(arXiv:1503.03712).
+\end{thebibliography}
+
+\end{document}

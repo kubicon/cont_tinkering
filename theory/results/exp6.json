@@ -1,0 +1,106 @@
+{
+  "two_point / Nash basin": {
+    "A both magnets   (cat=.2 g=.2)": {
+      "final": 0.0047573967166855136,
+      "tail": 0.005677438230022519,
+      "reach": 1100,
+      "best": 0.0047573967166855136
+    },
+    "B gauss magnet OFF(cat=.2 g=0 )": {
+      "final": 0.0020282595338118603,
+      "tail": 0.0024201024235559186,
+      "reach": 600,
+      "best": 0.0020282595338118603
+    },
+    "C cat magnet OFF  (cat=0  g=.2)": {
+      "final": 0.004862100460790213,
+      "tail": 0.005690807946140341,
+      "reach": 1100,
+      "best": 0.0048580047894544965
+    }
+  },
+  "two_point / weight-starvation (K=3>2)": {
+    "A both magnets   (cat=.2 g=.2)": {
+      "final": 4.034262852685267,
+      "tail": 4.034949950707132,
+      "reach": null,
+      "best": 4.034262852685267
+    },
+    "B gauss magnet OFF(cat=.2 g=0 )": {
+      "final": 4.033081806829728,
+      "tail": 4.0336870740873625,
+      "reach": null,
+      "best": 4.033081806829728
+    },
+    "C cat magnet OFF  (cat=0  g=.2)": {
+      "final": 4.034214269130734,
+      "tail": 4.034874261025318,
+      "reach": null,
+      "best": 4.034214269130734
+    }
+  },
+  "three_point / Nash basin": {
+    "A both magnets   (cat=.2 g=.2)": {
+      "final": 0.007335718247211144,
+      "tail": 0.008791208112858488,
+      "reach": 2100,
+      "best": 0.007335718247211144
+    },
+    "B gauss magnet OFF(cat=.2 g=0 )": {
+      "final": 0.0030938372026231057,
+      "tail": 0.0036985328806349066,
+      "reach": 1300,
+      "best": 0.0030938372026231057
+    },
+    "C cat magnet OFF  (cat=0  g=.2)": {
+      "final": 0.5483803726658771,
+      "tail": 0.4890927822053823,
+      "reach": null,
+      "best": 0.12849023081505176
+    }
+  },
+  "decoy_well / on-peaks init (clean)": {
+    "A both magnets   (cat=.2 g=.2)": {
+      "final": 0.0047930436014613775,
+      "tail": 0.005738407741174004,
+      "reach": 1300,
+      "best": 0.0047930436014613775
+    },
+    "B gauss magnet OFF(cat=.2 g=0 )": {
+      "final": 0.0020197000589630143,
+      "tail": 0.002417422825741335,
+      "reach": 700,
+      "best": 0.0020197000589630143
+    },
+    "C cat magnet OFF  (cat=0  g=.2)": {
+      "final": 0.0047930436014613775,
+      "tail": 0.005738407741174004,
+      "reach": 1300,
+      "best": 0.0047930436014613775
+    }
+  },
+  "decoy_well / spread init (the TRAP)": {
+    "A both magnets   (cat=.2 g=.2)": {
+      "final": 0.7238104976340576,
+      "tail": 0.7248814894707398,
+      "reach": null,
+      "best": 0.7238104976340576
+    },
+    "B gauss magnet OFF(cat=.2 g=0 )": {
+      "final": 0.7208139684350994,
+      "tail": 0.7212371800848343,
+      "reach": null,
+      "best": 0.7208139684350994
+    },
+    "C cat magnet OFF  (cat=0  g=.2)": {
+      "final": 0.7238104976340574,
+      "tail": 0.7248814894707398,
+      "reach": null,
+      "best": 0.7238104976340574
+    }
+  },
+  "rho": {
+    "A both magnets   (cat=.2 g=.2)": 0.9913339260685732,
+    "B gauss magnet OFF(cat=.2 g=0 )": 0.9998842380163855
+  }
+}

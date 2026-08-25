@@ -1,0 +1,59 @@
+# Idealized (noise-free, exact-gradient) MMD.  Run: python run_idealized.py <this file>
+#
+# Baseline: the sweep game that motivated everything. With skewed weights the residual
+# game over the mixture weights is an exact bilinear matching-pennies rotation, so the
+# Nash is an UNSTABLE fixed point without a proximal anchor. Started AT the Nash it
+# stays put -- unless you set `magnet_coef: 0.0`, whereupon the minority component's
+# weight collapses to 0. See convergence_experiments/RESULTS.md section 2.
+#
+# Every settable field is listed; "(default)" marks values left at the schema default
+# (see MMDSection / InitSection / LogSection in run_idealized.py).
+
+game:
+  name: multi_point
+  peaks: [-1.0, 1.0]
+  weights: [0.7, 0.3]     # skewed -> fragile. [0.5, 0.5] is the robust symmetric case.
+  width: 0.1
+  coupling: 1.0
+
+mmd:
+  # --- core MMD ---
+  lr: 0.05                # (default) step size (eta)
+  steps: 20000            # (default)
+  magnet_interval: 200    # (default) iterations between hard magnet snapshots
+  magnet_coef: 0.2        # (default) tau: proximal weight on KL(. || magnet).
+                          #   <- set 0.0 and the Nash becomes unstable (weights collapse)
+  entropy_coef: 0.0       # (default) pull of the categorical head toward uniform.
+                          #   Nonzero biases any SKEWED Nash toward 0.5/0.5.
+  num_components: 2       # (default) == |Nash support| here
+
+  # --- which heads train ---
+  train_means: true       # (default)
+  train_std: true         # (default)
+  freeze_weights: false   # (default) true pins the categorical head (isolates the Gaussian one)
+
+  # --- std bounds / graduated optimization ---
+  anneal_std_from: 0.0    # (default) 0 disables. >0 holds every std >= this early, then
+                          #   relaxes the floor to std_min (widens basins of attraction).
+  std_min: 0.001          # (default) log-std floor
+  std_max: 1.0            # (default) log-std ceiling
+
+  # --- annealed mean-repulsion sweep (COUNTEREXAMPLE.md section 4c) ---
+  repulsion_coef: 0.0     # (default) 0 disables. Adds coef * |mu_i - mu_j|, ramped up then off.
+  repulsion_ramp: 0.2     # (default) fraction of training spent ramping up
+  repulsion_hold: 0.5     # (default) fraction spent held at repulsion_coef
+
+  # --- payoff backend ---
+  backend: auto           # (default) auto | closed_form | quadrature
+  grid_points: 801        # (default) quadrature only
+
+init:
+  means: [-1.0, 1.0]      # start AT the Nash: the question is whether it STAYS.
+                          #   `spread` = the trainer's own init (component k at (k+0.5)/K of the box)
+  weights: [0.7, 0.3]     # null (default) = uniform
+  log_std: 0.05           # null (default) = (high-low)/(2K), as the trainer does
+
+log:
+  every: 200
+  rows: 12
+  out: null               # (default) optional path to dump the full history as JSON

@@ -1,0 +1,70 @@
+# Idealized (noise-free, exact-gradient) MMD.  Run: python run_idealized.py <this file>
+#
+# THE COUNTEREXAMPLE. num_components == |Nash support| == 2, the Nash is exactly
+# representable, and MMD *still* converges to the decoy -- a stable NON-Nash fixed point
+# (exploitability ~0.72). See convergence_experiments/counterexample/COUNTEREXAMPLE.md.
+#
+# Things to try:
+#   * repulsion_coef: 0.0  -> the trap itself. Both means collapse onto the decoy at 0.
+#   * repulsion_coef: 3.0  -> the annealed mean-repulsion SWEEP, the one K=2 gradient-only
+#                             method that escapes (see idealized_decoy_sweep.yaml, which is
+#                             tuned for it: narrow std_max, light magnet, frozen weights).
+#   * anneal_std_from: 1.0 -> the graduated-optimization escape hatch. It does NOT help
+#                             here; it makes things WORSE, because smoothing favours MASS
+#                             over HEIGHT and the broad decoy dominates the smoothed
+#                             landscape (it is the only basin at large std).
+#   * magnet_coef: any     -> irrelevant. The magnet fixes equilibrium SELECTION; this is a
+#                             transport barrier, so no value of tau helps (0/96 in the sweep).
+#
+# Every settable field is listed; "(default)" marks values left at the schema default.
+
+game:
+  name: decoy_well
+  peaks: [-1.0, 1.0]           # the Nash support (tall + narrow)
+  weights: null                # (default) null = uniform -> Nash is 0.5/0.5 on the peaks
+  peak_width: 0.05             # (default) narrow => low mass => invisible to smoothing
+  peak_height: 1.0             # (default)
+  decoys: [[0.0, 0.7, 0.45]]   # (default) (center, height, width). Broad + low = 6.3x the
+                               #   mass of a peak, so it DOMINATES the smoothed landscape
+                               #   while being strictly suboptimal unsmoothed.
+  coupling: 1.0                # (default)
+  action_margin: 2.0           # (default) -> box [-3, 3]; the spread init lands at +-1.5,
+                               #   inside the dead zone, and walks straight into the trap.
+
+mmd:
+  # --- core MMD ---
+  lr: 0.05                # (default)
+  steps: 20000            # (default)
+  magnet_interval: 200    # (default)
+  magnet_coef: 0.2        # (default)
+  entropy_coef: 0.0       # (default)
+  num_components: 2       # (default) == |Nash support|. The point: this is ENOUGH capacity.
+
+  # --- which heads train ---
+  train_means: true       # (default)
+  train_std: true         # (default)
+  freeze_weights: false   # (default)
+
+  # --- std bounds / graduated optimization ---
+  anneal_std_from: 0.0    # (default) 0 disables. See header: setting it does not rescue this.
+  std_min: 0.001          # (default)
+  std_max: 1.0            # (default)
+
+  # --- annealed mean-repulsion sweep ---
+  repulsion_coef: 0.0     # 0.0 = the bare trap. 3.0 = the sweep that escapes it.
+  repulsion_ramp: 0.2     # (default)
+  repulsion_hold: 0.5     # (default)
+
+  # --- payoff backend ---
+  backend: auto           # (default) -> closed_form (decoy_well exposes .peaks)
+  grid_points: 801        # (default) quadrature only
+
+init:
+  means: spread           # the trainer's own init: means at +-1.5, std 1.5
+  weights: null           # (default) uniform
+  log_std: null           # (default) (high-low)/(2K) = 1.5, as the trainer does
+
+log:
+  every: 250
+  rows: 12
+  out: null               # (default)

@@ -1,0 +1,93 @@
+# Idealized (noise-free, exact-gradient) MMD.  Run: python run_idealized.py <this file>
+#
+# Attempt 1 at re-breaking idealized_mmd.py after idealized_decoy_sweep.yaml solved
+# the single-center-decoy counterexample (see configs/idealized_decoy_sweep.yaml,
+# convergence_experiments/counterexample/COUNTEREXAMPLE.md section 4c).
+#
+# Idea (user's): keep the peaks at the exact same +-1, but move the decoy(s) OUTSIDE
+# the peaks instead of between them -- one to the left of -1, one to the right of +1,
+# at the natural `_spread_bias_init` landing spot (+-1.5, inside the "dead zone"
+# between peak and box edge that the DecoyWellGame docstring already flags).
+#
+# Why this should defeat the mean-repulsion sweep specifically: the sweep's escape
+# mechanism (idealized_decoy_sweep.yaml) works because repulsion pushes the two means
+# APART (outward, away from each other/center), and in that config the decoy sits AT
+# the center while the peaks sit further out -- so "outward" and "toward the peaks"
+# are the same direction. Here the decoy sits further OUT than the peaks, so "outward"
+# and "toward the decoy" are now the same direction instead, and reaching a peak
+# requires the sweep to stop -- against its own outward-pushing gradient -- exactly at
+# +-1, before the decoy captures it. No repulsion_coef window should fix this: too
+# small never leaves the decoy's basin, too large blows straight through the peak's
+# capture zone into the decoy (mirroring the old ">= 8.0 overshoots to the box edge"
+# failure, except now the overshoot target IS a trap instead of empty box).
+#
+# Init starts directly on the decoys (mirrors old config's "start ON the decoy" stress
+# test, and also matches where _spread_bias_init naturally lands two components).
+#
+# CONFIRMED BROKEN. Full repulsion_coef sweep, all other knobs unchanged (40k steps):
+#     0.0   stalls at the decoy itself      (+-1.50, expl 1.358)  -- never leaves
+#     0.5   creeps out, doesn't reach peak  (+-1.70, expl 1.494)
+#     1.0   overshoots the peak already     (+-2.09, expl 2.160)
+#     1.5   blows straight to the box edge  (+-3.00, expl 2.752)
+#     2.0   box edge                        (+-3.00, expl 2.752)
+#     3.0   box edge (the value that WORKED in idealized_decoy_sweep.yaml)  (+-3.00, expl 2.752)
+#     5.0   box edge                        (+-3.00, expl 2.752)
+# No coefficient lands on the peaks (+-1.0, target expl ~0). There is no window: the
+# gap between "too weak to leave the decoy" (0.0-0.5) and "too strong, blows through
+# the peak into the decoy/box edge" (>=1.0) never passes through the peak itself,
+# because the peak is no longer between the start point and the box edge in the way
+# the sweep needs -- it's a single narrow gate the outward-only gradient walks through
+# without stopping. Confirms the hypothesis: mean-repulsion sweep is direction-locked
+# (always outward), so it only works when decoys are "upstream" of the peaks relative
+# to the sweep direction. Put a decoy "downstream" instead and the same mechanism that
+# rescued idealized_decoy_sweep.yaml drives the components straight past the peak.
+#
+# Every settable field is listed; "(default)" marks values left at the schema default.
+
+game:
+  name: decoy_well
+  peaks: [-1.0, 1.0]
+  weights: null                          # (default) uniform -> Nash 0.5/0.5 on the peaks
+  peak_width: 0.05                       # (default)
+  peak_height: 1.0                       # (default)
+  decoys: [[-1.5, 0.7, 0.45], [1.5, 0.7, 0.45]]   # <- moved outside the peaks, symmetric
+  coupling: 1.0                          # (default)
+  action_margin: 2.0                     # (default) -> box [-3, 3]; decoys sit well inside it
+
+mmd:
+  # --- core MMD ---
+  lr: 0.05                # (default)
+  steps: 40000             # same budget the sweep needed before
+  magnet_interval: 200    # (default)
+  magnet_coef: 0.05        # LIGHT, as in the solved config
+  entropy_coef: 0.0        # (default)
+  num_components: 2        # (default) == |Nash support|
+
+  # --- which heads train ---
+  train_means: true        # (default)
+  train_std: true          # (default)
+  freeze_weights: true      # pin the categorical head at uniform, as before
+
+  # --- std bounds ---
+  anneal_std_from: 0.0     # (default) not used -- same reasoning as the solved config
+  std_min: 0.001           # (default)
+  std_max: 0.10             # keep components narrow, as in the solved config
+
+  # --- the sweep (identical knobs to the config that solved the center-decoy case) ---
+  repulsion_coef: 3.0      # the value that worked before -- test whether it still does
+  repulsion_ramp: 0.2      # (default)
+  repulsion_hold: 0.5      # (default)
+
+  # --- payoff backend ---
+  backend: auto            # (default) -> closed_form
+  grid_points: 801         # (default) quadrature only
+
+init:
+  means: [-1.5, 1.5]       # start ON the outside decoys (== natural spread-init spot)
+  weights: null             # (default) uniform (and frozen, see freeze_weights)
+  log_std: 0.05             # narrow from the start
+
+log:
+  every: 500
+  rows: 10
+  out: null                 # (default)

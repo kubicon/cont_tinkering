@@ -1,0 +1,64 @@
+# Idealized (noise-free, exact-gradient) MMD.  Run: python run_idealized.py <this file>
+#
+# ForsakenGame -- the Hsieh et al. (2021) limit-cycle saddle, the standard example of
+# gradient-based min-max CYCLING instead of converging.
+#
+# It has no `.peaks`, so idealized_mmd's closed-form expected payoff (which is specific to
+# the MultiPointGame family) does NOT apply. The QUADRATURE backend is auto-selected: it
+# discretizes the action interval and integrates numerically, so it works for ANY 1-D box
+# game. (Cross-checked against the closed form on multi_point: max weight delta 0.003,
+# max mean delta 0.000.)
+#
+# What to expect at the values below: player 0 finds the two well minima (+-1.29, the true
+# ones are +-1.31) but player 1 COLLAPSES to the centre with a dead component, and
+# exploitability stalls around 0.21. This game exists to expose exactly that step-size
+# sensitivity -- vary `lr` and `magnet_coef` and it flips between cycling and converging.
+#
+# Note this game is INSIDE the C1/C2/C4 structural class of route_a/ROUTE_A.md (shared
+# landscape -phi + a bilinear coupling) and still fails -- which is the point: class
+# membership alone buys nothing. Its landscape -phi is TRIMODAL (local maxima at -1.31, 0,
+# +1.31), and the centre basin at 0 is spurious: it is NOT in the Nash support.
+#
+# Every settable field is listed; "(default)" marks values left at the schema default.
+
+game:
+  name: forsaken
+  bound: 1.5              # (default) action box [-1.5, 1.5]
+
+mmd:
+  # --- payoff backend (the reason this config exists) ---
+  backend: quadrature     # auto-selects to this anyway (no .peaks); stated for clarity
+  grid_points: 801        # (default) quadrature resolution
+
+  # --- core MMD ---
+  lr: 0.05                # (default) <- try 0.1 with magnet_coef 0.05: it cycles
+  steps: 20000            # (default)
+  magnet_interval: 200    # (default)
+  magnet_coef: 0.1        # <- try 0.05 (cycles) vs 0.1 (converges): the sensitivity
+  entropy_coef: 0.0       # (default)
+  num_components: 2       # (default) the Nash is mixed on the two well minima +-1.31
+
+  # --- which heads train ---
+  train_means: true       # (default)
+  train_std: true         # (default)
+  freeze_weights: false   # (default) true stops p1's component from dying
+
+  # --- std bounds / graduated optimization ---
+  anneal_std_from: 0.0    # (default) 0 disables
+  std_min: 0.001          # (default)
+  std_max: 0.5            # tighter than the 1.0 default: the box is only [-1.5, 1.5]
+
+  # --- annealed mean-repulsion sweep ---
+  repulsion_coef: 0.0     # (default) 0 disables
+  repulsion_ramp: 0.2     # (default)
+  repulsion_hold: 0.5     # (default)
+
+init:
+  means: spread           # the trainer's own init: component k at (k+0.5)/K of the box
+  weights: null           # (default) uniform
+  log_std: null           # (default) (high-low)/(2K) = 0.75, clipped to std_max
+
+log:
+  every: 250
+  rows: 12
+  out: null               # (default)

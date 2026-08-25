@@ -13,8 +13,13 @@ import jax.numpy as jnp
 
 from .base import ZeroSumGame
 from .examples import (
+    AsymmetricWellGame,
     ContinuousBlottoGame,
     ContinuousMatchingPennies,
+    CurvaturePumpGame,
+    DecoyWellGame,
+    ForsakenGame,
+    MultiDimDecoyWellGame,
     MultiPointGame,
     QuadraticZeroSumGame,
 )
@@ -64,9 +69,90 @@ class BlottoConfig:
         return ContinuousBlottoGame(front_values=front_values, budget=self.budget, sharpness=self.sharpness)
 
 
+@dataclasses.dataclass
+class AsymmetricWellConfig:
+    dim: int = 1
+    coupling: float = 1.0
+    bound: float = 3.0
+
+    def build(self) -> ZeroSumGame:
+        return AsymmetricWellGame(dim=self.dim, coupling=self.coupling, bound=self.bound)
+
+
+@dataclasses.dataclass
+class CurvaturePumpConfig:
+    dim: int = 1
+    pump: float = 4.0
+    bound: float = 2.0
+
+    def build(self) -> ZeroSumGame:
+        return CurvaturePumpGame(dim=self.dim, pump=self.pump, bound=self.bound)
+
+
+@dataclasses.dataclass
+class ForsakenConfig:
+    bound: float = 1.5
+
+    def build(self) -> ZeroSumGame:
+        return ForsakenGame(bound=self.bound)
+
+
+@dataclasses.dataclass
+class DecoyWellConfig:
+    peaks: tuple[float, ...] = (-1.0, 1.0)
+    weights: tuple[float, ...] | None = None
+    peak_width: float = 0.05
+    peak_height: float = 1.0
+    # Each decoy is `(center, height, width)`; heights must be < `peak_height`.
+    decoys: tuple[tuple[float, float, float], ...] = ((0.0, 0.7, 0.45),)
+    coupling: float = 1.0
+    action_margin: float = 2.0
+
+    def build(self) -> ZeroSumGame:
+        return DecoyWellGame(
+            peaks=tuple(self.peaks),
+            weights=tuple(self.weights) if self.weights is not None else None,
+            peak_width=self.peak_width,
+            peak_height=self.peak_height,
+            decoys=tuple(tuple(d) for d in self.decoys),
+            coupling=self.coupling,
+            action_margin=self.action_margin,
+        )
+
+
+@dataclasses.dataclass
+class MultiDimDecoyWellConfig:
+    dim: int = 2
+    peaks: tuple[float, ...] = (-1.0, 1.0)
+    weights: tuple[float, ...] | None = None
+    peak_width: float = 0.05
+    peak_height: float = 1.0
+    # Each decoy is `(center, height, width)`; heights must be < `peak_height`.
+    decoys: tuple[tuple[float, float, float], ...] = ((0.0, 0.7, 0.45),)
+    coupling: float = 1.0
+    action_margin: float = 2.0
+
+    def build(self) -> ZeroSumGame:
+        return MultiDimDecoyWellGame(
+            dim=self.dim,
+            peaks=tuple(self.peaks),
+            weights=tuple(self.weights) if self.weights is not None else None,
+            peak_width=self.peak_width,
+            peak_height=self.peak_height,
+            decoys=tuple(tuple(d) for d in self.decoys),
+            coupling=self.coupling,
+            action_margin=self.action_margin,
+        )
+
+
 GAME_CONFIGS: dict[str, type] = {
     "matching_pennies": MatchingPenniesConfig,
     "multi_point": MultiPointConfig,
     "quadratic": QuadraticConfig,
     "blotto": BlottoConfig,
+    "asymmetric_well": AsymmetricWellConfig,
+    "curvature_pump": CurvaturePumpConfig,
+    "forsaken": ForsakenConfig,
+    "decoy_well": DecoyWellConfig,
+    "multidim_decoy_well": MultiDimDecoyWellConfig,
 }

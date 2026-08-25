@@ -31,6 +31,21 @@ from .config import MixturePPOHyperparams
 
 OpponentActionFn = Callable[[chex.PRNGKey, int], chex.Array]
 
+# Lower bound on each component's log-std, applied in `MixtureActorCritic.__call__`.
+# The upper bound is `log(high - low)` (a std as wide as the whole action range),
+# computed there since it is per-action-dimension.
+#
+# Both bounds are load-bearing, not defensive padding:
+#   * ceiling -- the Gaussian entropy bonus in `mixture_ppo_loss` is
+#     `-gaussian_entropy_coef * (-log p(a))` on the *marginal* mixture density, and
+#     `-log p(a)` is unbounded above as std -> inf. So the bonus has no interior
+#     optimum in the std: any `gaussian_entropy_coef` large enough to matter drives
+#     log_std to +inf and the run NaNs (it does, reliably, above ~0.5).
+#   * floor -- as std -> 0 the density (hence `gaussian_log_prob` and
+#     `mixture_marginal_log_prob`) blows up, which NaNs the loss from the other side.
+#     This mirrors the `[log 1e-3, log 1]` clip that `idealized_mmd.run` already applies.
+LOG_STD_MIN = -6.907755  # log(1e-3)
+
 
 def _spread_bias_init(low: chex.Array, high: chex.Array, num_components: int) -> Callable:
     """Bias initializer spreading each component's mean evenly across `[low, high]`.
@@ -127,6 +142,7 @@ class MixtureActorCritic(nn.Module):
             name="log_std_head",
         )(torso)
         log_std = log_std_flat.reshape(self.num_components, self.action_dim)
+        log_std = jnp.clip(log_std, LOG_STD_MIN, jnp.log(self.high - self.low))
 
         value = nn.Dense(1, name="value_head")(torso)
 

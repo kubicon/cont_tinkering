@@ -1,0 +1,1645 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage{enumitem}
+\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue]{hyperref}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{example}[theorem]{Example}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\cA}{\mathcal{A}}
+\newcommand{\cB}{\mathcal{B}}
+\newcommand{\cP}{\mathcal{P}}
+\newcommand{\cN}{\mathcal{N}}
+\newcommand{\ip}[2]{\left\langle #1, #2 \right\rangle}
+\newcommand{\KL}{\mathrm{KL}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator{\supp}{supp}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\conv}{conv}
+\newcommand{\GC}[1]{\textsf{GC-#1}}
+\newcommand{\CV}[1]{\textsf{CV-#1}}
+
+\newcommand{\idea}[1]{%
+  \par\medskip\noindent\fbox{\parbox{0.96\textwidth}{\textbf{The idea.}\ #1}}%
+  \par\medskip}
+
+\title{The result in parts\\
+\large An incremental exposition}
+\author{\texttt{cont\_tinkering} / \texttt{theory2}}
+\date{August 2026}
+
+\begin{document}
+\maketitle
+
+\section*{Why this document exists}
+
+\texttt{convergence.tex} proves the convergence theorem for the class
+$\mathfrak{G}$ in one piece. That is the right shape for a proof and the wrong
+shape for a reader: the hypotheses, the four interacting blocks and the
+composition all arrive together, and there is no point before the end at which a
+reader has something they can accept or reject.
+
+This document breaks the same result into five parts. Each part switches on one
+more moving object, each has a one-sentence claim, and each is a theorem that
+stands alone.
+
+\begin{center}
+\begin{tabular}{@{}c p{0.37\textwidth} p{0.15\textwidth} p{0.10\textwidth} p{0.13\textwidth}@{}}
+\hline
+part & claim & switched on & needs & components\\
+\hline
+1 & Given the atoms, the weights are free. & categorical head &
+  \emph{nothing} & any\\
+2 & On a fixed landscape, one attractor per cell is what transport needs, and
+  its failure is fatal. & component means & (C), (L) & any\\
+3 & The blur anneals itself, and sets the bias. & scales & heat equation &
+  \textbf{Gaussian}\\
+4 & Let the opponent move: it is a chase, and it damps. & coupling & (D) & any\\
+5 & All of them at once. & --- & (G) & any\\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent
+The structural point is that Parts 1--4 are each independently checkable, and
+Part 5 --- the small-gain composition, which is the technical heart and the hard
+read --- only has to be believed by someone who already believes 1--4. A reader
+who bounces off Part 5 still has four theorems, a sharpness result and a
+certified counterexample.
+
+The last column is the second structural point, and it is why the parts are
+ordered as they are. \emph{The choice of component family is not used until
+Part 3.} Parts 1 and 2 are stated for an arbitrary family --- point masses
+included --- because their proofs never open up a component: Part 1 needs only
+that the per-component expectations exist, and Part 2 needs only a fixed
+differentiable landscape and a preconditioned ascent step. Part 3 is where the
+Gaussian is bought and paid for: it is the heat kernel, the width acquires its own
+gradient, and the two facts together give self-annealing, a closed-form bias law
+and the theory's sharpest numerical predictions. Parts 4 and 5 return to
+indifference, inheriting the Gaussian only through Part 3.
+
+Deferring the choice is not bookkeeping. It is what makes the role of the
+Gaussian legible: read in this order, Part 3's $O(s^2)$ bias is visibly not an
+unavoidable fact about mixture policies --- Part 1 exhibits a family with no bias
+at all --- but the price charged for the annealing mechanism of that part.
+
+\medskip\noindent
+Proofs here are deliberately compressed to the idea; the full ones live in
+\texttt{game\_class.tex} and \texttt{convergence.tex}, referenced as
+\GC{Lemma~1} and \CV{Lemma~4} respectively. The exception is
+\S\ref{sec:transport}, whose two results are given in full: everything in Parts
+3--5 is an estimate added to Theorem~\ref{thm:part2}, so its hypotheses had
+better be exactly right, and writing the proof out is what shows which they are.
+
+\medskip\noindent
+\textbf{Setting, in one paragraph.} Player $0$ maximises and player $1$ minimises
+a bounded measurable payoff $u : \cA\times\cB \to \R$ on compact action sets.
+Each player plays a $K$-component mixture with a categorical head over the
+components: a weight vector $w \in \Delta_K$, and $K$ component laws with location
+parameters $m_1,\dots,m_K$. \emph{Which} family the components are drawn from is
+left open until Part 3, where it is fixed to diagonal Gaussians; until then the
+only thing assumed is that a component is a probability measure concentrated near
+its location, and that the location can be moved by a gradient step. The
+\emph{effective landscape} of player $0$ is $Q_\nu(a) = \int u(a,b)\,d\nu(b)$:
+the value of playing the pure action $a$ against the opponent's current policy
+$\nu$. We fix a Nash equilibrium and assume throughout that it is supported on
+finitely many points --- the \emph{atoms} $p_1,\dots,p_{M_0}$ for player $0$ ---
+with positive weights $w^\star$.
+
+\part*{Part 1. Given the atoms, the weights are free}
+\addcontentsline{toc}{section}{Part 1}
+\setcounter{section}{1}
+\setcounter{theorem}{0}
+
+\idea{A mixture policy has two kinds of parameter, and they are doing completely
+different jobs. The component means answer \emph{where are the atoms}; the
+categorical head answers \emph{how much mass on each}. The second question turns
+out to be a finite matrix game --- not approximately, exactly --- and finite matrix
+games are solved by the algorithm already in use, globally, from any
+initialisation, with no assumptions on the payoff whatsoever. So half the problem
+is free, and every hypothesis this theory will ever need belongs to the other
+half. Nothing in this part depends on what the components are.}
+
+\subsection*{1.1 The decomposition}
+
+Suppose player $0$'s components are probability measures $P_1,\dots,P_{K_0}$ on
+$\cA$ with weights $w \in \Delta_{K_0}$, and player $1$'s are $R_1,\dots,R_{K_1}$
+on $\cB$ with weights $v$. Define the \emph{component matrix}: the entry
+$\bar A_{kl}$ is the expected payoff when player $0$ samples from its component
+$k$ and player $1$ from its component $l$,
+\begin{equation}\label{eq:Abar}
+  \bar A_{kl} \;:=\; \E_{a \sim P_k,\ b \sim R_l}\big[u(a,b)\big].
+\end{equation}
+
+\begin{lemma}[Exact decomposition, \GC{Lemma~1}]\label{lem:decomp}
+For any bounded measurable $u$ and any component families,
+\[
+  U(\pi_{\theta_0},\pi_{\theta_1}) \;=\; w^\top \bar A\, v ,
+\]
+and consequently the two heads receive exactly the following gradients:
+\begin{enumerate}
+\item[(i)] the categorical head of player $0$ sees the vector $\bar A v$, so its
+  update is \emph{verbatim} tabular magnetic mirror descent on the finite
+  zero-sum matrix game $\bar A$;
+\item[(ii)] the location parameter of component $k$ sees $w_k \nabla_{m_k}
+  \E_{a\sim P_k} Q_{\pi_{\theta_1}}(a)$: preconditioned gradient ascent on the
+  effective landscape, averaged against that component's own shape.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}[Idea]
+Write the expected payoff as a double sum over the two players' components and
+apply Fubini. The mixture weights factor out of the integral because they do not
+depend on the sampled action, leaving a bilinear form in $(w,v)$ whose
+coefficients are exactly the per-component expectations. No structure on $u$ is
+used, and none on the components --- only that the expectations exist.
+\end{proof}
+
+The content is (i). The categorical head is not \emph{approximately} playing a
+matrix game, or playing one in some limit; it is playing one identically, at
+every step, whatever the components happen to be and wherever they happen to sit.
+
+\begin{example}[The two families this document uses]\label{ex:families}
+Two instances of \eqref{eq:Abar} are worth having in view from the start, because
+the difference between them is exactly what Part 3 is about.
+
+\emph{Point masses.} $P_k = \delta_{m_k}$. Then $\bar A_{kl} = u(m_k, n_l)$: the
+component matrix is the payoff table between the two players' locations, with no
+approximation of any kind. If the locations are the equilibrium atoms, $\bar A$
+\emph{is} the atom matrix $A_{jl} = u(p_j, r_l)$, and clause (ii) reads
+$w_k\nabla Q_{\pi_{\theta_1}}(m_k)$ --- ascent on the raw landscape.
+
+\emph{Diagonal Gaussians.} $P_k = \cN(m_k, \sigma_k^2)$, the implemented policy.
+Then $\bar A_{kl} = A_{kl} + O(\sigma^2 + \varsigma^2)$, and clause (ii) reads
+$w_k \nabla (Q_{\pi_{\theta_1}})_{\sigma_k}(m_k)$: ascent on the landscape blurred
+at that component's own width, where $\Lambda_s := \Lambda * \cN(0,s^2 I)$.
+
+The Gaussian family therefore does two things at once that the point-mass family
+separates: it blurs the landscape being climbed, and it displaces the matrix being
+played. Parts 2 and 4 will care only about the first, and only through the fact
+that \emph{some} fixed landscape is being climbed.
+\end{example}
+
+\subsection*{1.2 Matrix games are solved}
+
+\begin{lemma}[Tabular MMD on a fixed matrix; Sokota et al.\ 2023,
+restated as \CV{Lemma~9}]\label{lem:mmd}
+Fix a matrix $\bar A$. The categorical update run by both players has two nested
+loops, and both converge:
+\begin{enumerate}
+\item[(i)] \emph{inner}: with the magnet snapshot held fixed, the iterates
+  converge at a linear rate to the $\tau$-regularised equilibrium (the QRE) of
+  $\bar A$;
+\item[(ii)] \emph{outer}: refreshing the magnet to the current iterate is a
+  proximal-point step, whose fixed points are exactly the Nash equilibria of
+  $\bar A$ --- for \emph{every} $\tau > 0$ --- and which converges at a linear rate
+  because the underlying variational inequality is polyhedral.
+\end{enumerate}
+There is no basin structure and no initialisation dependence in either loop.
+\end{lemma}
+
+\begin{proof}[Idea]
+A zero-sum matrix game lifts to a monotone variational inequality; adding
+entropy makes it strongly monotone, which gives (i). For (ii), at a fixed point
+of the refresh map the magnet equals the iterate, so the regularisation term
+vanishes identically and the first-order condition collapses to the plain
+variational inequality of $\bar A$ --- which is why the regularisation biases the
+\emph{rate} and not the \emph{limit}.
+\end{proof}
+
+\begin{remark}[Why $\tau$ is not a bias knob]\label{rem:tau}
+Part (ii) is worth pausing on, because it is easy to assume that entropy
+regularisation must leave a residual $O(\tau)$ error. It does not, once the magnet
+is refreshed: the refresh is what removes it. This will matter in Part 5, where
+the composition wants $\tau$ \emph{large} for stability and one would otherwise
+fear paying for it in accuracy.
+\end{remark}
+
+\subsection*{1.3 Part 1}
+
+\begin{theorem}[The weights are free]\label{thm:part1}
+Suppose player $0$'s component locations are held at the equilibrium atoms
+$p_1,\dots,p_{M_0}$, and symmetrically for player $1$, with the component shapes
+held fixed. Then the categorical heads converge to a Nash equilibrium of the
+component matrix $\bar A$; the induced policy pair converges; and its
+exploitability is exactly the \emph{spread deficit} of the component family,
+\[
+  \varepsilon \;=\; \Big[\max_\cA Q_\nu - \max_j \E_{a\sim P_j} Q_\nu(a)\Big]
+  \;+\; \Big[\max_\cB W_\mu - \max_l \E_{b\sim R_l} W_\mu(b)\Big] .
+\]
+\emph{No hypothesis on the game, and none on the component family, is used.}
+In the two instances of Example~\ref{ex:families}:
+\begin{enumerate}
+\item[(i)] \emph{point masses}: $\bar A = A$ exactly, and $\varepsilon = 0$
+  exactly --- the equilibrium is a fixed point of the algorithm, not a limit of
+  one;
+\item[(ii)] \emph{Gaussians at a floor $s^{\min}$}: $\bar A = A + O(s^2)$, the
+  deficit is the blur deficit $\max_\cA Q_\nu - \max_\cA (Q_\nu)_{s^{\min}_0}$
+  (and symmetrically), and
+  $\varepsilon = O\big((s^{\min}_0)^2 + (s^{\min}_1)^2\big)$.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}[Idea]
+By Lemma~\ref{lem:decomp} the heads play the matrix game $\bar A$, which is fixed
+because the components are; by Lemma~\ref{lem:mmd} they converge to its Nash. For
+the exploitability, the crucial observation is that a Nash of $\bar A$
+\emph{equalises the components}: complementary slackness makes every component in
+the support attain the same value, so the mixture's expected payoff equals
+$\max_j \E_{P_j} Q_\nu$, and what is left is the gap between that and the best
+achievable value of the landscape at a \emph{point}. For (i) the two are equal,
+because an atom of a Nash equilibrium attains $\max_\cA Q_{\nu^\star}$ by the
+support characterisation of a best response --- a theorem, not an assumption. For
+(ii) the gap is a pure blur deficit, and Taylor-expanding the blur at the atom
+gives the exponent $2$; this is where condition (B) --- $Q$ twice differentiable at
+its atoms --- is used, and the only place in the entire development that it is.
+\end{proof}
+
+\begin{remark}[The bias is a property of the family, not of the method]
+\label{rem:biasfamily}
+Clause (i) is worth stating even though the point-mass policy is not the one
+implemented, because it isolates where the $O(s^2)$ of clause (ii) comes from.
+It is not an artifact of mixing, of the matrix game, or of the algorithm: with
+$K \ge M$ point masses the equilibrium is \emph{exactly representable} and the
+bias is identically zero. It appears in clause (ii) for one reason only --- a
+Gaussian of width $s \ge s^{\min} > 0$ is never a point mass, so the policy class
+does not contain its target.
+
+Part 3 is where that becomes a bargain rather than a defect: the same width that
+causes the bias is what supplies the annealing mechanism, and the mechanism drives
+the bias it caused to zero. But the accounting should be visible in advance ---
+one family pays nothing here and gets nothing there.
+\end{remark}
+
+\begin{remark}[What Part 1 does \emph{not} say]\label{rem:part1not}
+It says nothing about where the means are. Run the same argument with the means
+in completely the wrong places and it still goes through --- the weights converge,
+beautifully and globally, to the Nash of a matrix that describes the wrong
+components. Part 1 is a statement about mixing, not about location.
+\end{remark}
+
+\begin{remark}[Why a one-point condition can characterise a many-atom
+equilibrium]\label{rem:atomnotnash}
+Lemma~\ref{lem:decomp} is what makes the rest of the theory possible, and the
+reason is worth stating explicitly because readers arriving from optimisation
+stumble on it. A component mean is a \emph{point} of $\cA$, and no point of $\cA$
+is a Nash equilibrium when $M_0 > 1$. So there can be no condition of the form
+``each mean is attracted to the equilibrium''. What there can be is a condition of
+the form ``each mean is attracted to \emph{one atom}'' --- and mixing over the
+atoms is then not a geometric phenomenon at all, but a property of the weights,
+which solve an ordinary matrix game. The problem factorises:
+
+\begin{center}
+\begin{tabular}{@{}l p{0.32\textwidth} p{0.32\textwidth}@{}}
+\hline
+ & \emph{where are the atoms?} & \emph{how much mass on each?}\\
+\hline
+solved by & the component means & the categorical heads\\
+mechanism & $M_i$ parallel single-target problems & one finite matrix game\\
+needs & everything (Parts 2--5) & nothing (Part 1)\\
+\hline
+\end{tabular}
+\end{center}
+\end{remark}
+
+\part*{Part 2. On a fixed landscape: one attractor per cell}
+\addcontentsline{toc}{section}{Part 2}
+\setcounter{section}{2}
+\setcounter{theorem}{0}
+
+\idea{Freeze the opponent. Then a component mean is doing gradient ascent on one
+fixed function, and the question ``do the means find the atoms'' becomes the
+purely single-agent question ``does gradient ascent find the peaks''. It has two
+obstacles. There are several peaks and we want them all --- so we stop asking for
+a global statement and partition the action set into one \emph{cell} per peak,
+turning one $M$-target problem into $M$ single-target problems. And within a
+cell, ascent can still stall --- so we ask for the weakest condition under which
+it cannot: that the gradient, everywhere in the cell, has a positive component
+pointing at the target. That is the whole hypothesis, and a one-line Lyapunov
+argument shows it suffices. The other half of the part is that it cannot be
+weakened: a cell with two attractors traps components in a way no hyperparameter
+repairs.}
+
+Throughout Part 2, fix an opponent policy $\nu$ and freeze the component shapes,
+and write $\Lambda$ for the resulting fixed landscape on $\cA$ --- the function
+whose gradient clause (ii) of Lemma~\ref{lem:decomp} delivers to a location
+parameter. Only the locations move.
+
+\medskip\noindent
+\textbf{The symbols, informally.} This part has one moving object and a handful of
+constants, and it is worth saying plainly what each of them is before the
+definition arrives.
+\begin{description}[leftmargin=2.6em, itemsep=2pt, font=\normalfont]
+\item[$\Lambda$:] the \emph{landscape} --- the fixed function on the action set
+  that a component climbs, ``how good is the pure action $a$ against the frozen
+  opponent''. Its peaks are what the components are looking for.
+\item[$m$:] the \emph{location} of one component --- a single point of $\cA$, and
+  the only thing that moves in this part. There is one per component, and in this
+  part they move independently of each other.
+\item[$\cA_j$:] a \emph{cell} --- a region of the action set containing exactly
+  one peak. The $M$ cells partition $\cA$ up to a null set, which is what turns
+  ``find all $M$ peaks'' into $M$ separate one-peak problems.
+\item[$\xi_j$:] the \emph{target} of cell $j$ --- the peak inside it, and the
+  point every component that starts in that cell is claimed to reach. It is part
+  of the hypothesis: you name it, and Lemma~\ref{lem:crit} then proves it really
+  is the cell's unique critical point and unique maximiser.
+\item[$\rho$:] the \emph{strength of the pull} --- a lower bound, as a function of
+  the distance to $\xi_j$, on how hard the landscape pushes a component towards
+  it. It may be arbitrarily small, and typically is (Remark~\ref{rem:rho}); it
+  sets the rate and nothing else.
+\item[$\alpha$:] that pull in its most useful shape --- the constant in
+  $\rho(r) \ge \alpha r$, i.e.\ ``the pull is at least proportional to how far
+  away you still are''.
+\item[$L$:] the Lipschitz constant of $\nabla\Lambda$ --- how fast the slope is
+  allowed to change, a bound on the landscape's curvature. It is what decides how
+  large a step is safe.
+\item[$R_j$:] the \emph{invariance radius} --- the radius of the largest ball
+  around $\xi_j$ that still fits inside the cell. A component has to start inside
+  \emph{it}, not merely inside the cell; \S\ref{sec:transport} explains why.
+\item[$\eta$, $P$:] the algorithm's step size and preconditioner --- how far a
+  step goes and how it is stretched across directions. Neither is a property of
+  the game, and neither appears in any hypothesis.
+\end{description}
+
+\begin{remark}[What Part 2 uses about $\Lambda$, and what it does not]
+\label{rem:provenance}
+Everything in this part is a statement about \emph{one fixed function on $\cA$ and
+ascent on it}. The only properties of $\Lambda$ used below are that it is
+differentiable with $L$-Lipschitz gradient, and that the update is
+$m^+ = m + \eta\,P\,\nabla\Lambda(m)$ for a positive definite $P$ and a small
+enough $\eta$. Where $\Lambda$ came from is never opened up.
+
+That is the deferral promised in the overview. Read $\Lambda = (Q_\nu)_s$, the
+blurred landscape of the Gaussian policy, and Part 2 is the transport half of the
+implemented method; read $\Lambda = Q_\nu$, the raw landscape of a point-mass
+policy, and every statement below --- definition, Lyapunov argument, sharpness
+result, counterexample --- holds verbatim with that landscape's own Lipschitz
+constant. The readings diverge only in Part 3, where the width stops being
+frozen. The single exception is not a theorem but a \emph{certificate} for one of
+the hypotheses, which is Gaussian and one-dimensional (Remark~\ref{rem:check}).
+The preconditioner is deferred too, and only for legibility:
+\S\ref{sec:transport} takes $P = I$, and \S\ref{sec:precond} puts it back in half
+a page, where it rescales two constants and changes nothing else.
+\end{remark}
+
+\subsection*{2.1 Cells and attractors}
+
+\begin{definition}[Attracting cell structure --- condition (C), frozen form]
+\label{def:C}
+$\Lambda$ has an \emph{$M$-cell attracting structure} if there are open sets
+$\cA_1,\dots,\cA_M \subset \cA$ with disjoint closures, whose union has full
+measure in $\cA$, each \emph{star-shaped about} a point $\xi_j \in \cA_j$ ---
+meaning that for every $a \in \cA_j$ the whole segment
+$\{\xi_j + t(a - \xi_j) : t \in [0,1]\}$ lies in $\cA_j$ --- such
+that for every $j$ and every $a \in \cA_j$,
+\begin{equation}\label{eq:star}
+  \ip{\nabla \Lambda(a)}{\xi_j - a}
+  \;\ge\; \rho\big(\|\xi_j - a\|\big)\,\|\xi_j - a\| ,
+\end{equation}
+for some continuous $\rho$ with $\rho(0)=0$ and $\rho(r) > 0$ for $r > 0$.
+\end{definition}
+
+In words, the definition asks two separate things of a cell, and they constrain
+different objects.
+
+\emph{Of the set.} $\cA_j$ must be star-shaped about $\xi_j$: the target can see
+the whole of its own cell. This is a shape requirement and says nothing about
+$\Lambda$; it is used in exactly one place (Remark~\ref{rem:starshaped}).
+
+\emph{Of the function.} Read \eqref{eq:star} literally: \emph{from anywhere in the
+cell, the gradient has a positive component pointing at $\xi_j$} --- wherever you
+stand, walking uphill takes you at least slightly towards the target, and the
+guaranteed amount of ``towards'' is $\rho$. It permits the gradient to be
+arbitrarily small, to point mostly sideways, and the landscape to have flat
+regions and inflections. What it forbids is exactly two things --- a second
+attractor inside the cell, and the gradient pointing away from $\xi_j$ anywhere in
+it.
+
+The two are easy to run together because both are the same weakening of a
+convexity notion, taken in different places: a convex \emph{set} asks of every
+pair of points what star-shapedness asks only of pairs containing $\xi_j$, and a
+concave \emph{function} compares values at every pair of points where
+\eqref{eq:star} merely signs one inner product per point --- which is why (C) is
+far weaker than concavity (Remark~\ref{rem:weak}). Neither implies the other, and
+the proof consumes both.
+
+\begin{remark}[$\xi_j$ is posited, not defined]\label{rem:posited}
+The point $\xi_j$ is data of the hypothesis --- to claim a game qualifies you must
+exhibit it --- not something defined as ``the critical point''. That it is a
+critical point, and the unique one, is a consequence (Lemma~\ref{lem:crit}). This
+collapses what would otherwise be three claims (existence, uniqueness,
+attraction) into one checkable inequality, and it is why (C) can be verified by
+counting modes rather than by solving for critical points.
+\end{remark}
+
+\begin{remark}[What star-shapedness is for, and why it is not free]
+\label{rem:starshaped}
+``$\cA_j$ is star-shaped about $\xi_j$'' says the target can see the whole of its
+own cell: the segment from $\xi_j$ to any point of $\cA_j$ never leaves $\cA_j$.
+It is strictly weaker than convexity, which asks the same of every pair of points
+rather than only of pairs containing the centre, and it is used in exactly one
+place: Lemma~\ref{lem:crit}(iv) proves maximality by integrating \eqref{eq:star}
+along that segment. Condition \eqref{eq:star} says the gradient points along the
+segment; star-shapedness says the segment lies where the hypothesis holds. The
+proof consumes both.
+
+Nor does the first imply the second, as a disconnected cell shows cheaply. Let
+$\cA_j = B \cup B'$ with $B$ a small ball about $\xi_j$ and $B'$ a far-away blob
+separated from it by other cells, and on $B'$ put
+$\Lambda(a) = c_0 - c\|a - \xi_j\|$, smoothed; then \eqref{eq:star} holds there
+for any $\rho \le c$, while $c_0$ is free --- the pieces are not adjacent --- so
+$\Lambda$ may exceed $\Lambda(\xi_j)$ throughout $B'$ and $\xi_j$ is \emph{not}
+the maximiser over $\overline{\cA_j}$. A star-shaped set is connected, which rules
+this out. (Whether \eqref{eq:star} plus connectedness already forces
+star-shapedness is left open; the hypothesis costs nothing, since one must exhibit
+the cells and targets anyway.) In one dimension it is automatic, a connected open
+subset of $\R$ being an interval, so it bites only in $n \ge 2$ and there excludes
+only cells one would have to draw deliberately.
+\end{remark}
+
+\begin{remark}[(C) is much weaker than concavity]\label{rem:weak}
+A Gaussian bump $h\,e^{-x^2/2w^2}$ is concave only on $|x| \le w$ --- yet it
+satisfies \eqref{eq:star} on its entire cell, because its gradient points uphill
+everywhere. This matters practically: mixture-MMD converges on the codebase's
+two-peak game ($w = 0.1$) from means far outside that radius, which no
+concavity-based hypothesis could explain.
+\end{remark}
+
+\subsection*{2.2 One attractor per cell suffices}\label{sec:transport}
+
+What this subsection proves, informally: \emph{a component that starts close
+enough to its cell's target walks to that target, never leaves the cell on the
+way, and in discrete time halves its remaining distance at a fixed geometric
+rate.} ``Close enough'' is the invariance radius below, and it is the only thing
+the reader has to supply beyond Definition~\ref{def:C}.
+
+Throughout this subsection a location parameter runs plain gradient ascent,
+\begin{equation}\label{eq:update}
+  m^+ \;=\; m \;+\; \eta\,\nabla\Lambda(m),
+\end{equation}
+the preconditioner of the implemented step being deferred to \S\ref{sec:precond}.
+Assume $\nabla\Lambda$ is $L$-Lipschitz on $\cA_j$, and define the
+\emph{invariance radius}
+\begin{equation}\label{eq:Rj}
+  R_j \;:=\; \mathrm{dist}\big(\xi_j,\, \partial\cA_j\big) \;>\; 0,
+\end{equation}
+positive because $\cA_j$ is open and $\xi_j \in \cA_j$; equivalently, $R_j$ is the
+largest $r$ with $\overline{B}(\xi_j, r) \subseteq \cA_j$.
+
+Starting merely \emph{in} the cell will not do, and the radius is what repairs it.
+What the Lyapunov argument below delivers is that the \emph{distance} to $\xi_j$
+does not grow, which confines a trajectory to $\cA_j$ only if the ball of that
+radius lies in $\cA_j$; otherwise a component can exit through a nearby piece of
+$\partial\cA_j$ while moving strictly closer to $\xi_j$, land in a neighbouring
+cell, and converge to the wrong attractor. This is the quantitative reading of the
+covering clause \CV{(G$_\sigma$)} imposes on the initialisation. It constrains the
+initialisation relative to the cell and is independent of star-shapedness, which
+relates the cell to its target: a star-shaped cell can be a thin spike with $R_j$
+far smaller than its extent.
+
+\begin{lemma}[The target is critical, and the gradient is dominated;
+\CV{Lemma~1}]\label{lem:crit}
+Assume Definition~\ref{def:C}. Then
+\begin{enumerate}
+\item[(i)] $\nabla\Lambda(\xi_j) = 0$;
+\item[(ii)] $\xi_j$ is the unique critical point of $\Lambda$ in $\cA_j$;
+\item[(iii)] $\|\nabla\Lambda(a)\| \le L\,\|a - \xi_j\|$ for every
+  $a \in \cA_j$;
+\item[(iv)] $\xi_j$ is the unique maximiser of $\Lambda$ over
+  $\overline{\cA_j}$.
+\end{enumerate}
+Moreover, if \eqref{eq:star} holds with $\rho(r) \ge \alpha r$ then
+$\alpha \le L$.
+\end{lemma}
+
+\begin{proof}
+(i) $\cA_j$ is open, so $B(\xi_j,\epsilon_0) \subseteq \cA_j$ for some
+$\epsilon_0 > 0$. Fix a unit vector $v$ and $0 < \epsilon < \epsilon_0$, and put
+$a = \xi_j + \epsilon v$. Then $\xi_j - a = -\epsilon v$, so \eqref{eq:star} reads
+$\ip{\nabla\Lambda(\xi_j + \epsilon v)}{v} \le -\rho(\epsilon) < 0$. Letting
+$\epsilon \downarrow 0$ and using continuity of $\nabla\Lambda$ and of $\rho$ at
+$0$ gives $\ip{\nabla\Lambda(\xi_j)}{v} \le 0$ for \emph{every} unit $v$; taking
+$v = \nabla\Lambda(\xi_j)/\|\nabla\Lambda(\xi_j)\|$ forces
+$\nabla\Lambda(\xi_j) = 0$.
+
+(ii) If $a \in \cA_j$, $a \ne \xi_j$ had $\nabla\Lambda(a) = 0$, then
+\eqref{eq:star} at $a$ would read
+$0 \ge \rho(\|\xi_j - a\|)\|\xi_j - a\| > 0$.
+
+(iii) By (i) and $L$-Lipschitzness,
+$\|\nabla\Lambda(a)\| = \|\nabla\Lambda(a) - \nabla\Lambda(\xi_j)\|
+\le L\|a - \xi_j\|$.
+
+(iv) Let $a \in \overline{\cA_j}$ with $r := \|a - \xi_j\| > 0$, and suppose first
+that $a \in \cA_j$. By star-shapedness the segment $a_t := \xi_j + t(a - \xi_j)$
+lies in $\cA_j$ for $t \in (0,1]$, and $a - \xi_j = (a_t - \xi_j)/t$, so
+\eqref{eq:star} at $a_t$ gives
+$\ip{\nabla\Lambda(a_t)}{a - \xi_j} \le -\rho(tr)\,r$. Integrating along the
+segment and substituting $u = tr$,
+\begin{equation}\label{eq:maximality}
+  \Lambda(a) - \Lambda(\xi_j)
+  \;=\; \int_0^1 \ip{\nabla\Lambda(a_t)}{a - \xi_j}\,dt
+  \;\le\; -\,r\int_0^1 \rho(tr)\,dt
+  \;=\; -\int_0^{r}\rho(u)\,du \;<\; 0 ,
+\end{equation}
+the last inequality because $\rho > 0$ on $(0,r]$. For $a \in \partial\cA_j$ pick
+$a^{(n)} \in \cA_j$ with $a^{(n)} \to a$ and write $r_n := \|a^{(n)} - \xi_j\|$;
+then $r_n \to r > 0$, and since $r \mapsto \int_0^r \rho$ is continuous and
+strictly increasing, passing to the limit in \eqref{eq:maximality} gives
+$\Lambda(a) - \Lambda(\xi_j) \le -\int_0^{r}\rho(u)\,du < 0$ as well.
+
+Finally, combining (iii) with Cauchy--Schwarz and \eqref{eq:star},
+$\alpha r^2 \le \ip{\nabla\Lambda(a)}{\xi_j - a} \le \|\nabla\Lambda(a)\|\,r
+\le L r^2$, so $\alpha \le L$.
+\end{proof}
+
+Clause (iii) is small but is the reason everything later works: \emph{a
+component's step shrinks as it arrives}, which is what separates ``converges''
+from ``hovers within $O(\eta)$''.
+
+\begin{theorem}[Transport on a fixed landscape]\label{thm:part2}
+Assume Definition~\ref{def:C} and let $m(0) \in \cA_j$ satisfy
+$r_0 := \|m(0) - \xi_j\| < R_j$. Then:
+\begin{enumerate}
+\item[(a)] \emph{(continuous time)} the flow $\dot m = \nabla\Lambda(m)$ stays in
+  $\overline{B}(\xi_j, r_0) \subseteq \cA_j$ for all $t \ge 0$,
+  $\|m(t) - \xi_j\|$ is strictly decreasing, and $m(t) \to \xi_j$;
+\item[(b)] \emph{(discrete time)} if in addition the modulus is linear,
+  \begin{equation}\label{eq:Lpart2}
+    \rho(r) \;\ge\; \alpha\,r \quad\text{on } (0, \mathrm{diam}\,\cA],
+    \qquad \alpha > 0 \tag{L}
+  \end{equation}
+  and the step size satisfies
+  \begin{equation}\label{eq:step2}
+    0 \;<\; \eta \;<\; \frac{\alpha}{L^2},
+  \end{equation}
+  then the iterates \eqref{eq:update} stay in $\overline{B}(\xi_j, r_0)$ and
+  \begin{equation}\label{eq:geo}
+    \|m(t) - \xi_j\| \;\le\;
+    \Big(1 - \tfrac12\,\eta\,\alpha\Big)^{t}\,\|m(0) - \xi_j\| .
+  \end{equation}
+\end{enumerate}
+Consequently, if $K \ge M$ components are initialised so that every cell
+contains at least one \emph{within its invariance radius}, then every cell's
+attractor is found.
+\end{theorem}
+
+\begin{proof}
+Write $d := m - \xi_j$ for the displacement from the target, $G :=
+\nabla\Lambda(m)$ for the gradient there, and $V := \tfrac12\|d\|^2$ for half the
+squared distance --- the Lyapunov function, the quantity shown to decrease. Note
+that by \eqref{eq:star}, $\ip{G}{d} = -\ip{G}{\xi_j - m} \le -\rho(\|d\|)\|d\|$
+while $m \in \cA_j$: the gradient and the displacement point oppositely, which is
+the whole content of the hypothesis.
+
+(a) Then $\dot V = \ip{d}{G} \le -\rho(\|d\|)\|d\| < 0$ for $m \ne \xi_j$, so
+$\|d\|$ is strictly decreasing and $m(t)$ remains in $\overline{B}(\xi_j, r_0)$,
+which by $r_0 < R_j$ lies in $\cA_j$: the trajectory can never reach
+$\partial\cA_j$, so it never leaves, and being confined to a compact set on which
+$\nabla\Lambda$ is Lipschitz it exists for all $t \ge 0$. Now $V$ is
+nonincreasing and bounded below, so $V(t) \downarrow V_\infty \ge 0$. If
+$V_\infty > 0$ then $\|d(t)\|$ stays in a compact interval $[c, r_0]$ with
+$c > 0$, on which the continuous function $r \mapsto \rho(r)r$ has a positive
+minimum $\delta$; then $\dot V \le -\delta$ for all $t$ and $V(t) \to -\infty$, a
+contradiction. Hence $m(t) \to \xi_j$.
+
+(b) One step gives $d^+ = d + \eta G$, so
+$V^+ = V + \eta\ip{G}{d} + \tfrac{\eta^2}{2}\|G\|^2$. Bounding the cross term by
+\eqref{eq:Lpart2} and the quadratic one by Lemma~\ref{lem:crit}(iii), and using
+$\|d\|^2 = 2V$,
+\[
+  V^+ \;\le\; V\big(1 - 2\eta\alpha + \eta^2L^2\big)
+  \;\le\; V\big(1 - \eta\alpha\big),
+\]
+the last step by \eqref{eq:step2}, which gives $\eta^2L^2 < \eta\alpha$. The
+factor is nonnegative, since $\eta\alpha < \alpha^2/L^2 \le 1$ by
+\eqref{eq:step2} and $\alpha \le L$ from Lemma~\ref{lem:crit}. Taking square
+roots and using $\sqrt{1-x} \le 1 - x/2$ on $[0,1]$ gives
+$\|d^+\| \le (1 - \tfrac12\eta\alpha)\|d\|$. In particular $\|d\|$ never
+increases, so the iterate remains in $\overline{B}(\xi_j,r_0) \subseteq \cA_j$
+and the hypotheses hold again at $m^+$; \eqref{eq:geo} follows by induction.
+\end{proof}
+
+\begin{remark}[Why (L) cannot be postponed]\label{rem:needL}
+It is natural to read \eqref{eq:Lpart2} as buying a rate --- geometric decay
+rather than mere monotonicity --- and that is how Part 5 will present it
+(Remark~\ref{rem:L}). In discrete time with a \emph{fixed} step it buys more than
+that: it buys convergence. In the proof of (b) the step splits into a radial gain
+and a tangential cost, worth respectively
+\[
+  \eta\,\ip{G}{d} \;\le\; -\eta\,\rho(\|d\|)\,\|d\|
+  \qquad\text{and}\qquad
+  \tfrac{\eta^2}{2}\|G\|^2 \;\le\; \tfrac{\eta^2}{2}L^2\|d\|^2 .
+\]
+Lemma~\ref{lem:crit}(iii) makes the cost quadratic in $\|d\|$; the gain is
+quadratic only if $\rho(r)/r$ is bounded below. For a modulus vanishing faster
+than linearly, say $\rho(r) = r^{1+\delta}$, the gain dominates only while
+$\|d\|^{\delta} > \tfrac{\eta}{2}L^2$, and below that radius a fixed step size
+certifies nothing: nothing but a radial gain that is also second order in $\|d\|$
+can absorb a cost that is.
+
+So the honest division is: the flow converges under (C) alone, the fixed-step
+iteration needs (C) and (L), and a diminishing step size $\eta_t \to 0$ with
+$\sum_t \eta_t = \infty$ recovers convergence under (C) alone at the cost of the
+geometric rate. Since Part 2 is about the algorithm rather than about a flow, (L)
+belongs here; Part 5 does not introduce it, it only notices that the same constant
+is what the scale block needs.
+\end{remark}
+
+\begin{remark}[What ``small $\rho$'' costs]\label{rem:rho}
+Nothing in \eqref{eq:Lpart2} requires $\alpha$ to be \emph{large}, and it
+typically is not: for a Gaussian bump of width $w$, $\rho(r) \asymp (h/w^2)\,r\,
+e^{-r^2/2w^2}$, so $\alpha \asymp (h/w^2)e^{-\mathrm{diam}^2/2w^2}$ ---
+exponentially small, the ``dead zone'' where the landscape is essentially flat.
+Theorem~\ref{thm:part2} is uniform in this: \eqref{eq:geo} holds for every
+$\alpha > 0$ and only the rate degrades. This demotes the previous theory's
+$s_{\mathrm{reach}}$ from a hypothesis to a \emph{rate}, and it matches the
+observation that borderline configurations converge at $150$k steps and not at
+$40$k. The distinction that matters is therefore not between large and small
+$\alpha$, but between $\rho$ decaying at long range --- harmless, and the generic
+case --- and $\rho$ vanishing superlinearly \emph{at the target}, which is what
+Remark~\ref{rem:needL} excludes and which a nondegenerate maximum never does.
+\end{remark}
+
+\subsection*{2.3 Preconditioning moves the constants and nothing else}
+\label{sec:precond}
+
+By Lemma~\ref{lem:decomp}(ii) the implemented algorithm runs not \eqref{eq:update}
+but a \emph{preconditioned} step,
+\begin{equation}\label{eq:updateP}
+  m^+ \;=\; m \;+\; \eta\,P\,\nabla\Lambda(m),
+\end{equation}
+with $P$ symmetric positive definite --- a fixed rescaling of the gradient, moving
+the component faster in some directions than in others. This subsection discharges
+the difference; it is short on purpose. The two constants below, $p_-$ and $p_+$,
+are the slowest and the fastest of those directions.
+
+\begin{corollary}[Transport under a preconditioner]\label{cor:precond}
+Let $P$ be symmetric positive definite with spectrum in $[p_-, p_+]$,
+$0 < p_- \le p_+$, and put $\|x\|_{P^{-1}} := (x^\top P^{-1}x)^{1/2}$, so that
+\begin{equation}\label{eq:normeq}
+  \|x\|/\sqrt{p_+} \;\le\; \|x\|_{P^{-1}} \;\le\; \|x\|/\sqrt{p_-} .
+\end{equation}
+Define $R_j^P$ as the largest $r$ with
+$\{a : \|a - \xi_j\|_{P^{-1}} \le r\} \subseteq \cA_j$. Then
+Theorem~\ref{thm:part2} holds verbatim for \eqref{eq:updateP} with
+$\|\cdot\|$ replaced by $\|\cdot\|_{P^{-1}}$ and $R_j$ by $R_j^P$, on replacing
+the step-size bound and the rate by
+\begin{equation}\label{eq:stepP}
+  0 \;<\; \eta \;<\; \frac{\alpha}{p_+ L^2},
+  \qquad\text{rate}\quad 1 - \tfrac12\,\eta\,\alpha\,p_- .
+\end{equation}
+\end{corollary}
+
+\begin{proof}
+Take $V := \tfrac12\|d\|^2_{P^{-1}}$. In continuous time
+$\dot V = \ip{d}{P^{-1}P\nabla\Lambda(m)} = \ip{\nabla\Lambda(m)}{d}$ --- the
+preconditioner cancels exactly --- and part~(a) is unchanged. In discrete time
+$d^+ = d + \eta PG$ gives
+$V^+ = V + \eta\ip{d}{PG}_{P^{-1}} + \tfrac{\eta^2}{2}\|PG\|^2_{P^{-1}}$, where
+again $P$ cancels in the cross term, $\ip{d}{PG}_{P^{-1}} = \ip{d}{G}$, while
+$\|PG\|^2_{P^{-1}} = G^\top PG \le p_+\|G\|^2$. Bounding
+$\ip{G}{d} \le -\alpha\|d\|^2$ and $\|G\|^2 \le L^2\|d\|^2$ as before,
+\[
+  V^+ \;\le\; V - \eta\|d\|^2\Big(\alpha - \tfrac{\eta}{2}p_+L^2\Big)
+  \;\le\; V - \tfrac{\eta\alpha}{2}\|d\|^2 ,
+\]
+by \eqref{eq:stepP}. Finally $\|d\|^2 \ge p_-\|d\|^2_{P^{-1}} = 2p_-V$ by
+\eqref{eq:normeq}, so $V^+ \le V(1 - \eta\alpha p_-)$, whose factor is
+nonnegative because $\eta\alpha p_- < \alpha^2 p_-/(p_+L^2) \le \alpha^2/L^2
+\le 1$. Square roots as before.
+\end{proof}
+
+\begin{remark}[$P$ is a property of the algorithm, not of the game]
+\label{rem:Palg}
+No hypothesis of Definition~\ref{def:C}, and no constant in it, mentions $P$: the
+\emph{game} supplies $\Lambda$, its cells, its targets, the modulus $\rho$ and
+the Lipschitz constant $L$; the \emph{algorithm} supplies $P$ and $\eta$. Hence
+$P$ does not move the limit --- $m + \eta P\nabla\Lambda(m) = m$ iff
+$\nabla\Lambda(m) = 0$ for any invertible $P$ --- so preconditioning changes the
+path and the rate and never the destination; the \emph{only} thing the proof asks
+of it is $p_- > 0$ uniformly in time; and an anisotropic $P$ makes the invariant
+sets ellipsoids rather than balls, the condition number $p_+/p_-$ being what
+\CV{} carries as $\chi^2$, the one place a preconditioner leaves a fingerprint on
+a conclusion rather than on a constant.
+
+Which $P$? For a point-mass policy $P = I$ and Corollary~\ref{cor:precond} is
+vacuous; for the Gaussian policy of Part 3, Lemma~\ref{lem:decomp}(ii) delivers
+$P = \sigma_k^2 w_k I$, so a component's width sets how fast its mean moves
+(whence Remark~\ref{rem:throttle}), and observation~2 of \S5.1 shows $P$ cancels
+out of the stability condition entirely. The factor $w_k$ is not
+natural-gradient at all: the Fisher metric of the joint law
+$p(k,a) = w_k\,\cN(a \mid m_k,\sigma_k^2)$ has $m_k$-block $w_k/\sigma_k^2$, so
+the exact natural gradient is $\sigma_k^2\nabla\Lambda(m_k)$ with \emph{no}
+$w_k$. That discrepancy is the whole of the weight-starvation freeze --- a
+component losing weight also loses mobility, i.e.\ $p_- \to 0$, and freezes at a
+non-atom --- carried in \GC{} as hypothesis (W), a floor $w_k \ge w_{\min} > 0$,
+which becomes \emph{vacuous} under the corrected preconditioner $\sigma_k^2/w_k$.
+So the one place where $P$ can hurt is a fixable defect in the implementation
+rather than a property of any game.
+\end{remark}
+
+\subsection*{2.4 It cannot be weakened}
+
+Definition~\ref{def:C} looks like a convenient hypothesis. It is a forced one.
+
+\begin{proposition}[A second attractor is fatal]\label{prop:sharp}
+Suppose a cell contains a second nondegenerate local maximum $\hat a \ne \xi_j$.
+Then:
+\begin{enumerate}
+\item[(i)] $\hat a$ is an exponentially stable fixed point of the mean dynamics,
+  with an \emph{open} set of initialisations converging to it;
+\item[(ii)] it is \textbf{magnet-invariant}: the magnet snapshot is refreshed to
+  the trap itself, so the magnet's gradient vanishes there identically --- and the
+  magnet adds $-\eta\tau I$ to the Jacobian, strictly \emph{deepening} the trap;
+\item[(iii)] it is \textbf{capacity-invariant}: spare components initialised in
+  its basin are captured too, so raising $K$ does not help;
+\item[(iv)] it is \textbf{annealing-invariant}, and worse: an annealing schedule
+  is the mechanism that \emph{delivers} components into it, since which branch a
+  component follows down the scale ladder is decided at large blur.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}[Idea]
+(i) is elementary: local ascent near a nondegenerate maximum is a contraction, and
+contraction is an open condition. (ii)--(iv) are the substantive claims and each
+is a one-line computation: for (ii), at the trap $\bar a = \hat a$, so the
+quadratic term $-\tau(\hat a - \bar a)/\bar\sigma^2$ is identically zero, and
+$-\eta\tau I$ is negative definite. Full statements in \GC{Proposition~1} and
+\GC{Proposition~4}.
+\end{proof}
+
+\begin{remark}[The trap does not depend on the component family either]
+\label{rem:trapfamily}
+Clause (ii) is stated for the implemented Gaussian magnet, whose mean-dependent
+part is the quadratic $-\tfrac{\tau}{2}\|a-\bar a\|^2_{\bar\sigma^{-2}}$, but the
+computation touches nothing else: any proximal term of that shape gives the same
+vanishing gradient at the trap and the same $-\eta\tau I$, so (ii) survives a
+point-mass policy. Clause (iv) is the one exception in this part, and it is
+vacuous rather than false --- with no width there is nothing to anneal --- but it
+is stated here because the schedule \emph{is} present in Part 3, and the reader
+should meet the objection in the part that raises it.
+\end{remark}
+
+The consequence is the shape of the whole theory: \emph{any class of games that
+is robust to initialisation must forbid spurious attractors outright.} Not merely
+dominated ones --- the previous theory's ``every spurious bump is dominated in
+height and mass by the atoms'' controls which branch is the \emph{global} maximum,
+but local ascent never compares global amplitudes, and a dominated spurious bump
+still captures whatever enters it. Condition (C) is derived, not chosen.
+
+\begin{example}[The decoy game, excluded by counting]\label{ex:decoy}
+The codebase's decoy game has a landscape with three local maxima while its
+equilibrium has support size two. Definition~\ref{def:C} asks for exactly $M = 2$
+cells each containing one attractor, which is impossible: some cell contains two.
+By Proposition~\ref{prop:sharp} there is an open set of initialisations from which
+the method does not converge to Nash --- which is precisely what is observed. No
+dominance computation, no smoothing analysis: a mode count against a support size,
+and it is the cheapest useful thing in the theory.
+\end{example}
+
+\subsection*{2.5 Is (C) checkable?}
+
+A hypothesis that cannot be checked is a hypothesis that has been assumed away, so
+this deserves a direct answer. It is: \emph{partially, by two routes, and the
+limits of each are known.}
+
+Definition~\ref{def:C} as stated in this part is the \emph{easy} case, because
+freezing the opponent and the width hid two quantifiers. What the later parts
+actually need is \eqref{eq:star} holding
+\begin{itemize}[leftmargin=1.4em, itemsep=1pt]
+\item for every width $s$ in the admissible range $\Sigma_0$ (Part 3 unfreezes
+  it), and
+\item for every opponent policy $\nu$ the run can visit (Part 4 unfreezes it),
+  \textbf{with the same cells} --- for the reason given in
+  Remark~\ref{rem:fixed}.
+\end{itemize}
+Neither quantifier can be checked by evaluating anything finitely many times. Each
+is collapsed by a separate structural assumption, and by nothing else.
+
+\begin{remark}[The width quantifier: mode counting, and the one place the kernel
+matters]\label{rem:check}
+Condition (C) has to hold not at one width but across the whole admissible range,
+which looks like an infinite family of checks. In one dimension it collapses to
+two, by \emph{scale-space causality}: Gaussian blurring never creates a local
+extremum, so the mode count of $\Lambda_s$ is non-increasing in $s$, and it
+suffices to count modes at the \emph{bottom} of the range and check that no two
+merge before the top --- two one-dimensional root counts, computable before
+training. Structure finer than the smallest width is invisible and therefore
+free, which is why the condition tolerates ripple, discretisation noise, or a
+Monte-Carlo estimate of the landscape; and run against a support size it is
+Example~\ref{ex:decoy}.
+
+This is the exception to Remark~\ref{rem:provenance}. Causality is not a generic
+property of blurring: in one dimension the Gaussian is essentially the only kernel
+with it, and in two or more it fails even for the Gaussian. So the
+\emph{theorems} of this part hold for any component family, but this
+\emph{certificate} for their hypothesis is Gaussian and one-dimensional --- and
+the Gaussian in question is the one smoothing the landscape, not the one
+parameterising the policy. A point-mass policy drawing its gradients from a
+Gaussian exploration kernel of bandwidth $h$ keeps the certificate intact, with
+$h$ in place of $s$; one using a uniform ball or a finite difference does not.
+\end{remark}
+
+\paragraph{The opponent quantifier: finite-rank coupling.} Suppose the payoff has
+the form that Part 4 will use anyway,
+\begin{equation}\label{eq:finiterank}
+  u(a,b) \;=\; D_0(a) - D_1(b) + \ip{\varphi(a)}{C\,\psi(b)},
+  \qquad \varphi : \cA \to \R^{m_0},\ \psi : \cB \to \R^{m_1} .
+\end{equation}
+Informally: $D_0$ and $D_1$ are each player's own preferences over its own action
+--- the part of the payoff that would be there with no opponent at all --- and the
+third term is the only place the two players meet, through the finitely many
+\emph{features} $\varphi$ and $\psi$ they each expose and a coupling matrix $C$
+that says how those features trade off. Then
+$Q_\nu(a) = D_0(a) + \ip{\varphi(a)}{Cy} + \mathrm{const}$ with
+$y = \E_\nu \psi$: \emph{the opponent enters through $m_1$ numbers and nothing
+else}, namely the averages of its features under its current policy. The
+quantifier over all probability measures on $\cB$ therefore collapses to one over
+the compact convex \emph{moment body} $Y := \conv \psi(\cB) \subset \R^{m_1}$ ---
+the set of feature averages any opponent could possibly present --- and the same
+structure discharges it outright.
+
+\begin{proposition}[Curvature dominates coupling, for (C); \GC{Proposition~2}]
+\label{prop:capC}
+Assume \eqref{eq:finiterank}. Suppose the \emph{self-term alone} satisfies
+Definition~\ref{def:C}: $D_{0,s}$ is star-concave toward a branch
+$\xi^0_j(s)$ on $\cA_j$, with modulus $\rho_0$. If
+\begin{equation}\label{eq:capC}
+  \sup_{y \in Y}\|Cy\| \cdot \sup_{\cA_j}\|\nabla\varphi_s\|
+  \;<\; \inf_{r > 0} \rho_0(r),
+\end{equation}
+then \eqref{eq:star} holds for the \emph{coupled} landscape $(Q_\nu)_s$, for every
+$\nu$, with modulus $\rho_0 - \|Cy\|\,\|\nabla\varphi_s\|$.
+\end{proposition}
+
+\begin{proof}[Idea]
+The coupling perturbs the gradient by $\nabla\varphi_s^\top Cy$, whose norm is at
+most the left-hand side of \eqref{eq:capC}; a perturbation smaller than the
+modulus cannot reverse the sign of an inner product bounded below by that modulus.
+The cells and the star-concavity survive; only $\rho$ shrinks.
+\end{proof}
+
+In words: \emph{check your own landscape, then check the opponent cannot bend it
+enough to matter.} The first half is a single-agent, opponent-free computation ---
+for a sum of Gaussian bumps it is the mode count above --- and the second is one
+inequality between norms. Note that it proves \eqref{eq:star} for \emph{every}
+$\nu$, which is strictly stronger than Definition~\ref{def:C}: nobody would verify
+the frozen version, a frozen opponent not being a situation the algorithm is ever
+in. Part 2 states it because that is the form in which the Lyapunov argument is
+legible.
+
+\begin{remark}[How conservative \eqref{eq:capC} is]\label{rem:conservative}
+Very, and predictably: the right-hand side is an infimum of $\rho_0$ over the
+\emph{whole} cell, attained by Remark~\ref{rem:rho} far from the target where the
+landscape is nearly flat --- $O(e^{-\mathrm{diam}^2/2w^2})$ for a Gaussian bump of
+width $w$. So \eqref{eq:capC} demands that the coupling be weaker than the
+\emph{weakest} pull anywhere in the cell, and a game can satisfy (C) comfortably
+while failing \eqref{eq:capC} by orders of magnitude: a cheap and crude sufficient
+condition, not a characterisation. It should be distinguished from the
+superficially similar cap of Proposition~\ref{prop:cap} in Part 4, which governs
+the \emph{small-gain} condition rather than (C), is stated in terms of the
+curvature $\alpha$ at the branch rather than $\inf\rho_0$ over the cell, and is
+the one that holds with three orders of margin on the codebase's games.
+\end{remark}
+
+\paragraph{Refutation is cheaper than certification.} In practice one rarely
+certifies (C); one tries to \emph{refute} it, and two one-line tests do most of
+the work. The first is the mode count of Remark~\ref{rem:check} against the
+support size: more local maxima at the floor width than $|\supp\mu^\star|$ and the
+game is out, by Proposition~\ref{prop:sharp} for good rather than pending better
+hyperparameters. The second is \emph{resolution at the floor}: (C) provides $M_0$
+distinct branch points at every admissible width and (M) identifies them with the
+atoms, so the atoms must be resolvable at the floor. For a landscape of equal
+Gaussian bumps of width $\bar w$ this is the closed-form inequality
+\begin{equation}\label{eq:resolution}
+  \sqrt{\bar w^2 + (s^{\min})^2} \;<\; \tfrac12 \min_{j\ne j'}\|p_j - p_{j'}\| ,
+\end{equation}
+from the classical bimodality threshold for an equal-weight Gaussian pair. Read in
+the other direction it constrains a \emph{hyperparameter} rather than the game:
+\emph{do not choose a floor larger than half the atom spacing}. On the two-peak
+game ($\bar w = 0.1$, $s^{\min} = 10^{-3}$, spacing $1$) the left side is
+$0.1000005$ against $0.5$ --- so it is the bump width, not the floor, that binds,
+and it holds with a factor $5$ to spare.
+
+\paragraph{Where this stops working.} Three limits. \emph{Dimension kills the mode
+count}: for $n \ge 2$ Gaussian smoothing can create local maxima, so above one
+dimension (C) must be imposed on the entire width range and the honest certificate
+is a numerical mode-ladder check, not a proof. \emph{There is no third route}: the
+opponent quantifier is collapsed by a finite-rank coupling or by one-dimensional
+causality and --- as \CV{\S8} puts it --- not otherwise, so a payoff with no
+finite-rank structure, above one dimension, leaves (C) as an assumption with no
+certificate attached. And \emph{the self-term still has to be checked}:
+Proposition~\ref{prop:capC} reduces (C) for the game to (C) for $D_0$, which is
+progress only because $D_0$ is opponent-free; for a black-box $D_0$, ``count its
+modes'' is itself a numerical question --- a benign one, since by
+Remark~\ref{rem:floor} structure finer than the floor is free.
+
+\subsection*{2.6 What Part 2 leaves open}
+
+Four things, each handled by a later part, and each a place a reader could
+reasonably object.
+
+\begin{enumerate}[leftmargin=1.4em]
+\item \textbf{The peaks found are not yet the Nash atoms.} With the opponent
+  frozen at an arbitrary $\nu$, Theorem~\ref{thm:part2} delivers the maxima of
+  $(Q_\nu)_s$ --- best responses to $\nu$, not equilibrium atoms. They coincide
+  only when $\nu = \nu^\star$. Condition (M) will assert exactly that the branch
+  endpoints at the equilibrium opponent are the atoms; making the opponent
+  actually get there is Part 4.
+
+  It is worth being precise about \emph{which} best response each $\xi_j$ is,
+  because the plural matters. By Lemma~\ref{lem:crit}(iv) each $\xi_j$ is the best
+  response \emph{within its own cell}; at any given $\nu$ exactly one of the $M$
+  is the global one, and the other $M-1$ are strictly worse. So Part 2 is not
+  best-responding --- best-responding would want one peak, and a pure action
+  attains it --- but tracking all $M$ local best responses at once. What makes the
+  losers worth carrying is that at $\nu^\star$ they stop being losers: the atoms
+  of an equilibrium strategy are \emph{all} best responses to $\nu^\star$ and are
+  tied in value, which is the equalisation that Theorem~\ref{thm:part1} runs on.
+  Away from $\nu^\star$ the low peaks are components being pre-positioned, and
+  nothing in this part ever compares heights across cells --- which is why
+  \S2.4 forbids extra attractors rather than merely requiring them to be
+  dominated.
+\item \textbf{The blur width was frozen, and the algorithm does not freeze it.}
+  The target $\xi_j$ depends on $s$; as $s$ changes the target moves. Part 3
+  shows the scales fall on their own, and that the target walks onto the true peak
+  as they do.
+\item \textbf{Exploration between cells is not solved, and cannot be.} Local
+  ascent cannot move a component from one cell to another; which attractor a
+  component finds is decided at initialisation. This is a genuine limitation of
+  the algorithm, not an artifact of the analysis, and the honest response is to
+  assume covering and note that overcapacity with a spread initialisation buys it
+  cheaply --- \emph{inside} the class, where by Proposition~\ref{prop:sharp} there
+  is no spurious attractor for the spare components to fall into.
+\item \textbf{The gradient was assumed, not obtained.} Theorem~\ref{thm:part2}
+  applies $\nabla\Lambda$ without saying where it comes from: the assumption is an
+  exact deterministic oracle, carried unchanged through Part 5, where it is listed
+  as the largest remaining gap (\S5.4, item~1). It is worth separating from the
+  previous item, because the word ``exploration'' does duty for both --- that one
+  is about crossing between cells, this one about getting a gradient at all. It is
+  also the one place where the reading of Remark~\ref{rem:provenance} is not free:
+  under the Gaussian reading $\nabla(Q_\nu)_\sigma(m)$ is an expectation under the
+  policy itself and the oracle idealises something that exists; under the
+  point-mass reading the estimate comes from off-policy perturbations whose noise
+  does \emph{not} shrink as the component arrives --- exactly the property
+  Lemma~\ref{lem:crit} supplies and everything after it consumes.
+\end{enumerate}
+
+\subsection*{2.7 Where Part 2 goes}
+
+Theorem~\ref{thm:part2} is not superseded later; it is \emph{invoked}. The
+statement that survives into the full proof is its discrete-time form, part~(b),
+in the preconditioned dress of Corollary~\ref{cor:precond} (\CV{Lemma~4}): one
+step of ascent contracts the distance to a \emph{frozen} target by a definite
+factor. Part 3 and Part 4 then add exactly one term to it,
+\[
+  \underbrace{\text{distance to target}}_{\text{shrinks, Part 2}}
+  \;+\;
+  \underbrace{\text{how far the target moved}}_{\text{Parts 3 and 4}},
+\]
+where the target moves because the blur width shrank (Part 3) or because the
+opponent did something (Part 4). The cells do not move, and the Lyapunov function
+$V = \tfrac12\|a-\xi_j\|^2$ does not change --- nor does it when the
+preconditioner is put back, since by Corollary~\ref{cor:precond} that only
+re-measures it. Everything after Part 2 is an argument that the second term
+eventually stops mattering.
+
+\part*{Part 3. The blur anneals itself, and sets the bias}
+\addcontentsline{toc}{section}{Part 3}
+\setcounter{section}{3}
+\setcounter{theorem}{0}
+
+\idea{Part 2 froze the blur width. The algorithm does not: each component's width
+is a parameter with its own update, so the landscape a component climbs is a
+blurred version of the real one and the blur is moving. Two things happen, and
+both are good. The blur collapses \emph{on its own} --- nobody schedules it ---
+because at a peak, blurring costs you value, so the update pushes the width down.
+And as it collapses, the target walks onto the true peak. What is left over is a
+pure blur deficit, and that deficit is exactly the exploitability. This is the
+part of the theory that makes parameter-free numerical predictions, and they hold
+to four digits. It is also the part that has to choose a component family, and
+the choice is not incidental: the mechanism \emph{is} a property of the Gaussian.}
+
+\medskip\noindent
+\textbf{This is where the Gaussian is bought.} Parts 1 and 2 were stated for an
+arbitrary component family and used nothing about it: Part 1 needed only that the
+per-component expectations exist, Part 2 only that some fixed differentiable
+landscape is being climbed (Remark~\ref{rem:provenance}). From here to the end of
+this part, the components are diagonal Gaussians, and two properties of that
+choice are used essentially --- neither of which any other family supplies:
+
+\begin{enumerate}[leftmargin=1.4em]
+\item \textbf{The width is a parameter with its own gradient.} It is not a
+  hyperparameter and not a schedule; it is a coordinate of the policy, and the
+  same objective that moves the means moves it. A point-mass policy has no such
+  coordinate, and a policy whose gradients come from a fixed exploration bandwidth
+  has one that is exogenous --- something to be tuned, not something that moves.
+\item \textbf{The Gaussian is the heat kernel.} Blurring at width $s$ is running
+  the heat equation for time $s^2/2$. This is what turns ``what does the width
+  update do?'' into ``what is the sign of the Laplacian at a peak?'', which has an
+  answer. It is a property of the Gaussian specifically, not of blurring: no other
+  family gives Lemma~\ref{lem:heat}.
+\end{enumerate}
+
+\noindent
+What is bought with them is the whole of this part --- annealing with no schedule,
+a bias with a closed form, and the theory's only four-digit predictions. What is
+paid is the $O(s^2)$ of Theorem~\ref{thm:part1}(ii), which
+Remark~\ref{rem:biasfamily} already isolated as the price of leaving the
+point-mass family. The bargain is that the mechanism drives its own price to zero:
+Corollary~\ref{cor:unfl}.
+
+Fix the opponent, as in Part 2, but now let both the means and the widths move.
+Write $\Lambda_s := \Lambda * \cN(0, s^2 I)$ for the landscape blurred at width
+$s$, and let $\xi_j(s)$ be the attractor of cell $j$ at that width --- a curve, the
+\emph{scale-space branch}, which is where the name comes from.
+
+\subsection*{3.1 Why the width falls by itself}
+
+\begin{lemma}[Blurring costs value at a peak; \GC{Lemma~3}]\label{lem:heat}
+For any $\Lambda$ and any width $s$,
+\[
+  \frac{\partial}{\partial (s^2/2)}\,\Lambda_s \;=\; \Delta \Lambda_s ,
+\]
+the heat equation. At an interior maximum of $\Lambda_s$ the Laplacian is
+non-positive, and strictly negative if the maximum is nondegenerate. Hence the
+log-width update of the algorithm is strictly negative near a branch point, and
+the width decreases.
+\end{lemma}
+
+\begin{proof}[Idea]
+Blurring is running the heat equation for time $s^2/2$; the derivative of the
+value at the current peak is the Laplacian there, the $\dot\xi$ term dropping out
+by the envelope theorem. A peak is locally concave, so its Laplacian is negative:
+smoothing a peak lowers it.
+\end{proof}
+
+This replaces the codebase's empirical ``self-annealing'' with a proof, and it
+holds in any dimension. It also explains why an explicit annealing schedule is
+never needed to get $\sigma \to 0$: a schedule only changes \emph{which} branch a
+component follows on the way down --- which, as Proposition~\ref{prop:sharp}(iv)
+noted, is precisely the mechanism by which annealing delivers components into a
+decoy in games outside the class.
+
+Lemma~\ref{lem:heat} is the exact point at which this document stops being
+family-agnostic, and the dependence is not incidental but definitional: the
+identity is the Gaussian semigroup's, and a family without it has no reason for
+its spread to fall at a peak rather than rise. Every subsequent statement in this
+part --- the arrival time, the branch displacement, the bias law, the magnet's
+brake factor --- is downstream of this one line.
+
+\begin{lemma}[Uniform version, giving a finite arrival time;
+\CV{Lemma~7}]\label{lem:arrive}
+The conclusion of Lemma~\ref{lem:heat} holds not only \emph{at} the branch point
+but throughout a ball of radius $\delta^\kappa$ around it, uniformly. Hence once a
+component has \emph{approximately} arrived, its width falls at a definite rate and
+reaches the floor $s^{\min}$ in finitely many steps --- after which it is constant.
+\end{lemma}
+
+\begin{proof}[Idea]
+Nondegeneracy at the branch point gives $\Delta\Lambda_s(\xi_j) \le -\kappa < 0$;
+the third derivative of $\Lambda_s$ is bounded, so the Laplacian is still below
+$-\kappa/2$ within a ball of radius $\kappa/(2L^{(3)})$.
+\end{proof}
+
+The upgrade from ``at the peak'' to ``near the peak'' is what makes this usable:
+transport and annealing happen simultaneously, so one never gets to apply
+Lemma~\ref{lem:heat} at an exactly arrived component. The finite arrival time
+matters too --- after it, the width contributes \emph{exactly zero} disturbance to
+the means, which is what lets the final argument conclude convergence rather than
+convergence-to-a-ball.
+
+\subsection*{3.2 The target walks onto the atom}
+
+\begin{lemma}[The branch moves slowly in the right variable;
+\CV{Lemma~3}]\label{lem:branch}
+$\|\partial \xi_j / \partial (s^2/2)\| \le L^{(3)}/\alpha$: the branch point moves
+by $O(1)$ per unit of $s^2/2$. Since the algorithm updates $\log s$, the
+displacement of the target caused by one width step carries a factor $s^2$.
+\end{lemma}
+
+\begin{proof}[Idea]
+Implicit function theorem applied to $\nabla \Lambda_s(\xi_j(s)) = 0$, using the
+heat equation for the $s$-derivative and nondegeneracy to invert the Hessian.
+\end{proof}
+
+This is a small statement with an outsized consequence, and it is worth spelling
+out because it answers the most natural objection to the whole scheme.
+
+\begin{remark}[``Doesn't the collapse freeze transport?'']\label{rem:throttle}
+It looks as though it must. The mean update is preconditioned by $\sigma^2$, so
+between $\sigma = 0.1$ and $\sigma = 10^{-3}$ the mean's contraction per step
+falls by four orders of magnitude: a component that has not arrived before the
+width collapses looks like it should be frozen where it stands. But the
+disturbance the collapse injects falls by \emph{six} orders --- one factor $s^2$
+from Lemma~\ref{lem:branch} and one from the preconditioner in the width update
+itself. Only the \emph{ratio} matters, and the ratio improves as the widths fall.
+Transport is not throttled relative to what it is chasing; both slow down
+together, and the disturbance slows faster (\CV{Lemma~8}).
+\end{remark}
+
+\subsection*{3.3 Part 3, and the numbers}
+
+\begin{theorem}[Transport and annealing, fixed opponent]\label{thm:part3}
+Assume Definition~\ref{def:C} holds at \emph{every} width in the admissible range
+$[s^{\min}, s^{\max}]$, with nondegenerate branch points. Then, with the opponent
+fixed, every component mean converges to the branch point of its cell, every
+width falls to the floor in finite time, and the residual exploitability is the
+blur deficit,
+\[
+  \varepsilon \;=\; \max_\cA \Lambda - \max_\cA \Lambda_{s^{\min}}
+  \;=\; O\big((s^{\min})^2\big),
+\]
+with the exponent $2$ exactly when the landscape is twice differentiable at its
+peaks.
+\end{theorem}
+
+\begin{proof}[Idea]
+Part 2 gives the means converging for each frozen width; Lemma~\ref{lem:arrive}
+gives the widths falling once the means are approximately arrived;
+Remark~\ref{rem:throttle} is what lets the two run simultaneously rather than in
+sequence. The bias is Theorem~\ref{thm:part1}'s computation at the floor.
+\end{proof}
+
+\begin{corollary}[Release the floor: $\varepsilon = \Theta(1/t)$;
+\GC{Corollary~2}]\label{cor:unfl}
+If the floor is removed, the width dynamics are $\dot\sigma = -c\,\sigma^3$ with
+$c = \tfrac{\eta}{2} w\,|\Delta \Lambda(\xi)|$ in closed form, so
+\[
+  \sigma(t) = \big(\sigma(0)^{-2} + 2ct\big)^{-1/2} = \Theta(t^{-1/2}),
+  \qquad
+  \varepsilon(t) = \Theta(1/t).
+\]
+\end{corollary}
+
+These are sharp enough to test directly, and \texttt{check\_scale\_law.py} does.
+On \texttt{TWO\_POINT} the predicted free constant is $c = 1.25$:
+
+\begin{center}
+\begin{tabular}{lccc}
+\hline
+run ($2\times10^6$ steps, floor $10^{-12}$) & fitted $c$ & predicted $c$ & ratio\\
+\hline
+free decay & $1.249835$ & $1.25$ & $0.9999$\\
+with magnet, atom init & $0.541092$ & $0.540415$ & $1.0013$\\
+with magnet, spread init & $0.541092$ & $0.540415$ & $1.0013$\\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent Fitting $\sigma^{-2}$ against $t$ gives $R^2 \ge 1 - 3\times10^{-8}$:
+the trajectory is affine in $\sigma^{-2}$, exactly as $\dot\sigma = -c\sigma^3$
+requires. Measured log--log slopes are $-0.502$ for $\sigma$ (predicted $-0.5$)
+and $-1.003$ for $\varepsilon$ (predicted $-1$).
+
+\begin{remark}[The floor is a hypothesis, not an approximation]\label{rem:floor}
+It is tempting to read the width floor as an implementation detail that costs
+accuracy. It is the opposite on both counts. It buys \emph{breadth}: condition (C)
+is imposed from $s^{\min}$ upward rather than from $0$, so a landscape carrying
+structure finer than the floor --- ripple, discretisation noise, a Monte-Carlo
+estimate --- can have very many peaks at width $0$ and exactly $M$ at the floor.
+Such a game is inside the class with a floor and outside it without. It is also
+what lets the payoff be merely \emph{bounded and measurable} rather than $C^2$:
+everything the algorithm ever evaluates is blurred at width $\ge s^{\min}$, hence
+smooth with bounded derivatives no matter how irregular $u$ is. And it costs no
+accuracy, because the floor is not what drives the bias down --- the width
+dynamics do, and Corollary~\ref{cor:unfl} recovers exactness as a rate. Its only
+genuine cost is that atoms closer together than the floor are unresolvable.
+
+Both benefits attach to the \emph{blur} rather than to the policy, so they are the
+part of this section that survives a point-mass reading: a policy of point masses
+whose gradients come from perturbations at bandwidth $h > 0$ evaluates only
+$h$-blurred objects, and inherits the bounded-measurable payoff and the tolerance
+of sub-$h$ structure verbatim. What it does not inherit is the sentence before
+last --- with $h$ exogenous nothing drives it down, so exactness stops being a rate
+and goes back to being a schedule to tune. That is the trade of this part in one
+line.
+\end{remark}
+
+\subsection*{3.4 What the Gaussian magnet does}
+
+The magnet on the Gaussian heads is the natural thing to reach for when transport
+is slow, and its effect is worth stating here because it is not the one usually
+assumed.
+
+\begin{lemma}[The magnet is a pure brake; \GC{Lemma~6}]\label{lem:brake}
+With magnet temperature $\tau^{\mathrm g}$ refreshed every $T$ steps, set
+\[
+  \beta \;=\; \frac{1 - e^{-\eta\tau^{\mathrm g}T}}{\eta\tau^{\mathrm g}T}
+  \;\in\; (0,1].
+\]
+Then \emph{both} Gaussian-head coordinates --- means and widths --- are slowed by
+the same factor $\beta$. The flow with magnet is the flow without it, under the
+time reparameterisation $t \mapsto \beta t$.
+\end{lemma}
+
+Since a time reparameterisation cannot change which initialisations eventually
+converge, the consequences are stark: asymptotic basins are unchanged, and what
+shrinks is finite-horizon reach. At a fixed step budget you arrive at fewer
+targets, and the bias at a fixed step count is worse by $1/\beta$. Combined with
+Proposition~\ref{prop:sharp}(ii) --- the magnet makes a trap \emph{deeper} --- the
+verdict for a curved landscape is that the Gaussian magnet cannot help transport
+and can only cost. The factor was checked over a $16\times$ range in
+$\eta\tau^{\mathrm g}T$; configurations sharing that product collapse onto the
+same constant, confirming it depends on nothing else:
+
+\begin{center}
+\begin{tabular}{ccccc}
+\hline
+$\tau^{\mathrm g}$ & $T$ & $\eta\tau^{\mathrm g}T$ & predicted $\beta$ &
+  measured ratio\\
+\hline
+$0.2$ & $50$ & $0.5$ & $0.78694$ & $1.0035$\\
+$0.05$ & $200$ & $0.5$ & $0.78694$ & $1.0006$\\
+$0.2$ & $200$ & $2.0$ & $0.43233$ & $1.0009$\\
+$0.2$ & $800$ & $8.0$ & $0.12496$ & $0.9976$\\
+$0.8$ & $200$ & $8.0$ & $0.12496$ & $0.9979$\\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{remark}[Where the magnet \emph{is} necessary]\label{rem:flat}
+There is one regime in which it is not optional. If the payoff has no self-term
+--- $u(a,b) = \ip{\varphi(a)}{C\psi(b)}$, a pure coupling --- then at equilibrium
+the landscape is \emph{constant}: $\nabla\Lambda \equiv 0$, and \eqref{eq:star}
+fails at every point. There is no gradient to ascend. The magnet's quadratic term
+$-\tfrac{\tau^{\mathrm g}}{2}\|a - \bar a\|^2$ supplies the curvature the game does
+not have, and (C) holds with one cell and $\rho(r) \propto r$.
+
+So the right object for condition (C) is not the blurred landscape but the
+\emph{magnet-regularised} blurred landscape, and curved and flat games are then
+two extremes of one condition rather than two cases. The price in the flat case is
+real: the target is $\bar a$, the previous iterate, so the atoms are unidentified
+and the conclusion degrades from ``the means converge to the atoms'' to ``the
+induced measure converges''. And the dichotomy is per \emph{direction}, not per
+game: a two-dimensional action can have a well in one coordinate and matching
+pennies in the other, and a scalar $\tau^{\mathrm g}$ then pays the brake in both.
+\end{remark}
+
+\subsection*{3.5 What Part 3 leaves open}
+
+The opponent is still frozen, so the peaks being found are still best responses
+rather than equilibrium atoms. That is Part 4.
+
+\part*{Part 4. Let the opponent move: a chase that damps}
+\addcontentsline{toc}{section}{Part 4}
+\setcounter{section}{4}
+\setcounter{theorem}{0}
+
+\idea{Now unfreeze the opponent. Your landscape is built from the opponent's
+policy, so when they move, your target moves --- and you are no longer climbing a
+hill, you are chasing one. The Lyapunov argument of Part 2 gains exactly one
+term: how far the target ran while you were closing in. So convergence becomes a
+question about a chase, and a chase terminates when the round trip contracts: if
+your target moves a little when they move, and theirs moves a little when you
+move, the whole thing damps. That is the one genuinely game-theoretic condition in
+the theory --- there is no counterpart in single-agent optimisation, because there
+is no opponent to chase --- and on the codebase's games it holds with three orders
+of magnitude to spare.}
+
+Throughout Part 4 both players' means and widths move; the categorical heads stay
+frozen, so that the chase can be seen on its own.
+
+\subsection*{4.1 One extra term}
+
+Player $0$'s landscape is $Q_\nu(a) = \int u(a,b)\,d\nu(b)$, so it is built from
+the opponent's whole policy. When the opponent's means move, $Q_\nu$ tilts, and
+the attractor $\xi_j$ moves with it. The estimate of Part 2 becomes
+\begin{equation}\label{eq:chase}
+  \underbrace{r(t+1)}_{\text{distance to target}}
+  \;\le\; r(t) \;-\; \underbrace{\eta\,\sigma^2 w\,\rho\big(r(t)\big)}
+                                 _{\text{you close in (Part 2)}}
+  \;+\; \underbrace{\big\|\xi_j(t+1) - \xi_j(t)\big\|}_{\text{the target ran}} .
+\end{equation}
+Everything about Part 2 survives verbatim --- same cells, same Lyapunov function,
+same contraction --- and the entire content of Part 4 is bounding the last term.
+
+\begin{remark}[The cell does not move; only the target inside it]\label{rem:fixed}
+This is the structural point that makes \eqref{eq:chase} usable, and it is where
+the present theory departs from its predecessor. The natural first attempt is to
+assume ``each mean starts in the basin of its atom''. That hypothesis does not
+survive a game: basins of a \emph{moving} landscape are not forward invariant, so
+a component sitting in the right basin at time $t$ can find itself in the wrong
+one at $t+1$ because the opponent moved --- through no fault of its own, with no
+update applied to it.
+
+Condition (C) repairs this by being quantified over \emph{every} opponent policy
+the run can visit, with the \emph{same} cells. A cell is then morally the
+intersection of the basins over the whole family: the region belonging to atom $j$
+no matter what the opponent does. That is what supplies a single Lyapunov function
+valid for all time, and it is the load-bearing difference between a condition that
+closes and one that does not.
+\end{remark}
+
+\subsection*{4.2 When the chase damps}
+
+\begin{lemma}[How far the target runs; \CV{Lemma~6}, \GC{Proposition~2}]
+\label{lem:drift}
+Let $g_0$ be the sensitivity of player $0$'s attractor to a displacement of
+player $1$'s means, and $g_1$ symmetrically. If the payoff has the finite-rank
+form \eqref{eq:finiterank} and the landscapes have curvature $\alpha_i$ at their
+branch points, then by the implicit function theorem
+\[
+  g_0 \;\le\; \frac{\|C\|\,\|\nabla\varphi\|\,\|\nabla\psi\|}{\alpha_0},
+\]
+and symmetrically. \emph{Curvature resists, coupling drives.}
+\end{lemma}
+
+\begin{theorem}[Two-player transport]\label{thm:part4}
+Assume, for both players, Part 2's hypotheses uniformly over the admissible width
+range, and that each player's widths are \emph{eventually constant} --- either
+frozen, or driven to a floor in finite time, for which Part 3 supplies a
+mechanism. Assume also the \emph{small-gain condition}
+\begin{equation}\label{eq:sg}
+  g_0\,g_1 \;<\; 1 .
+\end{equation}
+Then both players' means converge to their cells' branch points. If in addition
+the branch endpoints at the equilibrium opponent and the terminal width are the
+equilibrium atoms --- condition (M) --- then the means converge to the atoms, up to
+the branch displacement at that width.
+\end{theorem}
+
+\begin{remark}[Part 4 is indifferent again]\label{rem:part4family}
+The hypothesis has been stated as ``the widths are eventually constant'' rather
+than ``Part 3 holds'' deliberately. What the chase argument needs from the widths
+is only that they stop contributing a disturbance --- which Part 3 delivers for
+Gaussians, by Lemma~\ref{lem:arrive}, and which is true \emph{by construction} for
+a point-mass policy at a fixed exploration bandwidth, where there is no width
+coordinate to move in the first place.
+
+So Part 4 returns to the indifference of Parts 1 and 2, and the two sources of
+target motion it must bound --- the opponent's means and, in Part 5, the
+opponent's weights --- are the only ones a point-mass reading has at all. In the
+Gaussian reading there are two more, each player's own and its opponent's widths;
+those are what \eqref{eq:chase} inherits from Part 3 and what
+Remark~\ref{rem:throttle} disposes of. Nothing in Lemma~\ref{lem:drift} or
+Proposition~\ref{prop:cap} refers to a width: they are statements about how far an
+attractor moves when the landscape tilts, and their constants are curvatures and
+coupling norms.
+\end{remark}
+
+\begin{proof}[Idea]
+Apply \eqref{eq:chase} to each player, and note the last term of each is
+controlled by the \emph{other} player's tracking error, with constant $g_i$. So
+the pair of errors satisfies a two-dimensional comparison system whose off-diagonal
+product is $g_0g_1$; \eqref{eq:sg} makes a weighted maximum of the two a Lyapunov
+function for the pair. The point that makes this work rather than merely look
+plausible is that each player's \emph{step} is proportional to its own tracking
+error (Lemma~\ref{lem:crit}), so the disturbance each injects into the other
+vanishes as they arrive --- if the steps were merely $O(\eta)$, the two would
+hover forever within $O(\eta)$ of their targets instead of converging.
+\end{proof}
+
+\begin{remark}[Where the peaks become Nash atoms]\label{rem:M}
+Condition (M) is the bridge that Parts 2 and 3 kept deferring, and it is worth
+seeing why it is the natural hypothesis rather than a convenient one. By the
+support characterisation of a best response, the equilibrium atoms are
+\emph{automatically} maxima of the landscape at the equilibrium opponent --- that
+is a theorem, not an assumption. So (M) is not asserting anything about where the
+atoms are; it is asserting the converse pairing, that the $M$ attractors the class
+provides are those maxima and not others. Combined with Part 2's insistence that
+there are no \emph{other} maxima, the two conditions between them say: the
+landscape's peaks and the equilibrium's atoms are the same finite set.
+\end{remark}
+
+\subsection*{4.3 The condition in closed form, with numbers}
+
+\begin{proposition}[Curvature dominates coupling, for the small gain;
+\GC{Proposition~2}]\label{prop:cap}
+Under the finite-rank form \eqref{eq:finiterank}, the small-gain condition
+\eqref{eq:sg} is implied by
+\[
+  \alpha_0\,\alpha_1 \;>\; \|C\|^2\,\sup\|\nabla\varphi\|\,\sup\|\nabla\psi\| .
+\]
+\end{proposition}
+
+The same structural assumption \eqref{eq:finiterank} therefore does two jobs, and
+they should not be run together. In Part 2 it collapsed the quantifier over
+opponent policies and gave Proposition~\ref{prop:capC}, a certificate for
+\emph{(C)}, whose constant is $\inf\rho_0$ over the whole cell and which is
+correspondingly crude (Remark~\ref{rem:conservative}). Here it bounds the branch
+drift and gives a certificate for \emph{(D)}, whose constant is the curvature
+$\alpha_i$ \emph{at} the branch. Different conditions, different constants, one
+hypothesis on the payoff --- and it is this second one that holds with room to
+spare on the codebase's games.
+
+For the codebase's games $u = D(a) - D(b) + c\ip{f(a)}{f(b)}$ with Gaussian bumps
+of height $h$ and width $w$, so $\alpha \approx h/w^2$ and the condition reads
+$c\,\|f'\|^2 < (h/w^2)^2$ --- an $O(h/w^2)$ cap on the coupling. Concretely, on
+\texttt{TWO\_POINT} ($h=1$, $w=0.1$, so $\alpha = 100$; $f(a) = 2a-1$, so
+$\|f'\| = 2$; $c = 1$):
+\[
+  g_0 \;=\; \frac{c\|f'\|}{\alpha} \;=\; \frac{2}{100} \;=\; 0.02,
+  \qquad
+  g_0 g_1 \;=\; 4\times10^{-4} \;\lll\; 1 ,
+\]
+and the condition would first bite at $c \approx 50$. The coupling in that game is
+therefore three orders of magnitude away from being able to destabilise the
+chase --- which is why no experiment at $c=1$ has ever shown coupling-induced
+trouble, and why the two players' targets visibly settle rather than chase. A
+consistency check on the three-peak game predicts trouble from $c \approx 78$
+against a measured degradation between $c = 32$ and $c = 300$.
+
+\begin{remark}[This condition has no single-agent ancestor]\label{rem:gt}
+Parts 2 and 3 are, at bottom, graduated optimisation: star-concavity and a
+shrinking blur are borrowed from a single-agent literature. Part 4 is not. There
+is no opponent in graduated optimisation, hence no moving target, hence no
+round-trip gain and no small-gain condition. If one wants to name what the game
+setting adds to the optimisation story, it is exactly two things: the uniformity
+of (C) over opponent policies (Remark~\ref{rem:fixed}) and the condition
+\eqref{eq:sg}.
+\end{remark}
+
+\subsection*{4.4 What Part 4 leaves open}
+
+The categorical heads have been frozen. Unfreezing them is not free, because the
+opponent's \emph{weights} also enter your landscape: their weight error displaces
+your target just as their mean error does. So the chase of Part 4 is really a
+four-way chase, and that is Part 5.
+
+\part*{Part 5. All of them at once}
+\addcontentsline{toc}{section}{Part 5}
+\setcounter{section}{5}
+\setcounter{theorem}{0}
+
+\idea{Four things are moving --- two players' means, two players' weights --- and
+each disturbs the others. Part 1 says the weights would be fine if the means
+stopped; Part 4 says the means would be fine if the weights stopped. Neither
+stops. The question is whether the whole interconnection settles, and it is
+answered by a small-gain argument: form the matrix of ``how much block $i$ is
+disturbed per unit of block $j$'s error, relative to how fast block $i$ fixes
+itself'', and require its spectral radius to be below one. Three observations
+make that condition checkable, and one of them is what turns the whole scheme
+from plausible into provable.}
+
+\subsection*{5.1 The three observations}
+
+\begin{enumerate}[leftmargin=1.4em]
+\item \textbf{Every block's step is proportional to its own error.} A mean moves
+  fast only when it is far from its target, because the target is a critical point
+  (Lemma~\ref{lem:crit}); the same holds for the categorical head. So the
+  disturbance each block injects into its neighbours \emph{vanishes as that block
+  arrives}. Without this, the four blocks would settle into a permanent mutual
+  jitter of size $O(\eta)$ rather than converging.
+\item \textbf{The preconditioner cancels.} The factor $\sigma^2$ slows the mean
+  update as the widths collapse --- and slows every disturbance it is trying to
+  reject by at least as much (Remark~\ref{rem:throttle}). Around any cycle of the
+  interconnection it appears once in a numerator and once in a denominator. So
+  the stability condition contains no $\sigma$ and no step size: it is a statement
+  about the \emph{game}, checkable before training. (This observation exists to
+  answer an objection that only the Gaussian reading raises: it is the width
+  collapse of Part 3 that threatens to throttle transport. With a fixed
+  preconditioner and no width coordinate there is nothing to cancel and the
+  conclusion is immediate --- the same conclusion, reached for free.)
+\item \textbf{The categorical temperature is free.} It controls how stiff the
+  weight block's target is against the means moving underneath it --- larger
+  $\tau$, less sensitive --- and by Lemma~\ref{lem:mmd}(ii) it does not move the
+  limit. So it can be turned up until the loop closes, at no asymptotic cost.
+\end{enumerate}
+
+\subsection*{5.2 The composition}
+
+\begin{lemma}[Small gain; \CV{Lemma~10}]\label{lem:sg}
+Let four nonnegative errors satisfy
+\[
+  x_i(t+1) \;\le\; (1 - a_i)\,x_i(t) \;+\; \sum_{j\ne i} b_{ij}\,x_j(t)
+  \;+\; d_i(t),
+\]
+and let $\hat\Gamma_{ij} := b_{ij}/a_i$ --- disturbance received, per unit of the
+receiver's own repair rate. If the spectral radius of $\hat\Gamma$ is below one
+then there is a weighted maximum $V = \max_i x_i/\pi_i$ that contracts, and
+$x(t) \to 0$ whenever the exogenous inputs $d(t)$ do.
+\end{lemma}
+
+The four blocks are the two mean errors and the two weight errors; the widths are
+not a fifth block, because by Lemma~\ref{lem:arrive} they reach the floor in
+\emph{finite time} and thereafter contribute exactly zero, which is what makes
+$d(t)$ vanish.
+
+\begin{theorem}[Convergence on the class; \CV{Theorem~1}]\label{thm:main}
+Assume Parts 2--4's conditions --- which already include \textbf{(L)}, the linear
+star-concavity modulus $\rho(r) \ge \alpha r$ of \eqref{eq:Lpart2}, in force since
+Theorem~\ref{thm:part2}(b) --- together with one further condition:
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{(G)} the four-block gain matrix has spectral radius below one.
+\end{itemize}
+Then every mean converges to its cell's branch point, every width to its floor,
+the component matrix to the smoothed atom matrix, and the categorical heads to its
+Nash equilibrium; the means are within $O(s^2)$ of the atoms, and the induced
+policy pair is $\varepsilon$-Nash with
+$\varepsilon = O\big((s^{\min}_0)^2 + (s^{\min}_1)^2\big)$. Released from the
+floor, $\varepsilon = \Theta(1/t)$.
+\end{theorem}
+
+\subsection*{5.3 The two hard hypotheses, honestly}
+
+\begin{remark}[What (L) costs, and where it was actually spent]\label{rem:L}
+(L) is one of the two hypotheses in this development that can exclude a game, and
+on a bounded cell it is equivalent to requiring that the branch maxima be
+nondegenerate, uniformly. It does \emph{not} require $\alpha$ to be large: for
+Gaussian-bump landscapes $\alpha$ is exponentially small at long range, and every
+conclusion above is uniform in $\alpha > 0$ --- only the rate degrades
+(Remark~\ref{rem:rho}).
+
+It is worth being exact about when it was incurred, because the natural
+presentation --- ``Part 5 adds (L) to buy a geometric rate'' --- understates it.
+(L) was already required in Part 2, by Theorem~\ref{thm:part2}(b): the
+\emph{fixed-step} iteration does not converge without it, for the reason set out
+in Remark~\ref{rem:needL}. What Part 5 adds is not the hypothesis but the
+observation that one constant pays for three things --- the geometric contraction
+of the mean block, the uniform branch curvature $\kappa$ that
+Lemma~\ref{lem:arrive} needs for the scales to descend, and the denominators of
+the gain matrix in (G). Had (L) been introduced here it would look like a
+convenience; introduced in Part 2, it looks like what it is, the price of running
+a discrete algorithm rather than a flow.
+\end{remark}
+
+\begin{remark}[What (G) costs]\label{rem:G}
+(G) is the quantitative form of Part 4's $g_0g_1 < 1$, extended from two blocks to
+four. By observation~2 of \S5.1 it contains no step size and no width, so it is a
+$4\times4$ eigenvalue computation from game constants. Its two binding cycles are
+the mean$\leftrightarrow$mean cycle --- which is Proposition~\ref{prop:cap}, with
+condition numbers made explicit --- and a mean$\leftrightarrow$weight cycle, which
+carries a factor $1/\tau$ and is therefore satisfied by taking the categorical
+temperature large. Observation~3 is what makes that free.
+\end{remark}
+
+\subsection*{5.4 What is still not proved}
+
+\begin{enumerate}[leftmargin=1.4em]
+\item \textbf{Exact gradients.} Everything assumes the payoff and its derivatives
+  are available exactly. With sampled estimates the mean block acquires a noise
+  term that does \emph{not} vanish with the tracking error, so the argument would
+  deliver an $O(\sqrt\eta)$ ball rather than convergence; a decreasing step size
+  or variance reduction would be needed. This is the largest remaining gap between
+  the theorem and the implementation, and it is the gap that widens fastest if the
+  component family is changed --- see \S2.6, item~4.
+\item \textbf{Verifying (C) at scale.} Treated in \S2.5, and the summary is that
+  the two quantifiers in (C) are collapsed by a finite-rank coupling
+  (Proposition~\ref{prop:capC}) or by one-dimensional mode counting
+  (Remark~\ref{rem:check}), and not otherwise. Neither route is available for a
+  structureless payoff in dimension above one, and the closed-form certificate is
+  crude even when it applies (Remark~\ref{rem:conservative}). This is the
+  hypothesis with the widest gap between what is assumed and what can be
+  confirmed.
+\item \textbf{Exploration between cells.} Unchanged from Part 2: covering is
+  assumed because the algorithm cannot achieve it.
+\item \textbf{Extensive form.} A second theory, not a corollary: the payoff is
+  bilinear in sequence form, but the policy parameterises behavioural strategies
+  per infoset, and the cellwise analysis would have to be redone with continuation
+  values as the landscape.
+\end{enumerate}
+
+\section*{Reading the five parts together}
+
+The one-sentence version of the whole development is that the problem factorises
+and the two factors are not equally hard. Mixing is free: the categorical head
+plays a finite matrix game exactly, and finite matrix games are solved
+unconditionally (Part 1). Location is everything: it is local ascent on a blurred
+landscape, so it succeeds exactly when each region of the action space has one
+attractor (Part 2), it self-anneals onto the true peaks as the blur collapses
+(Part 3), it survives the opponent moving provided curvature dominates coupling
+(Part 4), and the pieces compose provided the round-trip gains are contractions
+(Part 5).
+
+The negative result is what fixes the shape. A single spurious attractor produces
+an exponentially stable non-Nash configuration with an open basin, immune to the
+magnet, to extra capacity and to annealing. So no initialisation-robust class can
+permit one, and ``exactly $M$ attractors'' is forced rather than chosen. Which is
+the practical message: the failures usually attributed to tuning are properties of
+the game, and --- by Remark~\ref{rem:check} --- they are checkable before training.
+
+There is a second thread running through the five parts, and it is worth
+collecting because it is invisible from inside any one of them. The Gaussian
+enters the development \emph{once}, at Lemma~\ref{lem:heat}, and everything on
+either side of that line is indifferent to it. Parts 1 and 2 hold for any family
+of components, point masses included, and the exposition says so at the two places
+it could be doubted (Remarks~\ref{rem:provenance} and~\ref{rem:trapfamily}); Parts
+4 and 5 hold for anything that eventually stops moving its widths
+(Remark~\ref{rem:part4family}). What Part 3 buys with the choice is the heat
+equation, and what the heat equation buys is a width that anneals itself; what it
+costs is the $O(s^2)$ representation bias that a point-mass family would not have
+had (Remark~\ref{rem:biasfamily}). That the mechanism drives its own cost to zero
+at $\Theta(1/t)$ is the content of Corollary~\ref{cor:unfl}, and it is the reason
+the trade is worth making rather than merely defensible.
+
+Two riders on that, both stated where they arise and repeated here because they
+are the places a careful reader will push. The cheap certificate for condition (C)
+--- the mode count of Remark~\ref{rem:check} --- is Gaussian and one-dimensional
+even though the theorem it certifies is neither; and the exact-gradient assumption
+of \S5.4 is an idealisation of something real under the Gaussian reading and of
+nothing in particular under a point-mass one. Neither changes a theorem. Both
+change how far a theorem is from an implementation, which is the more useful thing
+to know.
+
+\end{document}

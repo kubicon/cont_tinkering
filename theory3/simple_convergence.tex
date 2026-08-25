@@ -1,0 +1,1147 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.6cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black]{hyperref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}{Assumption}
+\renewcommand{\theassumption}{\Alph{assumption}}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{example}[theorem]{Example}
+
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator{\dom}{dom}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\Expl}{\mathrm{Expl}}
+\newcommand{\QRE}{\mathrm{QRE}}
+\newcommand{\simplex}{\Delta}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\half}{\tfrac{1}{2}}
+\newcommand{\ip}[2]{\langle #1, #2\rangle}
+\newcommand{\norm}[1]{\lVert #1 \rVert}
+\newcommand{\abs}[1]{\lvert #1 \rvert}
+
+\title{\textbf{A Simple Convergence Theory for MMD on Fixed-Size Mixtures}\\[4pt]
+\large Tabular, exact-gradient, purely about where the gradient pushes}
+\author{theory3}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note gives the simplest convergence argument I can find for the algorithm in
+this codebase (magnetic mirror descent / MMD on the categorical head of a
+$K$-component mixture policy, plus entropy-regularised ascent on the component
+locations), in the tabular, exact-gradient regime.
+
+Everything rests on one exact identity: the exploitability of a pair of mixture
+policies splits, with no slack, into the exploitability of a \emph{finite matrix
+game} played on the current component locations plus two \emph{support gaps}.
+The two halves are then killed by two different mechanisms: the matrix-game half
+by MMD on the simplex (which is a contraction because of the magnet), the support
+gaps by the component locations climbing the payoff landscape. The two mechanisms
+interact, and a two-line small-gain calculation says exactly when the interaction
+is benign.
+
+The Gaussian head never appears in the analysis except as a positive scalar
+multiplying a gradient (which cannot move a fixed point) and as the smoothing that
+defines \emph{which} landscape the gradient sees. Approximation error, sampling
+noise, and critic error are assumed away.
+\end{abstract}
+
+\tableofcontents
+
+\newpage
+\section{What this document is, and how it differs from \texttt{theory2}}
+
+\texttt{theory2} proves a lot, and the proofs are involved: they carry
+Wasserstein geometry on measures, heat-kernel annealing of the Gaussian width,
+lifted monotonicity, and a five-part incremental construction. This note throws
+almost all of that away and asks the narrow question:
+
+\begin{quote}
+\emph{In the tabular, noise-free, exact-gradient regime, with a fixed number $K$ of
+components and $K$ larger than what is needed to represent a Nash equilibrium ---
+what does the gradient field do, and when does it converge?}
+\end{quote}
+
+The four simplifications that make it easy:
+
+\begin{enumerate}[label=(S\arabic*),leftmargin=*]
+\item \textbf{Exact gradients.} No Monte-Carlo, no critic, no PPO surrogate. The
+update is the deterministic vector field of \texttt{idealized\_mmd.py}.
+\item \textbf{Atoms, not measures.} A $K$-component mixture is a point in
+$\simplex_K \times A^K$: $K$ weights and $K$ locations. We never work in the space
+of measures, never need Wasserstein gradient flows, and never need a
+representation-error term --- because of (S4).
+\item \textbf{The Gaussian head is not the subject.} A Gaussian component
+$\mathcal N(x_k,\sigma_k^2)$ is how the algorithm \emph{obtains} a gradient
+(it samples in a neighbourhood, so it feels the smoothed landscape). What we
+analyse is the vector field that comes out. The width $\sigma$ enters this
+document in exactly two harmless places: it multiplies the gradient by a positive
+scalar (Lemma~\ref{lem:precond}: cannot move a fixed point), and it fixes which
+smoothed landscape $u_\sigma$ the atoms are climbing (\S\ref{sec:setting},
+Remark~\ref{rem:sigma}). It is never a state variable of the proof.
+\item \textbf{Capacity is not the bottleneck.} We assume $K$ is at least the
+number of ``cells'' of the landscape (Assumption~\ref{as:cells}), which is at
+least the size of the support of a Nash. So there is no representation bias to
+bound and no $\Theta(1/t)$ bias-annealing story.
+\end{enumerate}
+
+What survives from \texttt{theory2}, in a much shorter form, is the shape of the
+answer: convergence is governed by \emph{coupling strength versus landscape
+curvature}, and the magnet temperature is the knob that buys stability at the
+price of bias. Theorem~\ref{thm:main} states that as a single scalar inequality,
+$\kappa\lesssim m_\star\tau$, and it is proved the way the fixed-matrix MMD result is
+proved: one map, one fixed point, one contraction.
+
+\medskip
+\noindent\textbf{Notation summary.}
+\begin{center}
+\begin{tabular}{ll}
+$A,B\subset\R^d$ & compact action sets of the maximiser / minimiser\\
+$u(a,b)$ & payoff to the maximiser; $\sigma$-smoothed version $u_\sigma$\\
+$x_1,\dots,x_K\in A$, $w\in\simplex_K$ & maximiser's atoms and weights, $\mu=\sum_k w_k\delta_{x_k}$\\
+$y_1,\dots,y_K\in B$, $v\in\simplex_K$ & minimiser's atoms and weights, $\nu=\sum_l v_l\delta_{y_l}$\\
+$M(X,Y)_{kl}=u(x_k,y_l)$ & the \emph{restricted game}: a $K\times K$ matrix\\
+$\tau$ & magnet / entropy temperature\\
+$\eta_x,\eta_w$ & step sizes for locations and for weights\\
+$m$ & strong concavity of the landscape inside a cell\\
+$\kappa$ & coupling strength, $\kappa=\sup\norm{\nabla_a u(a,b)-\nabla_a u(a,b')}$\\
+\end{tabular}
+\end{center}
+
+\newpage
+\part*{Part I --- The setting and the identity}
+\addcontentsline{toc}{part}{Part I --- The setting and the identity}
+
+\section{Setting}\label{sec:setting}
+
+\paragraph{The game.} A two-player zero-sum game with continuous actions:
+compact convex sets $A,B\subset\R^d$ and a payoff $u:A\times B\to\R$ that the
+first player maximises and the second minimises. Mixed strategies are probability
+measures; the payoff extends bilinearly,
+$U(\mu,\nu)=\int\!\!\int u\,d\mu\,d\nu$. Write $u(a,\nu)=\int u(a,b)\,d\nu(b)$
+and $u(\mu,b)=\int u(a,b)\,d\mu(a)$.
+
+\paragraph{Exploitability.} The quantity we drive to zero:
+\begin{equation}\label{eq:expl}
+\Expl(\mu,\nu) \;=\; \max_{a\in A} u(a,\nu)\;-\;\min_{b\in B} u(\mu,b)\;\ge\;0,
+\end{equation}
+which is $0$ exactly at a Nash equilibrium. (This is \texttt{exploitability()} in
+\texttt{idealized\_mmd.py}, computed there on a fine grid.)
+
+\paragraph{The policy class.} Both players use a mixture of $K$ atoms:
+\[
+\mu=\sum_{k=1}^K w_k\,\delta_{x_k},\qquad
+\nu=\sum_{l=1}^K v_l\,\delta_{y_l},\qquad w,v\in\simplex_K,\; x_k\in A,\; y_l\in B .
+\]
+The state of the algorithm is $z=(X,w,Y,v)\in A^K\times\simplex_K\times B^K\times\simplex_K$.
+
+\paragraph{Standing regularity.} $u$ is $C^2$ with
+\[
+\abs{u}\le U_{\max},\qquad
+\norm{\nabla_a u}\le G,\qquad
+\norm{\nabla^2_{aa} u}\le L,\qquad
+\kappa:=\sup_{a,b,b'}\norm{\nabla_a u(a,b)-\nabla_a u(a,b')}\le 2G ,
+\]
+and symmetrically in $b$. The constant $\kappa$ is the one that matters: it is
+\emph{how much the maximiser's landscape moves when the minimiser moves}. In a game
+$u(a,b)=D(a)-D(b)+\lambda\,f(a)^\top g(b)$ --- the family in \texttt{games/examples.py}
+--- we have $\kappa\le 2\lambda\,\norm{f'}_\infty\norm{g}_\infty$, i.e. $\kappa$ is
+literally the \texttt{coupling} coefficient up to a constant. If $\kappa=0$ the two
+players play separate single-agent problems and everything below is trivial.
+
+\begin{remark}[Where the Gaussian width lives]\label{rem:sigma}
+The algorithm's components are $\mathcal N(x_k,\sigma_k^2 I)$, not atoms, so the
+gradient it computes is a gradient of the \emph{smoothed} payoff
+$u_\sigma(a,b) = \E_{\xi\sim\mathcal N(0,\sigma^2 I)}[u(a+\xi,b)]$
+(this is exactly what \texttt{well\_expectation} computes in closed form).
+Fix $\sigma$ in a compact range $[\sigma_{\min},\sigma_{\max}]$ --- the code clips
+$\log\sigma$ to $[\log 10^{-3},0]$ --- and read \emph{every} $u$ in this document as
+$u_\sigma$. All constants $G,L,\kappa,m$ are then constants of $u_\sigma$. Nothing else
+changes; in particular Assumption~\ref{as:cells} is an assumption about $u_\sigma$,
+not about $u$. This is the only role $\sigma$ plays, and \S\ref{sec:anneal-sigma}
+says what it costs to let $\sigma$ move.
+\end{remark}
+
+\section{The algorithm, tabularised}\label{sec:alg}
+
+The implementation is soft actor-critic with a magnetic-mirror-descent actor. In
+the tabular exact-gradient regime the critic is exact, so the whole thing collapses
+to two updates. Write $q_k = u(x_k,\nu_t)$ for the maximiser's per-component value
+(this is \texttt{component\_q}); note $\ip{w}{q} = U(\mu,\nu)$.
+
+\paragraph{(W) The weights: closed-form MMD on the simplex.} With magnet $\rho$,
+magnet temperature $\tau$, entropy temperature $\tau_{\mathrm{ent}}$ and step $\eta_w$,
+\begin{equation}\label{eq:mmd}
+w_{t+1} \;=\; \argmax_{w\in\simplex_K}\;
+\Big\{ \ip{w}{q} - \tau\KL(w\Vert\rho) - \tau_{\mathrm{ent}}\KL(w\Vert \mathrm{unif})
+- \tfrac{1}{\eta_w}\KL(w\Vert w_t)\Big\},
+\end{equation}
+whose solution is the log-linear update implemented in
+\texttt{categorical\_mirror\_update}:
+$\log w_{t+1} \propto (\eta_w q + \eta_w\tau\log\rho + \log w_t)/(1+\eta_w\tau+\eta_w\tau_{\mathrm{ent}})$.
+The magnet $\rho$ is refreshed to the current $w$ every $T_{\mathrm{mag}}$ steps.
+Since $\KL(\cdot\Vert\mathrm{unif})$ is just $\KL$ against a particular magnet, we
+absorb $\tau_{\mathrm{ent}}$ into $\tau$ from now on and write a single temperature
+$\tau>0$. \emph{SAC's entropy bonus and MMD's magnet are the same object here.}
+
+\paragraph{(X) The locations: preconditioned ascent.} The mixture's payoff is
+$U(\mu,\nu)=\sum_k w_k\,u(x_k,\nu)$, so
+$\nabla_{x_k} U = w_k\,\nabla_a u(x_k,\nu)$; the natural gradient in the Gaussian's
+Fisher metric multiplies this by $\sigma_k^2$. Hence the implemented update
+(\texttt{gaussian\_natural\_step}) is, exactly,
+\begin{equation}\label{eq:xstep}
+x_k \;\leftarrow\; \Pi_A\big(x_k + \eta_x\,p_k\,\nabla_a u(x_k,\nu_t)\big),
+\qquad p_k \;=\; \sigma_k^2\,w_k \;>\;0 .
+\end{equation}
+The minimiser's updates are \eqref{eq:mmd}--\eqref{eq:xstep} with $u$ replaced by
+$-u$.
+
+\begin{remark}[What \eqref{eq:xstep} leaves out]\label{rem:xmagnet}
+\texttt{gaussian\_natural\_step} actually ascends
+$U(\mu,\nu)+\tau_{\mathrm{ent}}\sum_k\log\sigma_k
+-\tau\,\KL\big(\mathcal N(x_k,\sigma_k^2)\Vert\mathcal N(\rho_{X,k},\sigma_{\rho,k}^2)\big)$,
+so the implemented mean update carries, on top of \eqref{eq:xstep}, a proximal pull
+$-\eta_x\sigma_k^2\,\tau\,(x_k-\rho_{X,k})/\sigma_{\rho,k}^2$ towards the magnet's
+means. Everything below holds verbatim with that term included: it only \emph{adds}
+$\tau\sigma_k^2/\sigma_{\rho,k}^2$ to the strong-concavity constant $m$ of the
+location objective, and it moves the cell maximiser to that of the proximal
+objective. It vanishes at every magnet refresh $\rho_X\leftarrow X$, so it does not
+change the outer fixed point. We drop it because it can only help.
+\end{remark}
+
+\paragraph{(\texorpdfstring{$\sigma$}{sigma}) The widths.} Not analysed; see
+Remark~\ref{rem:sigma}. We only use $p_k\in[p_{\min},p_{\max}]$ with
+$p_{\min}=\sigma_{\min}^2 w_{\min}>0$; \S\ref{sec:starve} is about keeping
+$w_{\min}$ away from $0$.
+
+\begin{lemma}[Preconditioner neutrality]\label{lem:precond}
+Let $A=\prod_{i=1}^d[\ell_i,r_i]$ be a box and $P=\mathrm{diag}(p_1,\dots,p_d)$ with
+every $p_i>0$. Then the fixed points of $x\mapsto \Pi_A(x+\eta P\nabla\phi(x))$ are
+exactly the stationary points of $\phi$ on $A$, independently of $P$.
+\end{lemma}
+\begin{proof}
+$\Pi_A$ is the coordinatewise clip, so with $g=\nabla\phi(x)$ we have
+$\Pi_A(x+\eta Pg)=x$ iff, for every coordinate $i$, either $p_ig_i=0$, or
+$x_i=r_i$ and $p_ig_i>0$, or $x_i=\ell_i$ and $p_ig_i<0$. Each clause is unchanged
+when $p_ig_i$ is replaced by $g_i$, because $p_i>0$; and the resulting condition is
+exactly $g\in N_A(x)$, i.e.\ stationarity of $\phi$ on $A$.
+\end{proof}
+
+\begin{remark}
+$P\succ0$ alone does \emph{not} suffice on a general convex $A$: being fixed asks
+$Pg\in N_A(x)$, and a non-diagonal $P$ can rotate $g$ into or out of the normal cone
+at a curved boundary. A box with diagonal $P$ --- the case in this codebase, where
+$A$ is an interval and $P$ is a per-component scalar --- is exactly the situation in
+which $N_A(x)$ is $P$-invariant.
+\end{remark}
+
+\noindent This one line is the formal content of ``the analysis should not be
+about the Gaussian head''. The head chooses $P$; $P$ changes speed, never
+destination. It \emph{can} change stability in a genuinely coupled two-player
+system. It is harmless here for a narrower reason: the location block is projected
+gradient ascent--descent on a single \emph{strongly monotone} saddle problem
+(\S\ref{sec:locations}), whose contraction survives any constant positive diagonal
+preconditioner once the metric is chosen to match it (Remark~\ref{rem:Pnorm}). That is
+why the final condition (Theorem~\ref{thm:main}) depends on $p_{\max}/p_{\min}$ only as
+a constant.
+
+\section{The master identity}\label{sec:identity}
+
+Everything in this note is a consequence of the following exact decomposition.
+Define, for the current state $z=(X,w,Y,v)$:
+\begin{align}
+\Delta_x(z) &:= \max_{a\in A} u(a,\nu) \;-\; \max_{k\le K} u(x_k,\nu)
+&&\text{(maximiser's \emph{support gap})}\\
+\Delta_y(z) &:= \min_{l\le K} u(\mu,y_l) \;-\; \min_{b\in B} u(\mu,b)
+&&\text{(minimiser's support gap)}\\
+\Expl_M(w,v) &:= \max_{k} (Mv)_k \;-\; \min_{l} (w^\top M)_l,
+\quad M=M(X,Y) &&\text{(\emph{matrix-game} exploitability).}
+\end{align}
+All three are $\ge0$: the first two because a max over a subset is at most a max
+over the whole set, the third because $\max_k(Mv)_k\ge w^\top Mv\ge\min_l(w^\top M)_l$.
+
+\begin{lemma}[Master identity]\label{lem:identity}
+For every state $z$,
+\[
+\boxed{\;\Expl(\mu,\nu)\;=\;\Expl_{M(X,Y)}(w,v)\;+\;\Delta_x(z)\;+\;\Delta_y(z).\;}
+\]
+\end{lemma}
+\begin{proof}
+Insert a telescoping pair into \eqref{eq:expl}:
+\[
+\max_a u(a,\nu)-\min_b u(\mu,b)
+=\underbrace{\Big[\max_a u(a,\nu)-\max_k u(x_k,\nu)\Big]}_{\Delta_x}
++\Big[\max_k u(x_k,\nu)-\min_l u(\mu,y_l)\Big]
++\underbrace{\Big[\min_l u(\mu,y_l)-\min_b u(\mu,b)\Big]}_{\Delta_y}.
+\]
+Finally $u(x_k,\nu)=\sum_l v_l u(x_k,y_l)=(Mv)_k$ and
+$u(\mu,y_l)=\sum_k w_k u(x_k,y_l)=(w^\top M)_l$, so the middle bracket is
+$\Expl_M(w,v)$.
+\end{proof}
+
+\begin{corollary}[Support sufficiency]\label{cor:suff}
+If (i) some atom of each player is a global best response, i.e.
+$\Delta_x=\Delta_y=0$, and (ii) $(w,v)$ is a Nash equilibrium of the $K\times K$
+matrix game $M(X,Y)$, then $(\mu,\nu)$ is a Nash equilibrium of the continuous
+game.
+\end{corollary}
+
+\medskip
+Lemma~\ref{lem:identity} is the whole architecture of the theory, and it is worth
+saying plainly what it buys:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{The hard part of game theory --- mixing --- is finite.} Once the
+locations are fixed, finding the right \emph{weights} is a $K\times K$ matrix game
+problem, and MMD solves matrix games. Nothing about continuous action spaces,
+non-concavity, or infinite-dimensional geometry enters that half.
+\item \textbf{The hard part of continuous actions --- \emph{where} to put mass ---
+carries no equilibrium structure of its own.} $\Delta_x$ is a functional of $(X,\nu)$
+alone: no $\max\min$, no equilibrium concept appears in it, in contrast with $\Expl_M$,
+which is a genuine saddle quantity. Correspondingly, the update that closes it
+consults no equilibrium either --- it is ascent on a function.
+
+\emph{This must not be over-read.} It does \emph{not} say that closing $\Delta_x$ is a
+single-agent problem. At $K=1$ the matrix $M$ is $1\times1$, so $\Expl_M\equiv0$ and the
+identity degenerates to $\Expl=\Delta_x+\Delta_y$ --- the whole of the game now sits in
+the ``non-strategic'' half, and the dynamics are simultaneous gradient
+ascent--descent on $u(x,y)$, which on $u=xy$ cycles forever. The support gaps are closed
+against an opponent who is himself moving, and moving in response to us; that is a game,
+with feedback, and \S\ref{sec:main} is the price. What makes the location half tractable
+is not the identity but Assumption~\ref{as:cells}(C1): strong concavity per cell makes
+the joint location dynamics a \emph{strongly monotone} game, and strongly monotone games
+behave like optimisation problems. The honest reading of the split is therefore
+\emph{strategic error versus support error}, not \emph{game versus optimisation}.
+\item \textbf{They are added, not multiplied.} There is no cross term. So the two
+error sources can be attacked by two independent mechanisms, and the only thing
+left to control is how each mechanism disturbs the other. That is \S\ref{sec:main}.
+\end{itemize}
+
+\newpage
+\part*{Part II --- The two mechanisms}
+\addcontentsline{toc}{part}{Part II --- The two mechanisms}
+
+\section{The one assumption about the game: cells}\label{sec:cells}
+
+$\Delta_x$ is closed by gradient ascent, and gradient ascent is local. So we need
+an assumption saying that local ascent from a spread-out initialisation finds the
+global maximum. The weakest useful version:
+
+\begin{assumption}[Cell decomposition]\label{as:cells}
+There is a finite family of compact \emph{convex} sets $A_1,\dots,A_{m_A}\subseteq A$
+and a constant $m>0$ such that for \emph{every} $\nu\in\simplex(B)$:
+\begin{enumerate}[label=(C\arabic*),leftmargin=*]
+\item \textbf{Curvature.} $a\mapsto u(a,\nu)$ is $m$-strongly concave (and $L$-smooth)
+on each $A_i$.
+\item \textbf{Invariance.} Each $A_i$ is invariant under the update map
+$a\mapsto\Pi_A\big(a+\eta_x P\nabla_a u(a,\nu)\big)$, for every admissible diagonal
+$P$ and every $\eta_x$ obeying the step-size condition of Lemma~\ref{lem:track}.
+\item \textbf{Reachability of the best response.} Some cell contains a global
+maximiser of $u(\cdot,\nu)$ over $A$.
+\end{enumerate}
+Symmetrically for $B$ with cells $B_1,\dots,B_{m_B}$ and the same $m$.
+\end{assumption}
+
+By (C1) each cell has a unique maximiser
+$x_i^\star(\nu) := \argmax_{a\in A_i} u(a,\nu)$, and (C3) says exactly
+\begin{equation}\label{eq:cellmax}
+\max_{a\in A} u(a,\nu) = \max_{i\le m_A} u\big(x_i^\star(\nu),\nu\big).
+\end{equation}
+So the global maximum \emph{is} the best of the per-cell maxima, and each per-cell
+maximum is reachable by local ascent. That is the entire content of the assumption.
+
+\begin{remark}[Why the cells must \emph{not} be asked to cover $A$]\label{rem:nocover}
+The tempting form of (C3) is $\bigcup_iA_i=A$, and it is inconsistent with (C1).
+If $u(\cdot,\nu)$ has an interior local \emph{minimum} $a_0$ --- which every
+multi-well landscape has, and \texttt{MultiPointGame} certainly has --- then $a_0$
+would lie in some cell on which $u(\cdot,\nu)$ is $m$-strongly concave, contradicting
+$\nabla^2_{aa}u(a_0,\nu)\succeq0$. (C3) is all that \eqref{eq:cellmax} ever needs, and
+it is consistent: cells are neighbourhoods of the peaks, the valleys and plateaus
+between them belong to no cell, and \S\ref{sec:anneal-sigma} is precisely about making
+the peaks wide enough that the initialisation lands inside one.
+\end{remark}
+
+\begin{remark}[Invariance is stated for the \emph{discrete} step]
+(C2) is about the map the algorithm runs, not about the flow $\dot a=\nabla_au(a,\nu)$,
+and the algorithm projects onto $A$, not onto $A_i$; a continuous-time invariance
+statement would not by itself keep a discrete iterate inside its cell. A sufficient
+condition is that $A_i$ contain the $\norm{\cdot}_{P^{-1}}$-ball of radius
+$\sup_\nu\mathrm{diam}(A_i)$ around $x_i^\star(\nu)$ for all $\nu$, since by
+Lemma~\ref{lem:track} the step is a contraction towards $x_i^\star(\nu)$ in that norm.
+\end{remark}
+
+\begin{assumption}[Capacity and covering initialisation]\label{as:cover}
+$K\ge m_A$ and $K\ge m_B$, and the initial atoms $x_1(0),\dots,x_K(0)$ meet every
+cell $A_i$ (symmetrically for $Y$). Write $c(k)$ for a cell containing $x_k(0)$; by
+(C2), $x_k(t)\in A_{c(k)}$ for every $t$.
+\end{assumption}
+
+This is the formal reading of ``we always have more points than we need to
+reconstruct a Nash''. It is genuinely stronger than that phrase: the support of a
+Nash is contained in the set of best responses, which by \eqref{eq:cellmax} contains
+at most one point per cell, so $\lvert\mathrm{supp}\,\mu^\star\rvert \le m_A \le K$
+automatically. Assumption~\ref{as:cover} additionally asks that the atoms be
+\emph{spread across} the cells at initialisation, because ascent will never move an
+atom between cells. In the code this is
+\texttt{\_spread\_bias\_init} / the spread initialisations in
+\texttt{run\_idealized.py}, and \S\ref{sec:anneal-sigma} explains the other way to
+get it (start with a large $\sigma$, which merges cells).
+
+\begin{lemma}[How far a mixture can move a gradient]\label{lem:grad}
+For mixtures $\nu=\sum_lv_l\delta_{y_l}$ and $\nu'=\sum_lv'_l\delta_{y'_l}$ and any $a$,
+\[
+\norm{\nabla_a u(a,\nu)-\nabla_a u(a,\nu')}\;\le\;\tfrac{\kappa}{2}\norm{v-v'}_1
+\;+\;L_{ab}\max_l\norm{y_l-y'_l},\qquad L_{ab}:=\norm{\nabla^2_{ab}u}_\infty .
+\]
+\end{lemma}
+\begin{proof}
+Split
+$\nabla_au(a,\nu)-\nabla_au(a,\nu')=\sum_l(v_l-v'_l)\nabla_au(a,y_l)
++\sum_lv'_l\big(\nabla_au(a,y_l)-\nabla_au(a,y'_l)\big)$.
+The second sum is at most $L_{ab}\max_l\norm{y_l-y'_l}$. The first has coefficients
+summing to $0$, so subtracting any fixed vector from every $\nabla_au(a,y_l)$ leaves it
+unchanged; subtracting the midpoint of their range and using the definition of $\kappa$
+bounds it by $\tfrac{\kappa}{2}\norm{v-v'}_1$.
+\end{proof}
+
+\noindent The ratio $\kappa/m_\star$ --- \textbf{coupling over curvature} --- is the
+single number that decides whether this algorithm is stable. It appears again in
+Theorem~\ref{thm:main} and nowhere else. Note which constant it is \emph{not}: the
+cross-curvature $L_{ab}=\norm{\nabla^2_{ab}u}_\infty$, the second term above, never
+reaches the threshold --- see Remark~\ref{rem:noLab}.
+
+\section{The weight loop is a contraction (because of the magnet)}\label{sec:weights}
+
+Fix the locations, so the players face the fixed matrix game $M$. With temperature
+$\tau>0$ and magnet $\rho$, the regularised saddle problem
+\begin{equation}\label{eq:qre}
+\max_{w\in\simplex_K}\min_{v\in\simplex_K}\;
+\Phi_M(w,v),\qquad
+\Phi_M(w,v):=w^\top M v - \tau\KL(w\Vert\rho_x) + \tau\KL(v\Vert\rho_y)
+\end{equation}
+is $\tau$-strongly-convex-concave (KL is $1$-strongly convex in $\norm\cdot_1$), so it
+has a unique solution $\hat z(M)=(\hat w,\hat v)$, the \emph{quantal response
+equilibrium} $\QRE_\tau(M)$. Two standard facts, both of which we import:
+
+\begin{proposition}[MMD contracts, Sokota et al.\ 2023]\label{prop:mmd}
+Write $z_W=(w,v)$ and let
+\[
+D(z'_W\Vert z_W)\;:=\;\KL(w'\Vert w)+\KL(v'\Vert v)
+\]
+be the Bregman divergence of negative entropy on $\simplex_K\times\simplex_K$. For a
+fixed $M$ with $\norm{M}_{\max}\le U_{\max}$ and $\eta_w\le\eta_0(\tau,U_{\max})$, one
+simultaneous MMD step \eqref{eq:mmd} for both players, $z_W\mapsto F_M(z_W)$, satisfies
+\[
+D\big(\hat z(M)\,\big\Vert\,F_M(z_W)\big)\;\le\;(1-c\,\eta_w\tau)\,
+D\big(\hat z(M)\,\big\Vert\,z_W\big)
+\]
+for an absolute constant $c>0$.
+\end{proposition}
+
+\begin{remark}[The divergence is not decoration]
+It is tempting to state Proposition~\ref{prop:mmd} as an $\ell_1$ contraction
+$\norm{F_M(z)-\hat z}_1\le(1-c\eta_w\tau)\norm{z-\hat z}_1$, and tempting further to
+state it as a \emph{two-point} contraction $\norm{F_M(z)-F_M(z')}\le(1-c\eta_w\tau)\norm{z-z'}$,
+which would let one apply Banach's theorem directly. Both are false in general. The
+argument behind Proposition~\ref{prop:mmd} is a Lyapunov argument: the bilinear part of
+the saddle operator cancels in $\ip{F_M(z)-F_M(\hat z)}{z-\hat z}$ by monotonicity, and
+only the KL part survives. A two-point bound destroys that cancellation --- in logit
+coordinates the simultaneous step expands by $(1+\eta_wU_{\max})/(1+\eta_w\tau)$, which
+exceeds $1$ whenever $U_{\max}>\tau$. So the contraction really is towards the fixed
+point, in $D$, and the rest of this note is organised around that.
+\end{remark}
+
+\begin{lemma}[One MMD step taken against the wrong matrix]\label{lem:mmdpert}
+Let $\bar M$ be any payoff matrix, $\bar z_W=\hat z(\bar M)$ its QRE, and let
+$z_W^+=F_M(z_W)$ be one MMD step taken with a possibly different matrix $M$. Then
+\[
+D(\bar z_W\Vert z_W^+)\;\le\;(1-c\,\eta_w\tau)\,D(\bar z_W\Vert z_W)
+\;+\;2\,\eta_w\,\norm{M-\bar M}_{\max}\,\norm{z_W-\bar z_W}_1 .
+\]
+\end{lemma}
+\begin{proof}
+Let
+$\mathcal F_M(z_W)=\big(-Mv+\tau\nabla\KL(w\Vert\rho_x),\;M^\top w+\tau\nabla\KL(v\Vert\rho_y)\big)$
+be the saddle operator of \eqref{eq:qre}; the closed form in \eqref{eq:mmd} is the mirror
+step $z_W^+=\argmin_{z'}\{\eta_w\ip{\mathcal F_M(z_W)}{z'}+D(z'\Vert z_W)\}$ with the KL
+terms taken proximally. Proposition~\ref{prop:mmd} is exactly the conclusion of the
+three-point mirror-descent inequality for $M=\bar M$, where $\tau$-strong monotonicity
+of $\mathcal F_{\bar M}$ supplies the factor $(1-c\eta_w\tau)$. Running the identical
+argument with the operator $\mathcal F_M$ while comparing against $\bar z_W$ changes one
+term: it adds $\eta_w\ip{\mathcal F_M(z_W)-\mathcal F_{\bar M}(z_W)}{z_W-\bar z_W}$. Now
+$\mathcal F_M(z_W)-\mathcal F_{\bar M}(z_W)=\big(-(M-\bar M)v,\;(M-\bar M)^\top w\big)$,
+whose two blocks have $\ell_\infty$-norm at most $\norm{M-\bar M}_{\max}$ each, so
+H\"older bounds the added term by $2\eta_w\norm{M-\bar M}_{\max}\norm{z_W-\bar z_W}_1$.
+\end{proof}
+
+\noindent Lemma~\ref{lem:mmdpert} is what replaces a sensitivity analysis of the QRE.
+We never need to know how far $\hat z(M)$ moves when $M$ moves; we only need that one
+step taken with the wrong matrix still contracts towards the \emph{right} fixed point,
+up to a disturbance linear in the matrix error. That is the single structural change
+that makes the rest of this note shorter --- and, as \S\ref{sec:main} shows, sharper ---
+than the version that tracked moving targets.
+
+\begin{lemma}[Bias of the QRE]\label{lem:bias}
+$\Expl_M(\hat w,\hat v)\;\le\;2\tau\log(1/\rho_{\min})$, where
+$\rho_{\min}=\min_k\min(\rho_{x,k},\rho_{y,k})$. In particular with a uniform
+magnet, $\Expl_M(\QRE_\tau)\le 2\tau\log K$.
+\end{lemma}
+\begin{proof}
+Standard: $(\hat w,\hat v)$ is an exact Nash of the perturbed game with payoff
+$w^\top Mv + \tau\KL(w\Vert\rho_x)-\tau\KL(v\Vert\rho_y)$, and each perturbation term
+ranges over an interval of length at most $\tau\log(1/\rho_{\min})$ on $\simplex_K$.
+\end{proof}
+
+\begin{lemma}[No atom starves]\label{lem:full}
+\emph{(i)} $\hat w_k \;\ge\; \rho_{x,k}\,e^{-2U_{\max}/\tau}$ for all $k$.
+\emph{(ii)} The same holds along the iterates, not merely at the fixed point: with
+$\psi_t:=\max_k\log w_{t,k}-\min_k\log w_{t,k}$ and $\psi_\rho$ the same quantity for
+$\rho_x$,
+\[
+\psi_t\;\le\;\max\{\psi_0,\;\psi_\rho+2U_{\max}/\tau\}\quad\text{for all }t,
+\qquad\text{hence}\qquad w_{\min}(t)\;\ge\;K^{-1}e^{-\psi_t}\;>\;0 .
+\]
+\end{lemma}
+\begin{proof}
+(i) The first-order condition of \eqref{eq:qre} is
+$\hat w \propto \rho_x\exp\big((M\hat v)/\tau\big)$, and $\norm{M\hat v}_\infty\le U_{\max}$,
+so the exponential factor lies in $[e^{-U_{\max}/\tau},e^{U_{\max}/\tau}]$ and the
+normaliser in the reciprocal range.
+
+(ii) Put $\theta=1/(1+\eta_w\tau)$. The closed form in \eqref{eq:mmd} gives
+$\log w_{t+1,k}=\theta\log w_{t,k}+(1-\theta)\log\rho_{x,k}+\theta\eta_wq_k-\log Z_t$,
+so for any $k,j$ the log-ratio obeys
+$\log\frac{w_{t+1,k}}{w_{t+1,j}}=\theta\log\frac{w_{t,k}}{w_{t,j}}
++(1-\theta)\log\frac{\rho_{x,k}}{\rho_{x,j}}+\theta\eta_w(q_k-q_j)$,
+whence $\psi_{t+1}\le\theta\psi_t+(1-\theta)\psi_\rho+2\theta\eta_wU_{\max}$. Since
+$(1-\theta)=\eta_w\tau\theta$, the fixed point of this scalar recursion is
+$\psi_\rho+2U_{\max}/\tau$, and the recursion is a contraction, so $\psi_t$ never
+exceeds the maximum of $\psi_0$ and that value. Finally $\max_kw_{t,k}\ge1/K$.
+\end{proof}
+
+\noindent Part (ii) matters: the location step \eqref{eq:xstep} is scaled by the
+\emph{current} weight $w_k(t)$, not by $\hat w_k$, so a bound that holds only at the
+QRE would be circular. Part (ii) is an invariant of the update and needs nothing from
+the rest of the theory.
+
+\noindent Lemma~\ref{lem:full} is the quiet hero of the theory. The regularisation
+that makes the weight loop a contraction \emph{also} guarantees that every atom keeps
+a strictly positive weight, and therefore --- because the location step
+\eqref{eq:xstep} is scaled by $w_k$ --- that every atom keeps moving. Unregularised
+mixture ascent kills its own exploration: an atom that temporarily looks bad gets
+weight $\approx0$, freezes, and can never be revived. See \S\ref{sec:starve}.
+
+\section{The location loop is a contraction (inside a cell)}\label{sec:locations}
+
+\paragraph{The location block is one saddle problem, not two ascent problems.}
+It is tempting --- and it is what an earlier draft of this section did --- to analyse
+each player's atoms separately, as ascent on $a\mapsto u(a,\nu_t)$ with the opponent's
+atoms treated as an exogenous disturbance. That framing is available, but it is lossy:
+it forces an extra hypothesis bounding the cross-curvature $\norm{\nabla^2_{ab}u}$
+against $m$, which the algorithm does not actually need. The reason is that the two
+location blocks are \emph{not} two disturbances to each other; together they are
+projected gradient ascent--descent on a single saddle function, and the
+$\nabla^2_{ab}u$ terms cancel between the blocks exactly as they do in any saddle
+problem. Write, with the weights held at their current values,
+\begin{equation}\label{eq:Udef}
+U(X,Y)\;=\;\sum_{k,l}w_kv_l\,u(x_k,y_l),\qquad
+\nabla_{x_k}U \;=\; w_k\,\nabla_a u(x_k,\nu),\qquad
+\nabla_{y_l}U \;=\; v_l\,\nabla_b u(\mu,y_l).
+\end{equation}
+The implemented step \eqref{eq:xstep}, $x_k\leftarrow\Pi_A(x_k+\eta_x\sigma_k^2w_k\nabla_au(x_k,\nu))$,
+is therefore \emph{exactly}
+\[
+x_k\;\leftarrow\;\Pi_A\big(x_k+\eta_x\,\sigma_k^2\,\nabla_{x_k}U\big),
+\]
+i.e.\ preconditioned ascent on $U$ with the \textbf{constant} preconditioner
+$P_0=\mathrm{diag}(\sigma_k^2)$. The factor $w_k$ that \eqref{eq:xstep} shows in the
+preconditioner belongs, more usefully, to the gradient. Two things follow at once: the
+metric no longer moves with $t$ (Remark~\ref{rem:Pnorm}), and the joint update is
+ascent--descent on one function.
+
+\medskip
+\noindent Throughout, $P_0=\mathrm{diag}(p_1,\dots)$ is constant positive diagonal with
+$p_{\min}I\preceq P_0\preceq p_{\max}I$ ($p_{\min}=\sigma_{\min}^2$,
+$p_{\max}=\sigma_{\max}^2$), and $\norm{\zeta}_{P_0^{-1}}^2:=\zeta^\top P_0^{-1}\zeta$, so
+$p_{\min}\norm{\zeta}^2_{P_0^{-1}}\le\norm{\zeta}^2\le p_{\max}\norm{\zeta}^2_{P_0^{-1}}$.
+Since $A,B$ are boxes and $P_0$ is diagonal, the projection is a coordinatewise clip and
+is nonexpansive in $\norm{\cdot}_{P_0^{-1}}$. Write $\xi=(X,Y)$ for the joint location
+vector, $\mathcal C=\prod_kA_{c(k)}\times\prod_lB_{c(l)}$ for its (convex, compact)
+domain, and
+\[
+F_{w,v}(\xi)\;=\;\big(-\nabla_XU,\;+\nabla_YU\big),\qquad
+S_{w,v}(\xi)\;=\;\Pi\big(\xi-\eta_xP_0F_{w,v}(\xi)\big)
+\]
+for the saddle operator of \eqref{eq:Udef} and the joint one-step location map.
+
+\begin{lemma}[Curvature of the mixture objective]\label{lem:Ucurv}
+Under Assumption~\ref{as:cells}(C1), on $\mathcal C$ the function $U$ of
+\eqref{eq:Udef} is $m_\star$-strongly concave in $X$ and $m_\star$-strongly convex in
+$Y$, with
+\[
+m_\star\;:=\;\min\{w_{\min},v_{\min}\}\cdot m\;\ge\;w_\star\,m\;>\;0,
+\]
+where $w_\star>0$ is the uniform lower bound on all weights from
+Lemma~\ref{lem:full}(ii). Moreover $F_{w,v}$ is $L_F$-Lipschitz with $L_F\le L+L_{ab}$.
+\end{lemma}
+\begin{proof}
+$U$ is separable across a player's own atoms, so $\nabla^2_{XX}U$ is the block diagonal
+$\mathrm{diag}_k\big(w_k\nabla^2_{aa}u(x_k,\nu)\big)\preceq-w_{\min}mI$ by (C1), and
+symmetrically $\nabla^2_{YY}U\succeq v_{\min}mI$. The mixed block has entries
+$\nabla^2_{x_ky_l}U=w_kv_l\nabla^2_{ab}u(x_k,y_l)$; as a $K\times K$ array of blocks it
+is dominated by the rank-one pattern $w\,v^\top$, so its operator norm is at most
+$L_{ab}\norm{w}_2\norm{v}_2\le L_{ab}$. The diagonal blocks have norm at most
+$\max_kw_kL\le L$.
+\end{proof}
+
+\begin{lemma}[The joint location step is a contraction]\label{lem:track}
+Let $\eta_x\le m_\star p_{\min}/\big(p_{\max}^2L_F^2\big)$. Then
+\begin{enumerate}[label=(\roman*),leftmargin=*]
+\item \emph{(contraction)} $\norm{S_{w,v}(\xi)-S_{w,v}(\xi')}_{P_0^{-1}}
+\le\big(1-\tfrac12\eta_x p_{\min}m_\star\big)\norm{\xi-\xi'}_{P_0^{-1}}$ for all
+$\xi,\xi'\in\mathcal C$;
+\item \emph{(perturbation)} for two weight pairs,
+$\norm{S_{w,v}(\xi)-S_{w',v'}(\xi)}_{P_0^{-1}}\le\eta_x\sqrt{p_{\max}}\,
+\norm{F_{w,v}(\xi)-F_{w',v'}(\xi)}_2$;
+\item \emph{(fixed point)} $S_{w,v}$ has a unique fixed point in $\mathcal C$, at which
+every $x_k$ maximises $u(\cdot,\nu)$ over $A_{c(k)}$ and every $y_l$ minimises
+$u(\mu,\cdot)$ over $B_{c(l)}$.
+\end{enumerate}
+\end{lemma}
+\begin{proof}
+(i) The projection is nonexpansive, so drop it. Put $\zeta=\xi-\xi'$ and
+$\Delta F=F_{w,v}(\xi)-F_{w,v}(\xi')$. Then
+\[
+\norm{\zeta-\eta_xP_0\Delta F}^2_{P_0^{-1}}
+=\norm{\zeta}^2_{P_0^{-1}}-2\eta_x\ip{\zeta}{\Delta F}+\eta_x^2\norm{\Delta F}^2_{P_0}.
+\]
+The saddle operator of a function that is $m_\star$-strongly concave in $X$ and
+$m_\star$-strongly convex in $Y$ is $m_\star$-strongly monotone: the two mixed terms
+$-\ip{\nabla^2_{XY}U\,\zeta_Y}{\zeta_X}$ and $+\ip{\nabla^2_{YX}U\,\zeta_X}{\zeta_Y}$
+enter with opposite signs and cancel, leaving only the diagonal blocks. Hence
+$\ip{\zeta}{\Delta F}\ge m_\star\norm{\zeta}^2\ge m_\star p_{\min}\norm{\zeta}^2_{P_0^{-1}}$,
+while $\norm{\Delta F}^2_{P_0}\le p_{\max}L_F^2\norm{\zeta}^2\le p_{\max}^2L_F^2\norm{\zeta}^2_{P_0^{-1}}$.
+The squared factor is therefore at most
+$1-2\eta_xm_\star p_{\min}+\eta_x^2p_{\max}^2L_F^2\le1-\eta_xm_\star p_{\min}$ under the
+step-size condition, and $\sqrt{1-s}\le1-s/2$.
+
+(ii) Drop the projection again:
+$\norm{\eta_xP_0(F_{w,v}(\xi)-F_{w',v'}(\xi))}_{P_0^{-1}}
+=\eta_x\norm{F_{w,v}(\xi)-F_{w',v'}(\xi)}_{P_0}\le\eta_x\sqrt{p_{\max}}\norm{\cdot}_2$.
+
+(iii) Existence and uniqueness are immediate from (i) and compactness of $\mathcal C$.
+At the fixed point, Lemma~\ref{lem:precond} gives coordinatewise stationarity of $U$,
+which by \eqref{eq:Udef} and $w_k,v_l>0$ (Lemma~\ref{lem:full}(ii)) is stationarity of
+$u(\cdot,\nu)$ at each $x_k$ and of $u(\mu,\cdot)$ at each $y_l$; (C1) and convexity of
+the cells turn stationarity into the cell optimum.
+\end{proof}
+
+\begin{remark}[Where $L_{ab}$ went]\label{rem:noLab}
+The cross-curvature $L_{ab}=\norm{\nabla^2_{ab}u}_\infty$ appears in
+Lemma~\ref{lem:track} only inside $L_F$, i.e.\ only in the \emph{step-size} condition
+$\eta_x\lesssim m_\star p_{\min}/(p_{\max}^2(L+L_{ab})^2)$. It does not appear in the
+contraction factor and it imposes no threshold: for any $L_{ab}$, a small enough $\eta_x$
+works. Analysing the two players' atoms separately --- bounding each one's motion as a
+disturbance to the other's landscape --- instead produces a genuine constraint
+$p_{\max}L_{ab}\lesssim p_{\min}m_\star$, unremovable by any step size. That constraint
+is an artefact of the separate-ascent bookkeeping. The cancellation that removes it is a
+game-theoretic fact about saddle problems, not an optimisation fact; see the second
+bullet after Lemma~\ref{lem:identity}.
+\end{remark}
+
+\begin{remark}[Why the norm must be $\norm{\cdot}_{P_0^{-1}}$]\label{rem:Pnorm}
+Statement (i) is false in the Euclidean norm for a general positive diagonal $P_0$:
+$\ip{\zeta}{P_0\Delta F}$ can be bounded only by
+$\big(p_{\min}m_\star-(p_{\max}-p_{\min})L_F\big)\norm{\zeta}^2$ from below, which is not
+positive unless $P_0$ is nearly a multiple of the identity; and converting (i) back to
+the Euclidean norm multiplies the contraction factor by $\sqrt{p_{\max}/p_{\min}}>1$,
+destroying it. So the analysis stays in $\norm{\cdot}_{P_0^{-1}}$, which requires $P_0$
+to be constant in $t$ --- a moving metric would reintroduce the same conversion factor at
+every step. That is why \eqref{eq:Udef} matters: putting the $w_k$ in the gradient rather
+than in the metric makes $P_0=\mathrm{diag}(\sigma_k^2)$, which is constant whenever
+$\sigma$ is (Remark~\ref{rem:sigma}). The price is that $w_{\min}$ resurfaces in
+$m_\star=w_{\min}m$ instead of in $p_{\min}$ --- the same product
+$p_{\min}m_\star=\sigma_{\min}^2w_{\min}m$ either way.
+\end{remark}
+
+\newpage
+\part*{Part III --- The theorem}
+\addcontentsline{toc}{part}{Part III --- The theorem}
+
+\section{Small gain: closing the loop}\label{sec:main}
+
+We now do for the whole algorithm what Sokota et al.\ do for MMD on a fixed matrix:
+exhibit \emph{one} fixed point and show that \emph{one} iteration moves the state
+strictly closer to it. Nothing tracks a moving target, so neither the sensitivity of
+the cell maximiser to $\nu$ nor the sensitivity of the QRE to $M$ is ever needed ---
+and dropping those two sensitivity factors is what improves the final threshold from
+$\kappa\lesssim m^2\tau^2$ to $\kappa\lesssim m\tau$ (Remark~\ref{rem:tau2}).
+
+Write $T$ for one joint iteration of the algorithm, acting on
+\[
+\mathcal Z\;:=\;\mathcal C\times\simplex_K\times\simplex_K,
+\qquad \mathcal C=\prod_{k\le K}A_{c(k)}\times\prod_{l\le K}B_{c(l)},
+\]
+a compact convex set by Assumption~\ref{as:cells} (cells are compact convex) and
+Assumption~\ref{as:cover} (the assignment $c$ is well defined and $T$-invariant).
+
+\begin{lemma}[A fixed point exists, and is what we want]\label{lem:exists}
+$T$ is continuous and maps $\mathcal Z$ into $\mathcal Z$, so by Brouwer it has a fixed
+point $\bar z=(\bar\xi,\bar w,\bar v)$, $\bar\xi=(\bar X,\bar Y)$. At any fixed point,
+$\bar x_k=x^\star_{c(k)}(\bar\nu)$ and $\bar y_l=y^\star_{c(l)}(\bar\mu)$
+(Lemma~\ref{lem:track}(iii)) and $(\bar w,\bar v)=\QRE_\tau\big(M(\bar X,\bar Y)\big)$.
+\end{lemma}
+
+\noindent Define the two error signals --- distances to \emph{that} fixed point, not to
+anything moving:
+\[
+e_X(t):=\norm{\xi_t-\bar\xi}_{P_0^{-1}},
+\qquad
+e_W(t):=\sqrt{2\,D\big(\bar z_W\Vert z_W(t)\big)} .
+\]
+By Pinsker's inequality, $\norm{w_t-\bar w}_1+\norm{v_t-\bar v}_1\le e_W(t)$. Write
+\[
+G_\star\;:=\;\max\Big\{\max_k\norm{\nabla_au(\bar x_k,\bar\nu)},\;
+\max_l\norm{\nabla_bu(\bar\mu,\bar y_l)}\Big\}
+\]
+for the residual gradient at the fixed point; $G_\star=0$ whenever every cell maximiser
+is interior to $A$ (resp.\ $B$), which is the case of interest --- they are peaks --- and
+$G_\star\le G$ always.
+
+\begin{lemma}[Coupled recursion]\label{lem:coupled}
+Under Assumptions~\ref{as:cells}--\ref{as:cover}, Proposition~\ref{prop:mmd}, and the
+step sizes $\eta_x\le m_\star p_{\min}/(p_{\max}^2L_F^2)$ and $\eta_w\le\eta_0$,
+\begin{align}
+e_X(t+1) &\le \Big(1-\tfrac12\eta_x p_{\min}m_\star\Big)\,e_X(t)
+\;+\;\eta_x\sqrt{p_{\max}}\,\Big(\tfrac{\kappa}{2}+G_\star\Big)\,e_W(t), \label{eq:recP}\\[2pt]
+e_W(t+1) &\le \Big(1-\tfrac12 c\,\eta_w\tau\Big)\,e_W(t)
+\;+\;8\,\eta_w\,G\sqrt{p_{\max}}\;e_X(t). \label{eq:recW}
+\end{align}
+\end{lemma}
+\begin{proof}
+\eqref{eq:recP}. Since $\bar z$ is a fixed point, $\bar\xi=S_{\bar w,\bar v}(\bar\xi)$,
+while $\xi_{t+1}=S_{w_t,v_t}(\xi_t)$. By Lemma~\ref{lem:track}(i)--(ii),
+\[
+e_X(t+1)\;\le\;\big(1-\tfrac12\eta_xp_{\min}m_\star\big)e_X(t)
+\;+\;\eta_x\sqrt{p_{\max}}\,\norm{F_{w_t,v_t}(\bar\xi)-F_{\bar w,\bar v}(\bar\xi)}_2 .
+\]
+For the $X$-block of that last operator difference, component $k$ is
+\[
+\bar w_k\nabla_au(\bar x_k,\bar\nu)-w_{t,k}\nabla_au(\bar x_k,\nu_t)
+=(\bar w_k-w_{t,k})\,\nabla_au(\bar x_k,\bar\nu)
+\;+\;w_{t,k}\big[\nabla_au(\bar x_k,\bar\nu)-\nabla_au(\bar x_k,\nu_t)\big].
+\]
+The first summand has norm at most $G_\star\abs{\bar w_k-w_{t,k}}$. For the second,
+apply Lemma~\ref{lem:grad} with the \emph{same} atoms $\bar Y$ on both sides, so its
+$L_{ab}$ term is identically zero and only $\tfrac{\kappa}{2}\norm{v_t-\bar v}_1$
+remains. Stacking over $k$ and using $\norm{\cdot}_2\le\norm{\cdot}_1$ and
+$\norm{w_t}_2\le1$,
+\[
+\norm{(F_{w_t,v_t}-F_{\bar w,\bar v})_X(\bar\xi)}_2
+\le G_\star\norm{w_t-\bar w}_1+\tfrac{\kappa}{2}\norm{v_t-\bar v}_1 ,
+\]
+and symmetrically for the $Y$-block. Adding the two blocks and applying Pinsker gives
+$\big(\tfrac{\kappa}{2}+G_\star\big)e_W(t)$.
+
+\eqref{eq:recW}. Apply Lemma~\ref{lem:mmdpert} with $M=M(X_t,Y_t)$ and
+$\bar M=M(\bar X,\bar Y)$, and use $\norm{z_W(t)-\bar z_W}_1\le e_W(t)$:
+\[
+\tfrac12e_W(t+1)^2\le(1-c\eta_w\tau)\tfrac12e_W(t)^2+2\eta_w\norm{M_t-\bar M}_{\max}e_W(t).
+\]
+If $\alpha^2\le(1-s)\beta^2+\gamma\beta$ with $s\in[0,1]$ then
+$\alpha\le(1-\tfrac{s}{2})\beta+\gamma$, because
+$\big((1-\tfrac{s}{2})\beta+\gamma\big)^2\ge(1-s)\beta^2+\gamma\beta$. Hence
+$e_W(t+1)\le(1-\tfrac12c\eta_w\tau)e_W(t)+4\eta_w\norm{M_t-\bar M}_{\max}$. Finally
+$\norm{M_t-\bar M}_{\max}\le G\big(\max_k\norm{x_k(t)-\bar x_k}+\max_l\norm{y_l(t)-\bar y_l}\big)
+\le2G\sqrt{p_{\max}}\,e_X(t)$, since a coordinate max is at most the joint Euclidean
+norm.
+\end{proof}
+
+\begin{theorem}[Convergence to the regularised fixed point]\label{thm:main}
+Let Assumptions~\ref{as:cells} and \ref{as:cover} hold, let the step sizes satisfy the
+conditions of Lemma~\ref{lem:coupled}, and suppose the \textbf{small-gain condition}
+\begin{equation}\label{eq:gain}
+\boxed{\;\mathcal G \;:=\; \frac{16\,(\kappa+2G_\star)\,G\,p_{\max}}{c\;p_{\min}\,m_\star\;\tau}\;<\;1 \;}
+\end{equation}
+holds. Then $\bar z$ is the \emph{unique} fixed point of $T$ in $\mathcal Z$, the iterates
+converge to it linearly from every initialisation in $\mathcal Z$, at $\bar z$ every atom
+sits at the optimum of its own cell against the opponent's final mixture and
+$(\bar w,\bar v)=\QRE_\tau(M(\bar X,\bar Y))$, and
+\[
+\Expl(\bar\mu,\bar\nu)\;\le\;2\tau\log(1/\rho_{\min}).
+\]
+\end{theorem}
+\begin{proof}
+Lemma~\ref{lem:coupled} is $e(t+1)\le\mathcal M\,e(t)$ componentwise, with the
+nonnegative matrix
+$\mathcal M=\begin{pmatrix}1-\alpha_X & \beta_X\\ \beta_W & 1-\alpha_W\end{pmatrix}$,
+$\alpha_X=\tfrac12\eta_xp_{\min}m_\star$,
+$\beta_X=\eta_x\sqrt{p_{\max}}(\tfrac{\kappa}{2}+G_\star)$,
+$\alpha_W=\tfrac12c\eta_w\tau$, $\beta_W=8\eta_wG\sqrt{p_{\max}}$. The step-size
+conditions make both diagonal entries lie in $(0,1)$, so $I-\mathcal M$ is a $Z$-matrix
+with positive diagonal, and $\rho(\mathcal M)<1$ iff its leading principal minors are
+positive, i.e.\ iff $\det(I-\mathcal M)>0$, i.e.\ iff $\alpha_X\alpha_W>\beta_X\beta_W$:
+\[
+\tfrac12\eta_xp_{\min}m_\star\cdot\tfrac12c\eta_w\tau
+\;>\;\eta_x\sqrt{p_{\max}}\big(\tfrac{\kappa}{2}+G_\star\big)\cdot 8\eta_wG\sqrt{p_{\max}}
+\iff \tfrac14c\,p_{\min}m_\star\,\tau>4(\kappa+2G_\star)Gp_{\max}\iff\mathcal G<1 .
+\]
+\emph{Both step sizes cancel.} Hence $e(t)\le\mathcal M^te(0)\to0$ geometrically at rate
+$\rho(\mathcal M)$, so $z_t\to\bar z$ linearly. Uniqueness is now free: if $\bar z'$ were
+a second fixed point, the trajectory started at $\bar z'$ is constant and must converge
+to $\bar z$, so $\bar z'=\bar z$. At $\bar z$: $e_X=0$ gives, by
+Lemma~\ref{lem:exists} and \eqref{eq:cellmax}, $\Delta_x=\Delta_y=0$; $e_W=0$ gives
+$(\bar w,\bar v)=\QRE_\tau$, so $\Expl_M\le2\tau\log(1/\rho_{\min})$ by
+Lemma~\ref{lem:bias}. Conclude with the master identity, Lemma~\ref{lem:identity}.
+\end{proof}
+
+\begin{remark}[Read \eqref{eq:gain} as $\kappa \lesssim m_\star\,\tau$]\label{rem:tau2}
+Take $G_\star=0$ (interior cell maxima) and treat $p_{\max}/p_{\min}$, $G$ and $c$ as
+$O(1)$. The small-gain condition reads
+\[
+\kappa \;\lesssim\; m_\star\,\tau,\qquad m_\star=w_{\min}\,m .
+\]
+\textbf{Coupling must be small compared with curvature $\times$ temperature.} That is the
+entire game-theoretic content of the theorem. Note that $m_\star$, not $m$, is the
+relevant curvature: low-weight atoms move slowly, and that shows up in the
+\emph{stability threshold}, not merely in the rate --- one more reason for the change
+recommended in \S\ref{sec:starve}, which replaces $m_\star$ by $m$ outright.
+
+An earlier version of this note ran the same argument through moving targets: it
+measured $e_X$ against the \emph{current} cell maximiser $x^\star_{c(k)}(\nu_t)$ and
+$e_W$ against the \emph{current} $\QRE_\tau(M_t)$, and therefore had to pay for how fast
+each target moves --- a factor $\kappa/m$ for the cell maximiser and a factor $1/\tau$ for
+the QRE. Those two factors turned the threshold into $\kappa\lesssim m^2\tau^2$. They are
+an artefact of the bookkeeping, not of the algorithm: measuring both errors against the
+fixed point of the joint map removes both, at the cost of needing Brouwer for existence
+(Lemma~\ref{lem:exists}) and of the perturbed-step Lemma~\ref{lem:mmdpert} in place of a
+QRE sensitivity bound. Since $m_\star\tau<1$ in every regime of interest,
+$\kappa\lesssim m_\star\tau$ is the strictly weaker, i.e.\ better, requirement.
+\end{remark}
+
+\begin{remark}[Only one threshold, and it involves only $\kappa$]
+\eqref{eq:gain} is now the sole non-step-size condition of the theorem. In particular
+the cross-curvature $L_{ab}$ does \emph{not} appear: by Remark~\ref{rem:noLab} it lives
+in the step-size condition through $L_F\le L+L_{ab}$ and nowhere else. This is worth
+stating because the opposite is easy to believe --- and an earlier draft did assert a
+second threshold $p_{\max}L_{ab}\le\tfrac14p_{\min}m$. What kills it is that the two
+players' location blocks are ascent and descent on the \emph{same} function
+\eqref{eq:Udef}, so their mutual influence is antisymmetric and cancels in
+$\ip{F(\xi)-F(\xi')}{\xi-\xi'}$. Treating each side as an exogenous disturbance to the
+other throws that cancellation away.
+\end{remark}
+
+\begin{remark}[The step sizes cancel --- timescale separation does not save you]
+This is the least obvious consequence of Lemma~\ref{lem:coupled} and worth stating
+loudly. One's instinct is that a two-timescale scheme ($\eta_x\ll\eta_w$, or the
+reverse) should make the interaction negligible. It does not, because both the
+damping and the disturbance in each loop scale with the \emph{same} step size:
+slowing the atoms down slows their disturbance of the weights by exactly as much as
+it slows their own recovery. The loop gain $\mathcal G$ is step-size free. Timescale
+separation changes the transient, the constants, and the rate --- never the
+threshold. What \emph{does} move the threshold is $\tau$ (raise it), the curvature
+$m_\star$ (a property of the landscape and of the weights; see \S\ref{sec:anneal-sigma}
+and \S\ref{sec:starve}), and the coupling $\kappa$ (a property of the game).
+\end{remark}
+
+\section{From QRE to Nash}\label{sec:anneal-tau}
+
+Theorem~\ref{thm:main} gives a $2\tau\log(1/\rho_{\min})$-Nash. Two routes to $0$.
+
+\paragraph{Route 1: magnet refreshes at fixed $\tau$.} This is what the code does
+(\texttt{magnet\_interval}). Setting $\rho\leftarrow w$ every $T_{\mathrm{mag}}$
+steps makes the outer iteration a proximal-point method on the restricted game, which
+converges to its exact Nash --- provided $T_{\mathrm{mag}}$ is long enough that the
+inner loop has converged, which by Theorem~\ref{thm:main} takes
+$O(\log(1/\eps)/\alpha)$ steps. The catch is Lemma~\ref{lem:full}: the bound
+$\hat w_k\ge\rho_k e^{-2U_{\max}/\tau}$ degrades geometrically as $\rho$ itself
+approaches a Nash with zero-weight atoms.
+
+\paragraph{Route 2: anneal $\tau_t\downarrow0$ with a uniform magnet.} Cleaner to
+analyse, and it exposes the real tension.
+
+\begin{proposition}[Annealing schedule]\label{prop:anneal}
+Suppose $\tau_t\downarrow0$ with $\tau_t$ non-increasing and
+$\tau_t-\tau_{t+1}\le \eps_\tau\,\tau_t$. All the constants of
+Lemma~\ref{lem:coupled} hold with $\tau=\tau_t$, plus one extra disturbance term
+of size $O\big((\tau_t-\tau_{t+1})/\tau_t\big)$ in \eqref{eq:recW}. Two conditions
+must hold along the schedule:
+\begin{enumerate}[label=(\roman*),leftmargin=*]
+\item \emph{stability}: $\kappa\lesssim m_\star\tau_t$ --- so $\tau_t$ may not fall
+below $\tau_\infty\asymp\kappa/m_\star$ unless the game's coupling is exactly zero;
+\item \emph{no starvation}: the atoms must keep up, and their speed is
+$\propto p_{\min}=\sigma^2_{\min}w_{\min}$ with $w_{\min}\ge K^{-1}e^{-2U_{\max}/\tau_t}$
+by Lemma~\ref{lem:full}, so the target's drift per step must satisfy
+$\eps_\tau \lesssim \eta_x\,e^{-2U_{\max}/\tau_t}$.
+\end{enumerate}
+Condition (ii) alone forces $\tau_t\gtrsim 2U_{\max}/\log t$, giving
+$\Expl_t = O\big(U_{\max}\log K/\log t\big)$. Note that (ii) only bites in the regime
+that (i) permits: if $\kappa>0$ then (i) stops the schedule at $\tau_\infty\asymp\kappa/m_\star$
+long before the $1/\log t$ rate becomes the binding constraint, and (ii) is the whole
+story only for $\kappa=0$ (or after the fix in \S\ref{sec:starve}, which removes it).
+\end{proposition}
+
+\noindent Both conditions are informative and both are actionable.
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{(i) is a real floor.} If the game has genuine coupling
+($\kappa>0$) and finite curvature, this analysis does not give exact Nash --- it gives
+$\Expl = O(\kappa\log K/m_\star)$. This is not obviously an artefact: it is the same
+place where \texttt{theory2} needs its stability condition, and it is where the
+counterexample games in \texttt{configs/idealized\_counterexample/} live.
+\item \textbf{(ii) is an artefact of the preconditioner, and is fixable.} The
+$e^{-2U_{\max}/\tau}$ comes purely from the factor $w_k$ in \eqref{eq:xstep}:
+low-weight atoms crawl. \textbf{Normalising the per-component location gradient by
+$w_k$} --- i.e. taking $p_k=\sigma_k^2$ instead of $p_k=\sigma_k^2 w_k$ --- removes
+it entirely, is legitimate by Lemma~\ref{lem:precond} (it is a different positive
+preconditioner, so the fixed points are identical), and upgrades
+Proposition~\ref{prop:anneal} from a $1/\log t$ rate to a polynomial one. See
+\S\ref{sec:starve}.
+\end{itemize}
+
+\newpage
+\part*{Part IV --- What breaks it, and what it says about the code}
+\addcontentsline{toc}{part}{Part IV --- What breaks it, and what it says about the code}
+
+\section{Failure modes, each one an assumption being violated}
+
+\subsection{Two maxima in one cell (Assumption~\ref{as:cells} (C1) fails)}
+If a region that the flow cannot leave contains two local maxima, an atom
+initialised in the wrong basin sits at a strictly suboptimal stationary point and
+$\Delta_x$ does not close. Note what Lemma~\ref{lem:identity} says about this: the
+weight loop \emph{cannot compensate}. $\Expl_M$ may be exactly $0$ --- the weights
+are a perfect Nash of the restricted game --- while $\Delta_x>0$ forever. Adding
+more atoms does not help unless one of them lands in the good basin, which is a
+statement about initialisation, not about $K$. This is the ``decoy'' family
+(\texttt{DecoyWellGame}, \texttt{configs/idealized\_decoy\_well.yaml}).
+
+\subsection{Coupling stronger than curvature (\eqref{eq:gain} fails)}
+When $\kappa \gtrsim m_\star\tau$ the cell maximisers $x_i^\star(\nu)$ swing further
+than the atoms can track, the restricted game $M(X_t,Y_t)$ never settles, and the
+two loops chase each other. This is the classical matching-pennies rotation, lifted
+into the locations. Symptom in a run: exploitability plateaus with visible
+oscillation in \texttt{means0}/\texttt{means1} rather than decaying.
+
+\subsection{Flat landscapes ($m=0$)}
+If $u(\cdot,\nu)$ has no curvature there is no cell maximiser to track and
+Lemma~\ref{lem:track} is vacuous. The atoms drift on a plateau, driven only by the
+coupling term. Note $\mathcal G\to\infty$ as $m\to0$: the theory says flat games are
+the \emph{worst} case, not the easiest. This matches the empirical observation that
+the dead plateau between two narrow wells is where the algorithm gets stuck.
+
+\subsection{Weight starvation ($p_{\min}\to0$)}\label{sec:starve}
+The location step \eqref{eq:xstep} carries a factor $w_k$. An atom whose weight
+collapses stops moving, so it stops improving, so its weight stays collapsed --- a
+self-reinforcing trap. Lemma~\ref{lem:full} says the magnet/entropy temperature
+$\tau$ is precisely what prevents this ($w_k\ge\rho_ke^{-2U_{\max}/\tau}$), which is
+a second, independent reason to keep $\tau$ away from $0$ beyond the stability
+condition \eqref{eq:gain}.
+
+\medskip
+\noindent\textbf{Concrete recommendation for the codebase.} In
+\texttt{gaussian\_natural\_step}, the mean gradient is
+$w_k\sigma_k^2\,\nabla_a u(x_k,\nu)$. Dividing by $w_k$ (equivalently, computing each
+component's location gradient against its \emph{own} conditional objective rather
+than the mixture's) is free by Lemma~\ref{lem:precond} and removes both the
+$e^{-2U_{\max}/\tau}$ in Proposition~\ref{prop:anneal} and the entire starvation
+failure mode. It also replaces $m_\star=w_{\min}m$ by $m$ in the effective curvature
+of Lemma~\ref{lem:Ucurv}: with $p_k=\sigma_k^2$ the location block ascends
+$\sum_ku(x_k,\nu)$, on which each atom feels the full curvature $m$ regardless of its
+weight. So it moves the \emph{stability threshold} \eqref{eq:gain}, not just the rate ---
+by a factor $1/w_{\min}$, which Lemma~\ref{lem:full} bounds only by
+$Ke^{2U_{\max}/\tau}$. That is the largest single constant in this theory, and it is
+free to remove. It should show up as: low-weight atoms still migrating to their cell
+maxima, so that a later change in the opponent can revive them.
+
+\subsection{Too few atoms, or a bad initialisation (Assumption~\ref{as:cover} fails)}
+Ascent never moves an atom across a cell boundary, so an uncovered cell is
+uncovered forever, and if that cell holds the global best response then
+$\Delta_x>0$ permanently. Everything about ``more points than you need'' is used
+\emph{here} and nowhere else in the proof.
+
+\section{What the Gaussian width actually does}\label{sec:anneal-sigma}
+
+By Remark~\ref{rem:sigma} all constants are those of $u_\sigma$, and the width
+changes them in a specific, useful way. For a landscape built from Gaussian bumps of
+width $\omega$ --- exactly \texttt{MultiPointGame} --- smoothing by $\sigma$ gives
+bumps of width $\sqrt{\omega^2+\sigma^2}$ and height scaled by
+$\omega/\sqrt{\omega^2+\sigma^2}$ (this is \texttt{well\_expectation}). Therefore:
+\[
+\text{cell radius } \approx \sqrt{\omega^2+\sigma^2},\qquad
+m \;\approx\; \frac{h\,\omega}{(\omega^2+\sigma^2)^{3/2}},\qquad
+m_A(\sigma)\ \text{non-increasing in }\sigma .
+\]
+So:
+\begin{itemize}[leftmargin=*]
+\item \textbf{Large $\sigma$: few, wide cells.} Assumption~\ref{as:cover} is easy
+(a handful of atoms covers everything), and there is no dead plateau --- an atom
+anywhere feels the far peak. But nearby peaks have merged into one cell, so the
+$\sigma$-landscape's maxima are not the true maxima, and the fixed point is
+biased.
+\item \textbf{Small $\sigma$: many, narrow cells, high curvature.} $m$ is large, so
+\eqref{eq:gain} is easy to satisfy and the fixed point is unbiased --- but
+Assumption~\ref{as:cover} needs an atom inside each narrow well, and between the
+wells the landscape is flat, so an atom that starts outside every well never
+arrives.
+\end{itemize}
+This is exactly graduated optimisation, and it is what \texttt{anneal\_std\_from}
+implements: start with wide cells so that coverage is automatic, then shrink,
+splitting cells while each already contains an atom.
+
+\begin{remark}[The honest status of $\sigma$-annealing]
+Theorem~\ref{thm:main} assumes the cell decomposition is \emph{fixed}. A
+$\sigma$-schedule changes it, so the theorem does not cover annealed runs. The
+natural extension --- and, I think, the right next thing to prove --- is a
+\emph{cell-splitting} statement:
+\begin{quote}
+if $\sigma$ decreases slowly enough that, at each splitting of a cell $A_i$ into
+$A_{i'},A_{i''}$, at least one atom lies in each part, and the atoms have converged
+to within $O(\text{cell radius})$ before each split, then coverage
+(Assumption~\ref{as:cover}) is preserved for all $\sigma$ and
+Theorem~\ref{thm:main} applies at every stage.
+\end{quote}
+This requires $K\ge m_A(\sigma_{\min})$ (again ``more points than you need''), plus a
+mechanism to leave more than one atom per cell during the wide phase --- which is
+what the magnet's full-support guarantee (Lemma~\ref{lem:full}) and any repulsion
+between components would provide. This is stated as a conjecture, not proved.
+\end{remark}
+
+\section{Checking the assumptions on this codebase's game}
+
+\texttt{MultiPointGame} with peaks $p_1<\dots<p_n$, bump width $\omega$, coupling
+$\lambda$:
+\[
+u(a,b) \;=\; D(a)-D(b)+\lambda\,f(a)^\top f(b),\qquad
+D(a)=\sum_{j}e^{-(a-p_j)^2/2\omega^2},\quad f_j(a)=\Big(\tfrac{a-\bar p}{r}\Big)^{j}-t_j .
+\]
+Against a fixed $\nu$, the maximiser's landscape is
+$a\mapsto D(a)+\lambda f(a)^\top\bar f_\nu + \text{const}$ with
+$\bar f_\nu=\E_\nu[f]$, $\norm{\bar f_\nu}_\infty\le2$.
+
+\paragraph{(C1) curvature.} $D''(p_j)=-1/\omega^2$, and $D$ is strongly concave with
+constant $\asymp1/\omega^2$ on $\lvert a-p_j\rvert\le\omega$. The coupling term
+contributes at most $\lambda\,\norm{f''}_\infty\norm{\bar f_\nu}_\infty
+\le 2\lambda\,C_n/r^2$ where $r$ is the half-range and $C_n$ depends on the polynomial
+degree. So (C1) holds on $A_j=[p_j-\omega,p_j+\omega]$ with
+$m \asymp \omega^{-2}-2\lambda C_n/r^2$, i.e. whenever
+\begin{equation}\label{eq:mpgcond}
+\lambda \;\lesssim\; \frac{r^2}{\omega^2}\quad\text{(up to the degree constant }C_n).
+\end{equation}
+For the defaults (peaks $\pm1$ so $r=1$, $\omega=0.1$, $\lambda=1$) this is
+comfortable: $r^2/\omega^2=100$.
+
+\paragraph{(C2)/(C3) invariance and the plateau.} The cells $[p_j\pm\omega]$ do not
+cover $A$: between and outside the wells $D$ is exponentially flat, and only the
+coupling term $\lambda f'(a)^\top\bar f_\nu$ pushes. Per Remark~\ref{rem:nocover} this
+is not a defect of the assumption --- coverage would contradict (C1) --- but it does
+mean (C3) has real content here: the global maximiser must sit inside some
+$[p_j\pm\omega]$, which holds as long as the coupling term does not create a maximum on
+the plateau, i.e.\ under \eqref{eq:mpgcond}. What is genuinely not supplied by the game
+is Assumption~\ref{as:cover}: an atom that starts on the plateau belongs to no cell and
+the theory says nothing about it. Two ways to fix that, both already in the code: take
+$\sigma\gtrsim$ (peak separation)$/3$ so that $u_\sigma$'s wells overlap and the
+cells tile $A$ (\S\ref{sec:anneal-sigma}); or initialise atoms inside the wells
+(\texttt{\_spread\_bias\_init} at the peaks), which is Assumption~\ref{as:cover}
+by construction.
+
+\paragraph{The small-gain number.} $\kappa \le 2\lambda\norm{f'}_\infty\norm{f}_\infty
+\asymp\lambda/r$, so \eqref{eq:gain} reads $\kappa\lesssim m_\star\tau$ with
+$m_\star=w_{\min}m$, i.e.
+\[
+\frac{\lambda}{r} \;\lesssim\; \frac{w_{\min}}{\omega_\sigma^2}\,\tau
+\quad\Longleftrightarrow\quad
+\tau \;\gtrsim\; \frac{\lambda\,\omega_\sigma^2}{r\,w_{\min}},
+\qquad \omega_\sigma:=\sqrt{\omega^2+\sigma^2},
+\]
+where $\omega_\sigma$ rather than $\omega$ appears because all constants are those of
+$u_\sigma$ (Remark~\ref{rem:sigma}). Three numbers go in. With $\omega=0.1$ and the
+code's typical $\sigma\approx0.1$, $\omega_\sigma^2\approx0.02$. With $\lambda=r=1$ the
+coupling is $\kappa\asymp1$. For $w_{\min}$, the a priori bound of
+Lemma~\ref{lem:full} ($K^{-1}e^{-2U_{\max}/\tau}$) is numerically vacuous here, so use
+the value the run actually sits at: with $K=2$ and a near-uniform equilibrium mixture,
+$w_{\min}\approx\tfrac12$. That gives
+\[
+\tau \;\gtrsim\; 0.04 .
+\]
+The code's default \texttt{magnet\_coef} is $0.2$, a factor of $5$ above the threshold
+--- which predicts that the default configuration is in the stable regime, and that
+pushing $\tau$ down through $\sim\!4\times10^{-2}$ should destabilise it. \emph{That is a
+falsifiable prediction and a cheap experiment: sweep \texttt{magnet\_coef} down and look
+for the onset of oscillation in exploitability.} The margin is thinner than it looks in
+Remark~\ref{rem:tau2}, and the reason is entirely the $w_{\min}$ in $m_\star$: with the
+\S\ref{sec:starve} change ($p_k=\sigma_k^2$) the prediction moves back to
+$\tau\gtrsim0.02$ and stops depending on the equilibrium mixture at all. Comparing the
+two sweeps is a second, sharper experiment.
+
+\section{What this theory deliberately does not prove}
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Exact Nash with $\kappa>0$.} Proposition~\ref{prop:anneal}(i) leaves a
+floor $\Expl=O(\kappa\log K/m_\star)$. Removing it needs either an argument that
+the small-gain bound is loose (it is: $\mathcal G$ uses worst-case $\kappa$ over all
+$\nu$, whereas near the fixed point the relevant $\nu$-variation is small) or a
+genuine last-iterate result for the coupled system.
+\item \textbf{Sampling and approximation error.} Assumed away by construction, per
+the brief. Adding them is a routine stochastic-approximation exercise on top of
+Lemma~\ref{lem:coupled}: both recursions become $\le(1-\alpha)e+\text{disturbance}+\text{noise}$
+and one gets an $O(\text{noise}/\alpha)$ radius.
+\item \textbf{$\sigma$-annealing.} Conjecture only, \S\ref{sec:anneal-sigma}.
+\item \textbf{Non-covering initialisations, and any escape mechanism.} Ascent cannot
+cross cells; nothing here provides exploration between cells, and
+Assumption~\ref{as:cover} simply asserts it away.
+\item \textbf{Extensive form / states.} Single-shot games only. The master identity
+(Lemma~\ref{lem:identity}) is stated per information set and should compose, but
+that is not done here.
+\end{enumerate}
+
+\section{The whole thing on one page}
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Identity.} $\Expl = \Expl_{M(X,Y)}(w,v) + \Delta_x + \Delta_y$, exactly.
+Mixing error and support error add; there is no cross term
+(Lemma~\ref{lem:identity}).
+\item \textbf{Weights kill the first term.} MMD with temperature $\tau>0$ is a
+contraction to $\QRE_\tau$ of the restricted $K\times K$ game, with bias
+$2\tau\log K$ (Proposition~\ref{prop:mmd}, Lemma~\ref{lem:bias}). The magnet is not
+a heuristic --- without it there is no contraction at all.
+\item \textbf{Locations kill the other two.} Each atom does preconditioned ascent on
+$u(\cdot,\nu)$, which inside a cell is a contraction --- in the preconditioner's own
+norm, Remark~\ref{rem:Pnorm} --- to that cell's maximiser (Lemma~\ref{lem:track}).
+Since the global max is attained in some cell, covering the cells makes $\Delta_x=0$
+(Assumptions~\ref{as:cells}--\ref{as:cover}). \emph{This is
+the only place the ``more points than you need'' hypothesis is used.}
+\item \textbf{The Gaussian head is a preconditioner.} It multiplies the gradient by
+$\sigma_k^2w_k>0$, which cannot move a fixed point (Lemma~\ref{lem:precond}). It
+enters the result only through $p_{\max}/p_{\min}$, and --- separately --- through
+which smoothed landscape the cells are defined on.
+\item \textbf{Coupling of the two loops.} Small gain:
+$\kappa \lesssim m_\star\tau$, $m_\star=w_{\min}m$ (Theorem~\ref{thm:main},
+Remark~\ref{rem:tau2}) --- the \emph{only} non-step-size condition.
+Coupling versus curvature, moderated by temperature. \textbf{Both step sizes cancel:
+timescale separation does not change the threshold.} The whole coupling argument is one
+contraction towards one fixed point, exactly as in the fixed-matrix MMD proof; nothing
+tracks a moving target.
+\item \textbf{Price.} $\Expl \le 2\tau\log K$ at the fixed point; annealing $\tau$
+is limited by stability ($\tau\gtrsim\kappa/m_\star$) and by weight starvation, the
+latter removable by dropping $w_k$ from the location preconditioner.
+\end{enumerate}
+
+\end{document}

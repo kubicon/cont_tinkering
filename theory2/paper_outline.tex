@@ -1,0 +1,671 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue]{hyperref}
+
+\definecolor{jobc}{RGB}{20,90,160}
+\definecolor{havec}{RGB}{20,120,60}
+\definecolor{needc}{RGB}{170,90,10}
+\definecolor{riskc}{RGB}{170,30,30}
+
+\newcommand{\job}[1]{\par\smallskip\noindent
+  \textcolor{jobc}{\textbf{Job.}}\ \emph{#1}\par\smallskip}
+\newcommand{\says}[1]{\par\noindent\textbf{Key claims.}\ #1\par\smallskip}
+\newcommand{\have}[1]{\par\noindent
+  \textcolor{havec}{\textbf{Have.}}\ #1\par}
+\newcommand{\need}[1]{\par\noindent
+  \textcolor{needc}{\textbf{Need.}}\ #1\par}
+\newcommand{\risk}[1]{\par\noindent
+  \textcolor{riskc}{\textbf{Risk.}}\ #1\par\smallskip}
+\newcommand{\budget}[1]{\hfill{\small\textsf{[#1]}}}
+\setlength{\emergencystretch}{3em}  % working doc: allow looser lines
+
+% --- theorem environments and notation, kept identical to game_class.tex ---
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\cA}{\mathcal{A}}
+\newcommand{\cB}{\mathcal{B}}
+\newcommand{\cP}{\mathcal{P}}
+\newcommand{\cN}{\mathcal{N}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator{\supp}{supp}
+
+\title{Paper outline\\
+\large Gaussian-mixture policies for continuous-action zero-sum games:\\
+where they converge, and why}
+\author{\texttt{cont\_tinkering} / \texttt{theory2}}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{center}
+\fbox{\parbox{0.9\textwidth}{\centering
+\textbf{The final message --- everything builds to this line:}\\[4pt]
+\emph{The failures practitioners attribute to tuning are properties of the game,
+and they are checkable before you train.}}}
+\end{center}
+
+\bigskip
+\noindent
+\textbf{Spine.} The paper turns on one cheap lemma (\S\ref{sec:decomp}): the
+mixture policy's update \emph{factors} into two subproblems --- \emph{where are
+the atoms} and \emph{how much mass on each} --- and the second is a finite matrix
+game solved globally and unconditionally by existing theory. Therefore all
+difficulty, and all hypotheses, localise in the first. Every later section is a
+consequence: \S\ref{sec:fail} shows how the first subproblem fails,
+\S\ref{sec:class} characterises when it does not, \S\ref{sec:check} makes the
+characterisation checkable, \S\ref{sec:valid} shows it is quantitatively
+predictive, \S\ref{sec:poker} shows it survives contact with a real domain.
+
+\medskip
+\noindent
+\textbf{Legend.} \textcolor{jobc}{\textbf{Job}} = what the section must
+accomplish. \textcolor{havec}{\textbf{Have}} = material that already exists
+(\texttt{theory2/game\_class.tex}, \texttt{check\_scale\_law.py}).
+\textcolor{needc}{\textbf{Need}} = new work.
+\textcolor{riskc}{\textbf{Risk}} = what a referee will attack.
+Page budgets assume a 9-page main body.
+
+\tableofcontents
+
+\section*{Draft abstract}
+\job{Written first, because it forces the message. Rewrite last.}
+
+\noindent
+Continuous action spaces in imperfect-information games --- bet sizing, bidding,
+allocation --- are almost always handled by discretisation, at an abstraction cost
+that is hand-tuned and unquantified. A natural alternative is a parametric
+continuous policy, a Gaussian mixture, trained by a game-solving update. This
+converges in practice, but no theory covers it: the convergence guarantees of
+magnetic mirror descent require a monotone game, and in mixture \emph{parameters}
+the game is badly non-monotone. We resolve this by observing that the update
+factors exactly: the categorical head over components plays a finite matrix game,
+which mirror descent solves globally and unconditionally, while the Gaussian
+heads perform preconditioned ascent on a smoothed effective landscape. All
+obstructions therefore live in the second problem --- \emph{transport} of the
+component means to the equilibrium atoms --- and we characterise it. We show any
+self-consistent pair of spurious local maxima is an exponentially stable non-Nash
+attractor with an open basin, immune to the magnet, to extra capacity and to
+annealing; this forces the shape of any initialisation-robust hypothesis. We then
+give a class of games --- defined by a uniform one-point attraction condition on
+the family of smoothed effective landscapes --- on which transport succeeds, show
+the class is checkable in closed form for finite-rank couplings, and derive
+design rules for the variance floor, the component count and the magnet. The
+theory is quantitatively predictive: it predicts the residual exploitability
+decays as $\Theta(1/t)$ and that the magnet rescales the whole Gaussian-head flow
+by a closed-form factor, both confirmed to three or four digits. Finally we apply
+the method to poker, where the near-finite support of equilibrium bet-size
+distributions makes the class's central assumption a property of the domain
+rather than a modelling convenience.
+
+\section{Introduction}\label{sec:intro}
+\budget{1.25 pages}
+
+\job{Establish a \emph{puzzle}, not a gap. The reader should finish \S1 wanting
+to know why an algorithm outside its own theory works at all --- and why it
+sometimes doesn't.}
+
+\begin{itemize}[leftmargin=1.2em]
+\item Continuous actions in imperfect-information games: bet sizing in poker,
+  bids in auctions, allocations in Blotto/security games. Standard practice
+  discretises: hand-chosen grids, lossy, abstraction error unquantified.
+\item The alternative: a Gaussian-mixture policy driven by a game-solving update.
+  Empirically it converges.
+\item \textbf{The puzzle.} Magnetic mirror descent guarantees convergence for
+  \emph{monotone} games. In mixture parameters the game is wildly non-monotone
+  (multi-well landscape). Yet the last iterate converges --- from some
+  initialisations, and not others, with no apparent pattern. Practitioners
+  respond by tuning std schedules, magnet coefficients, capacity, step sizes,
+  largely without success.
+\item \textbf{Thesis.} The erratic behaviour is neither noise nor tuning. The
+  problem factors into two subproblems; one is unconditionally solved; the other
+  fails for reasons that are a property of the \emph{game} and computable in
+  advance.
+\item Contribution list, in delivery order: (i) the factorisation; (ii) the
+  sharpness result forcing the hypothesis; (iii) the class and its checkable
+  instances; (iv) quantitative predictions verified to $10^{-3}$; (v) poker.
+\end{itemize}
+
+\risk{``Both ingredients already exist.'' Pre-empt: the contribution is the
+\emph{characterisation}, not the algorithm. Say so in the first paragraph of
+contributions, not in rebuttal.}
+
+\section{Background}\label{sec:bg}
+\budget{0.5 pages}
+
+\job{Fix the game-theoretic object and the solution concept once, in exactly the
+generality the rest of the paper uses --- compact action sets, bounded measurable
+payoff, mixed strategies as measures --- so that \S\ref{sec:decomp} onwards can
+speak of atoms, effective landscapes and exploitability without re-deriving
+anything. Textbook material; stated because ``Nash equilibrium'' means something
+weaker here than in the finite case and the reader must not import the finite
+intuition.}
+
+\subsection{The game}
+
+\begin{definition}[Two-player zero-sum game with continuous action sets]
+\label{def:game}
+A \emph{two-player zero-sum game with continuous action sets} is a triple
+$G = (\cA, \cB, u)$ in which
+\begin{enumerate}[label=(\roman*), leftmargin=2.2em]
+\item $\cA \subset \R^{n_0}$ and $\cB \subset \R^{n_1}$ are nonempty compact sets
+  --- throughout this paper, compact convex bodies --- called the \emph{action
+  sets} of player $0$ and player $1$;
+\item $u : \cA \times \cB \to \R$ is bounded and Borel measurable, the
+  \emph{payoff} (to player~$0$).
+\end{enumerate}
+The two players choose $a \in \cA$ and $b \in \cB$ simultaneously and
+independently; player~$0$ then receives $u(a,b)$ and player~$1$ receives
+$-u(a,b)$, so the payoffs sum to zero at every outcome. Player~$0$ maximises and
+player~$1$ minimises. The game is \emph{continuous-action} in that $\cA$ and
+$\cB$ are uncountable subsets of Euclidean space rather than finite sets; note
+that \emph{no} continuity of $u$ in either argument is required.
+\end{definition}
+
+\begin{remark}[Asymmetry]\label{rem:asym}
+Nothing ties the two sides together: $n_0 \ne n_1$, $\cA \ne \cB$, and later all
+per-player hyperparameters (component counts, scale floors, step sizes, magnet
+coefficients) may differ. Every statement in the paper is asymmetric in the
+players unless it explicitly says otherwise.
+\end{remark}
+
+\paragraph{Mixed strategies.}
+With $\cA$ and $\cB$ infinite there is in general no equilibrium in pure
+actions, so we pass to the \emph{mixed extension}. Let $\cP(\cA)$ denote the set
+of Borel probability measures on $\cA$; a \emph{mixed strategy} of player $0$ is
+a $\mu \in \cP(\cA)$, and a pure action $a$ is identified with the Dirac measure
+$\delta_a$. \emph{No topology on $\cP(\cA)$ is required here} --- nor anywhere up
+to and including \eqref{eq:expl}; everything through the definition of Nash
+equilibrium and of exploitability is purely measure-theoretic, and we introduce
+the weak-$*$ topology only at the one point where it is actually used
+(Remark~\ref{rem:weakstar}). The \emph{expected payoff} is
+\begin{equation}\label{eq:U}
+  U(\mu,\nu) \;\coloneqq\; \E_{\mu \otimes \nu}\,[\,u\,]
+  \;=\; \int_\cA\!\!\int_\cB u(a,b)\,d\nu(b)\,d\mu(a),
+  \qquad (\mu,\nu) \in \cP(\cA) \times \cP(\cB).
+\end{equation}
+Boundedness and measurability of $u$ make \eqref{eq:U} finite for every pair and,
+by Fubini--Tonelli, independent of the order of integration; $U$ is
+\emph{bilinear} (affine in each argument separately) and $|U| \le \|u\|_\infty$.
+This is the only role the regularity assumptions on $u$ play: the difficulty of
+the paper is never in defining the game.
+
+\paragraph{Effective landscapes and pure best responses.}
+Define the \emph{effective landscapes}
+\begin{equation}\label{eq:eff}
+  Q_\nu(a) \coloneqq \int_\cB u(a,b)\,d\nu(b),
+  \qquad
+  W_\mu(b) \coloneqq -\int_\cA u(a,b)\,d\mu(a),
+\end{equation}
+so that $U(\mu,\nu) = \int Q_\nu \,d\mu = -\int W_\mu \,d\nu$ and both players
+\emph{maximise}: player $0$ maximises $\E_\mu Q_\nu$, player $1$ maximises
+$\E_\nu W_\mu$. Because $U$ is affine in each argument, optimising over measures
+is the same as optimising over points,
+\begin{equation}\label{eq:pureBR}
+  \sup_{\mu \in \cP(\cA)} U(\mu,\nu) \;=\; \sup_{a \in \cA} Q_\nu(a),
+  \qquad
+  \inf_{\nu \in \cP(\cB)} U(\mu,\nu) \;=\; -\sup_{b \in \cB} W_\mu(b),
+\end{equation}
+i.e.\ \emph{best responses may always be taken pure}. (The suprema are attained
+when $Q_\nu$, resp.\ $W_\mu$, is upper semicontinuous --- in particular when $u$
+is continuous; in general they are suprema.) Equation~\eqref{eq:pureBR} is what
+lets a condition on a \emph{single} landscape $Q_\nu$ speak about the whole
+mixed-strategy problem, and it is used silently throughout
+\S\ref{sec:class}--\S\ref{sec:check}.
+
+\subsection{Nash equilibrium}
+
+\begin{definition}[Nash equilibrium]\label{def:nash}
+A pair $(\mu^\star,\nu^\star) \in \cP(\cA) \times \cP(\cB)$ is a \emph{Nash
+equilibrium} of $G$ if it is a saddle point of $U$:
+\begin{equation}\label{eq:nash}
+  U(\mu,\nu^\star) \;\le\; U(\mu^\star,\nu^\star) \;\le\; U(\mu^\star,\nu)
+  \qquad \text{for all } \mu \in \cP(\cA),\ \nu \in \cP(\cB).
+\end{equation}
+Equivalently, neither player can strictly improve their own expected payoff by a
+unilateral deviation: $\mu^\star$ maximises $U(\cdot,\nu^\star)$ and $\nu^\star$
+minimises $U(\mu^\star,\cdot)$. By \eqref{eq:pureBR} it suffices to rule out
+\emph{pure} deviations, so \eqref{eq:nash} is equivalent to
+\[
+  \sup_{a \in \cA} Q_{\nu^\star}(a)
+  \;=\; U(\mu^\star,\nu^\star)
+  \;=\; -\sup_{b \in \cB} W_{\mu^\star}(b),
+\]
+each player's landscape being flat at the equilibrium value across the other's
+best responses.
+\end{definition}
+
+\begin{remark}[Value and interchangeability]\label{rem:value}
+Weak duality $\sup_\mu \inf_\nu U \le \inf_\nu \sup_\mu U$ always holds; the
+existence of a pair satisfying \eqref{eq:nash} forces equality, and the common
+number
+\[
+  V(G) \;=\; \max_{\mu} \min_{\nu} U(\mu,\nu)
+        \;=\; \min_{\nu} \max_{\mu} U(\mu,\nu)
+        \;=\; U(\mu^\star,\nu^\star)
+\]
+is the \emph{value} of $G$. As in the finite case, the equilibrium set is a
+product set: if $(\mu^\star,\nu^\star)$ and $(\mu',\nu')$ are equilibria then so
+are $(\mu^\star,\nu')$ and $(\mu',\nu^\star)$, and all four have value $V(G)$.
+Hence ``converging to a Nash equilibrium'' is a statement about the two marginals
+separately --- which is what makes the asymmetric, per-player conditions of
+\S\ref{sec:class} legitimate.
+\end{remark}
+
+\paragraph{Standing assumption: finitely supported equilibria.}
+We fix one Nash equilibrium $(\mu^\star,\nu^\star)$ and assume throughout --- as
+a hypothesis, not a consequence --- that both measures are purely atomic with
+finite support,
+\begin{equation}\label{eq:finite}
+  \mu^\star = \sum_{j=1}^{M_0} w^\star_j\,\delta_{p_j},
+  \qquad
+  \nu^\star = \sum_{l=1}^{M_1} v^\star_l\,\delta_{r_l},
+  \qquad
+  w^\star \in \Delta_{M_0},\ v^\star \in \Delta_{M_1},\ w^\star,v^\star > 0 .
+\end{equation}
+The distinct points $p_j \in \cA$ and $r_l \in \cB$ are the \emph{atoms} of the
+equilibrium. This is the assumption a $K$-component mixture policy needs in order
+to be able to represent $\mu^\star$ at all, and it splits the learning problem in
+two: finding the atom \emph{locations} is the job of the component means, finding
+the \emph{weights} $w^\star, v^\star$ is the job of the categorical head. That
+split is the factorisation of \S\ref{sec:decomp}. \S\ref{sec:poker} argues the
+assumption is a property of the poker domain rather than a convenience.
+
+\begin{remark}[Existence is assumed, not derived]\label{rem:exist}
+If $u$ is \emph{continuous} on the compact set $\cA \times \cB$, a mixed Nash
+equilibrium exists and the value exists (Ville; Glicksberg's extension of Nash's
+theorem to compact Hausdorff action spaces), by a fixed-point argument over
+$\cP(\cA) \times \cP(\cB)$ that needs the topology of
+Remark~\ref{rem:weakstar}. For merely bounded measurable $u$ this can fail. We
+therefore treat the existence of $(\mu^\star,\nu^\star)$ --- and separately its
+finite support, \eqref{eq:finite} --- as standing assumptions rather than as
+consequences. Cite this honestly: the paper is about \emph{reaching} an
+equilibrium, not about its existence.
+\end{remark}
+
+\begin{remark}[Where a topology is needed --- and only there]\label{rem:weakstar}
+Definitions~\ref{def:game} and~\ref{def:nash}, the reduction \eqref{eq:pureBR}
+and the exploitability \eqref{eq:expl} are all measure-theoretic: they quantify
+over measures and never over limits of measures. Topology enters at exactly
+three later points, so we fix it once, here, for all of them. Equip $\cP(\cA)$
+with the \emph{weak-$*$} topology --- the coarsest topology making
+$\mu \mapsto \int f\,d\mu$ continuous for every $f \in C(\cA)$, equivalently
+$\mu_k \to \mu$ iff $\int f\,d\mu_k \to \int f\,d\mu$ for all continuous $f$
+(what probabilists call \emph{weak convergence}; the clash of names is worth a
+footnote in the final text). As $\cA$ is compact metric, $\cP(\cA)$ is convex,
+weak-$*$ compact and metrizable. Its three consumers:
+\begin{enumerate}[label=(\roman*), leftmargin=2.2em, itemsep=1pt]
+\item Remark~\ref{rem:exist}: Glicksberg's existence theorem needs exactly this
+  compactness, together with continuity of $u$;
+\item \S\ref{sec:valid}: releasing the variance floor gives
+  $\cN(m,\sigma^2) \to \delta_m$ as $\sigma \downarrow 0$, a weak-$*$ statement
+  that is \emph{false} in total variation, where
+  $\|\delta_a - \delta_{a'}\|_{\mathrm{TV}} = 2$ whenever $a \ne a'$;
+\item the branch-regularity condition (D) of \texttt{game\_class.tex}, whose
+  ``metric metrising weak convergence'' is metrizability of this topology.
+\end{enumerate}
+Nothing else in the paper needs $\cP(\cA)$ to be topologised, and in particular
+the class of \S\ref{sec:class} is stated without reference to it.
+\end{remark}
+
+\begin{remark}[Support characterisation]\label{rem:bg-support}
+Applying \eqref{eq:nash} to $\mu = \delta_a$ gives $Q_{\nu^\star}(a) \le V(G)$
+for all $a$, while $\int Q_{\nu^\star}\,d\mu^\star = V(G)$; hence
+$Q_{\nu^\star} = V(G)$ $\mu^\star$-almost everywhere, and when $Q_{\nu^\star}$ is
+upper semicontinuous,
+\[
+  \supp \mu^\star \subseteq \argmax_{\cA} Q_{\nu^\star},
+  \qquad
+  \supp \nu^\star \subseteq \argmax_{\cB} W_{\mu^\star}.
+\]
+\textbf{The equilibrium atoms sit at maxima of the effective landscape is
+therefore a theorem, not a hypothesis} --- this is the sentence \S\ref{sec:class}
+leans on when it assumes only nondegeneracy of those maxima and the absence of
+others.
+\end{remark}
+
+\paragraph{Approximate equilibria: the metric we actually report.}
+Convergence claims in \S\ref{sec:valid} are stated in \emph{exploitability}
+(\textsc{NashConv}),
+\begin{equation}\label{eq:expl}
+  e(\mu,\nu) \;\coloneqq\;
+  \sup_{\mu' \in \cP(\cA)} U(\mu',\nu) \;-\; \inf_{\nu' \in \cP(\cB)} U(\mu,\nu')
+  \;\overset{\eqref{eq:pureBR}}{=}\;
+  \sup_{a \in \cA} Q_\nu(a) \;+\; \sup_{b \in \cB} W_\mu(b) \;\ge\; 0 .
+\end{equation}
+A pair is an \emph{$\varepsilon$-Nash equilibrium} if $e(\mu,\nu) \le
+\varepsilon$, and $e(\mu,\nu) = 0$ exactly when $(\mu,\nu)$ is a Nash
+equilibrium in the sense of Definition~\ref{def:nash}. Note that $e$ is
+computable from the two effective landscapes alone, which is why it is the
+natural error measure for a paper whose whole analysis is landscape-based, and it
+is the quantity predicted to decay as $\Theta(1/t)$ in \S\ref{sec:valid}.
+
+\have{\texttt{game\_class.tex} \S1.1: the payoff, the effective landscapes
+\eqref{eq:eff}, the finite-support assumption \eqref{eq:finite} and
+Remark~\ref{rem:bg-support} are already written and can be lifted verbatim.}
+
+\need{Nothing mathematically new. Compress hard --- this is background and must
+not read as contribution. If space is tight, Definitions~\ref{def:game}
+and~\ref{def:nash} plus \eqref{eq:pureBR} and \eqref{eq:expl} stay in the main
+body; Remarks~\ref{rem:value}--\ref{rem:exist} move to the appendix.}
+
+\risk{A referee reads a half-page of standard definitions as padding. Mitigate by
+pointing forward in every remark: each one is here because a later section uses
+it (\eqref{eq:pureBR} $\to$ \S\ref{sec:class}, Remark~\ref{rem:value} $\to$
+asymmetric conditions, Remark~\ref{rem:bg-support} $\to$ the ``atoms are maxima''
+step).}
+
+\section{Setting and algorithm}\label{sec:setup}
+\budget{0.75 pages}
+
+\job{Define the object precisely and get out of the way. No results here.}
+
+\says{Two-player zero-sum game on compact action sets; $K$-component
+diagonal-Gaussian mixture policy; the two-head update (closed-form entropic
+simplex step on the categorical head, Fisher--Rao natural gradient on
+means/log-stds, magnet snapshot refreshed every $T$ steps); variance floor and
+ceiling.}
+
+\have{\texttt{game\_class.tex} \S1.1--1.2 verbatim.}
+
+\need{One paragraph positioning the algorithm as \textbf{SAC $\cap$ MMD}:
+reparameterised Gaussian policy and entropy from the former, KL-proximal magnet
+from the latter (the magnet is a target network by another name). Two sentences
+of closest related work; full treatment deferred to \S\ref{sec:related}.}
+
+\risk{Do \emph{not} headline ``SAC + MMD''. It invites ``so it is a combination
+of two known things''. The algorithm is the setting; the theory is the paper.}
+
+\section{The decomposition}\label{sec:decomp}
+\budget{1 page --- the pivot of the paper}
+
+\job{The reader should feel the problem change shape. After this section the
+question is no longer ``when does the algorithm converge'' but ``when do the
+means find the atoms''.}
+
+\says{With $\bar A_{kl}$ the expected payoff of component $k$ against component
+$l$, the expected payoff is $U = w^\top \bar A\, v$, and hence:
+\emph{(i)} the categorical heads run \emph{exactly} tabular MMD on the finite
+matrix game $\bar A$; \emph{(ii)} the Gaussian heads run preconditioned ascent on
+the smoothed effective landscape at each component's own scale. Requires no
+structure on the payoff whatsoever.}
+
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{Corollary.} Matrix-game MMD converges last-iterate from any
+  initialisation --- no basins, no assumptions. So the weight subproblem is
+  \emph{solved}, and every obstruction lives in the means.
+\item \textbf{Remark to include here}: this is why a \emph{one-point} condition
+  can characterise a \emph{many-atom} equilibrium. The target of the later
+  condition is an \emph{atom}, not an equilibrium; the mixing is not geometric,
+  it is a matrix game. Readers arriving from the optimisation literature will
+  otherwise stumble on exactly this.
+\end{itemize}
+
+\have{Lemma~1 and the ``target is an atom'' remark, both proved.}
+
+\section{When transport fails}\label{sec:fail}
+\budget{1 page}
+
+\job{Make the hypothesis of \S\ref{sec:class} feel \emph{forced} rather than
+chosen. Negative result before positive result --- this is the rhetorical hinge of
+the paper.}
+
+\says{Any self-consistent pair of spurious local maxima of the two effective
+landscapes is a fixed point of the dynamics, and is locally exponentially stable
+--- hence has an \emph{open basin} of initialisations from which the method does
+not converge to Nash.}
+
+\begin{itemize}[leftmargin=1.2em]
+\item It is \textbf{magnet-invariant}: at the trap the magnet is refreshed to the
+  trap itself, so its gradient vanishes; and it adds $-\eta\tau I$ to the
+  Jacobian, strictly \emph{deepening} the trap.
+\item It is \textbf{capacity-invariant}: spare components are captured too.
+\item It is \textbf{annealing-invariant} --- worse, annealing is the mechanism
+  that delivers components into it.
+\item \textbf{Therefore} any initialisation-robust class must forbid spurious
+  maxima outright. The shape of condition (C) is derived, not chosen.
+\item Worked counterexample: the decoy game, excluded by mode counting alone
+  (three local maxima, support size two) --- no dominance computation needed.
+\end{itemize}
+
+\have{Both propositions, proved, plus the counterexample.}
+
+\section{The class}\label{sec:class}
+\budget{1.75 pages}
+
+\job{State the class minimally and prove what can be proved. Resist completeness:
+eight conditions in the body will lose the reader.}
+
+\says{Core in the body --- \textbf{(C)} cellwise star-concavity of the smoothed,
+magnet-regularised effective landscape, uniformly over opponent policies and over
+the scale range; \textbf{(D)} the branch maps are Lipschitz with round-trip gain
+below one; \textbf{(M)} the branch endpoints at equilibrium are the atoms;
+\textbf{(K)} capacity $K_i \ge M_i$ with an initialisation meeting every cell.}
+
+\begin{itemize}[leftmargin=1.2em]
+\item Push the remaining conditions (nondegeneracy, atom regularity, step-size,
+  weight non-degeneracy) to an appendix as regularity and bookkeeping --- all four
+  turned out weaker than they first appeared.
+\item Emphasise what (C) is \emph{not}: not concavity (a Gaussian bump is concave
+  only within its own width, yet convergence happens from far outside), and not
+  ``the basin contains the target'' (basins of a time-varying flow are not
+  invariant). Uniformity in the opponent is the load-bearing part.
+\item (D) is the genuinely \emph{game-theoretic} condition --- it has no
+  counterpart in single-agent graduated optimisation, because there is no
+  opponent to chase.
+\item Main result plus the proof architecture: three input-to-state-stable blocks
+  (means, scales, weights) composed by a small-gain theorem.
+\item \textbf{State plainly what (K) does not do}: the class does not solve
+  exploration. Deterministic local ascent cannot move a component between
+  basins, so covering is assumed because the algorithm genuinely cannot achieve
+  it. Better to own this than to be caught by it.
+\end{itemize}
+
+\have{Definition, the ISS architecture, the scale lemma, the local results.}
+
+\need{\textbf{The global theorem is not proved} --- see
+\S\ref{sec:decisions}, decision 1. This determines the shape of the section.}
+
+\risk{The strongest attack on the paper. Do not paper over it.}
+
+\section{Checkable instances and design rules}\label{sec:check}
+\budget{1 page}
+
+\job{Convert the class into things a practitioner does differently on Monday.
+This is what makes the theory useful rather than decorative.}
+
+\begin{itemize}[leftmargin=1.2em]
+\item \textbf{Finite-rank coupling}: the opponent enters through $m$ moments, so
+  ``for all $\nu$'' collapses to a quantifier over a compact convex moment body.
+  Curvature-dominates-coupling in closed form, with worked constants.
+\item \textbf{One-dimensional Gaussian-bump landscapes}: scale-space causality
+  means a single mode count at the floor plus a merge check certifies the whole
+  scale ladder. Structure finer than the floor is free.
+\item \textbf{Multiple dimensions}: what survives verbatim (everything
+  structural) and what degrades (effective mass $h w^M$, smoothing can
+  \emph{create} maxima, covering costs more components, bias gains a factor $M$).
+\item \textbf{Design rules that fall out}: floor below half the atom spacing;
+  $K \gg M$ with a spread initialisation; magnet only on flat directions;
+  $\varepsilon = \Theta(1/t)$ converts a target exploitability into a step budget.
+\end{itemize}
+
+\have{All of it.}
+
+\section{Quantitative validation}\label{sec:valid}
+\budget{1.25 pages}
+
+\job{Show the theory is \emph{predictive}, not merely consistent. Parameter-free
+numerical predictions are rare in this literature; lead with that framing.}
+
+\begin{itemize}[leftmargin=1.2em]
+\item Scale decay $\sigma \sim t^{-1/2}$ and residual exploitability
+  $\varepsilon = \Theta(1/t)$: fitted constant vs.\ predicted, four digits;
+  $\sigma^{-2}$ affine in $t$ with $R^2 \ge 1-3\times10^{-8}$. State the mode of
+  convergence when the floor is released: the policy tends to $\mu^\star$
+  \emph{weak-$*$} (Remark~\ref{rem:weakstar}(ii)), which is the only sense in
+  which a Gaussian mixture can approach an atomic measure at all --- the
+  exploitability rate is the quantitative form of that statement.
+\item The magnet acts as a pure \textbf{time-rescaling} of the Gaussian-head flow
+  by a closed-form factor; verified over a $16\times$ range, with configurations
+  sharing $\eta\tau T$ collapsing onto one constant.
+\item Overcapacity \emph{helps} inside the class and \emph{fails} outside it ---
+  the same knob with opposite signs, predicted in advance.
+\item The certified counterexample, and the observation that residuals reported
+  in prior work were snapshots of a decaying quantity rather than floor-set
+  constants.
+\end{itemize}
+
+\have{\texttt{check\_scale\_law.py}, runs A--F, results in
+\texttt{results/scale\_law.\{json,log\}}.}
+
+\need{Figures: (a) $\sigma^{-2}$ vs.\ $t$, three runs, one line; (b) brake factor
+vs.\ $\eta\tau T$, measured vs.\ closed form; (c) basin maps inside vs.\ outside
+the class.}
+
+\section{Poker}\label{sec:poker}
+\budget{1.75 pages}
+
+\job{Show the class survives contact with a real domain, in three rungs of
+increasing realism and decreasing rigour --- and label the rungs honestly.}
+
+\subsection*{8.1 Why poker fits}
+\begin{itemize}[leftmargin=1.2em]
+\item The action space is \emph{hybrid} --- discrete (fold/check/call/bet) plus a
+  continuous bet size --- which is exactly the shape of the policy. No contortion.
+\item \textbf{Near-finite support of equilibrium bet-size distributions is a known
+  property of the domain}: solvers discretise to a handful of sizes and lose
+  little. The class's central assumption is therefore domain-justified, not a
+  modelling convenience. This is the single best argument for the pairing.
+\item EV as a function of bet size is kinked and can jump (calling thresholds
+  move discretely). The class needs only \emph{bounded measurable} payoffs,
+  because the variance floor does the regularising --- a place where this theory
+  is better suited to poker than a smoothness-based one would be.
+\item Capacity: the number of sizes per node is unknown and varies; $K \gg M$ is
+  safe inside the class, so the practitioner does not need to know $M$.
+\end{itemize}
+
+\subsection*{8.2 Analytic poker models --- the bridge}
+\job{The rung that makes 8.3 interpretable. Do not skip it.}
+\begin{itemize}[leftmargin=1.2em]
+\item Von Neumann poker / one-street continuous-bet games: genuinely poker,
+  genuinely continuous, \emph{closed-form equilibria}.
+\item Verify (C) numerically on the true EV-vs-size landscape; recover the known
+  optimal sizes; measure \textbf{exact} exploitability.
+\item Report the mode structure of the EV landscape --- this is where a spurious
+  maximum would show up if the polarised-range intuition creates one.
+\end{itemize}
+\need{Everything. Model implementation, landscape diagnostics, exploitability.}
+
+\subsection*{8.3 Heads-up no-limit hold'em --- the scaling demonstration}
+\begin{itemize}[leftmargin=1.2em]
+\item Continuous bet sizing \emph{without discretisation}; baseline is a matched
+  discretised-sizing agent.
+\item Evaluation: local best response, plus head-to-head against the baseline.
+\item \textbf{Labelled explicitly as outside the theorem's hypotheses.}
+\end{itemize}
+\need{Environment, network, self-play infrastructure, evaluation.}
+\risk{Extensive form is a second theory, not a corollary: payoffs are bilinear in
+sequence form, but the network parameterises \emph{behavioural} strategies per
+infoset, and the cellwise analysis would have to be redone with continuation
+values as the landscape. Say this in \S\ref{sec:limits} before a referee does.}
+
+\section{Related work}\label{sec:related}
+\budget{0.5 pages}
+
+\job{Position honestly on four axes.}
+\begin{itemize}[leftmargin=1.2em]
+\item Game solving with mirror descent / magnetic mirror descent; last-iterate
+  results in monotone and bilinear games.
+\item Continuous and separable games; finite-support equilibria.
+\item Graduated optimisation and $\sigma$-niceness --- the single-agent ancestor of
+  condition (C); state precisely what the game setting adds (the uniformity in
+  the opponent, and the small-gain condition, which have no single-agent
+  counterpart).
+\item Star-convexity / quasar-convexity in nonconvex optimisation, and
+  variational stability in learning-in-games --- the two literatures the
+  inequality is borrowed from. Be explicit that the novelty is the
+  \emph{conjunction}: cellwise on a partition, toward a moving target, uniform in
+  the opponent, uniform in scale.
+\item Action abstraction in poker; whether continuous bet-size learning has been
+  attempted.
+\end{itemize}
+\need{A literature check on the last point before claiming novelty.}
+
+\section{Limitations}\label{sec:limits}
+\budget{0.25 pages}
+
+\job{Disarm the obvious attacks by making them first. Each one costs a sentence
+here and would cost the paper a referee otherwise.}
+\begin{itemize}[leftmargin=1.2em]
+\item Extensive form is a separate theory.
+\item (C) is unverifiable at scale; checkability holds for finite-rank couplings
+  and low-dimensional landscapes.
+\item Exploration is assumed, not solved --- the class inherits the covering
+  condition because the algorithm cannot discharge it.
+\item Shared network parameters couple infosets; the analysis treats mixture
+  parameters as free.
+\item Exact gradients; the stochastic case is open.
+\end{itemize}
+
+\section{Conclusion}\label{sec:conc}
+\budget{0.25 pages}
+
+\job{One paragraph. Return to the final message and make it land.}
+
+\noindent
+The two subproblems are not equally hard: equilibration is free, transport is
+everything. Transport succeeds or fails according to the geometry of the smoothed
+effective landscape, which is a property of the game --- computable before
+training, not discoverable by sweeping hyperparameters. \emph{The failures
+practitioners attribute to tuning are properties of the game, and they are
+checkable before you train.}
+
+\appendix
+\section{Deferred conditions and proofs}
+Nondegeneracy, atom regularity, step-size and weight conditions; full proofs;
+the resolution lemma and its reading as a hyperparameter design rule; the
+per-direction magnet taxonomy.
+
+\section{Open decisions}\label{sec:decisions}
+
+\job{Settle these \emph{before} drafting --- both change \S\ref{sec:intro}'s
+contribution list.}
+
+\paragraph{Decision 1: the unproved global theorem.}
+Proved today: the decomposition, the sharpness proposition, local convergence,
+the scale and bias laws. Not proved: the small-gain composition of the three ISS
+blocks. Three options, ranked:
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{Close it under a clean extra hypothesis} --- a two-timescale limit,
+  or an explicit small-gain constant. Yields a genuine theorem; narrows the class
+  slightly. \emph{Preferred.}
+\item \textbf{Restructure} so the theorems are the negative and structural
+  results, with the global statement as a criterion supported by the ISS
+  architecture and the experiments. Honest, publishable, weaker headline.
+\item Claim it as proved. \emph{No.}
+\end{enumerate}
+
+\paragraph{Decision 2: rung 8.2.}
+The analytic poker models are the only place where poker and verifiable theory
+meet. Without them, \S\ref{sec:poker} is a leap from synthetic games to an
+unverifiable benchmark. Recommendation: build 8.2 even at the cost of shrinking
+8.3.
+
+\paragraph{Decision 3: venue and framing.}
+A theory-first framing (class + sharpness, poker as demonstration) and an
+empirics-first framing (poker headline, theory as justification) want different
+venues and different \S\ref{sec:intro}s. The material is currently much stronger
+as theory-first.
+
+\end{document}

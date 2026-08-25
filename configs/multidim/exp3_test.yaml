@@ -1,0 +1,55 @@
+# Playground config -- Exp 3 (2-D, three peaks/axis, no decoy) with EVERY knob listed.
+# Run: python idealized_mmd_multidim.py configs/multidim/exp3_test.yaml
+# Values below reproduce Exp 3 (the weight-starvation failure); "(default)" marks a value
+# left at the engine's schema default, so you can see what changes when you touch it.
+
+game:
+  name: multidim_decoy_well   # the only game this runner supports
+  dim: 2                      # action dimensions A; payoff is a sum of `dim` 1-D DecoyWells
+  peaks: [-1.0, 0.0, 1.0]     # peak centers per axis (same in every axis); Nash support
+  weights: null               # per-peak Nash weights; null = uniform (must sum to 1 if set)
+  peak_width: 0.08            # std of each tall/narrow peak bump (smaller => more razor-thin)
+  peak_height: 1.0            # height of each peak bump
+  decoys: []                  # list of [center, height, width]; height MUST be < peak_height.
+                              #   [] = no decoys. e.g. [[0.0, 0.7, 0.45]] adds the trap.
+  coupling: 1.0               # weight on the moment-matching coupling term (0 => pure well)
+  action_margin: 2.0          # box is [min(peaks)-margin, max(peaks)+margin] per axis
+
+mmd:
+  # --- core MMD ---
+  lr: 0.05                    # step size (eta) for both heads
+  steps: 800000                 # number of MMD iterations
+  magnet_interval: 500        # iterations between hard magnet snapshots
+  magnet_coef: 0.4           # tau: proximal weight on KL(. || magnet)
+  entropy_coef: 0.05           # (default) pull of the categorical head toward uniform
+  num_components: 3           # K components in the JOINT mixture (means live in R^dim)
+
+  # --- which heads train ---
+  train_means: true           # (default) if false, component means are frozen at their init
+  train_std: true             # (default) if false, log-stds are frozen at their init
+  freeze_weights: false       # (default) if true, pins the categorical head at its init
+
+  # --- std bounds / graduated optimization ---
+  anneal_std_from: 0.0        # (default) 0 disables. >0 holds every std >= this early, then
+                              #   relaxes the floor to std_min over training (graduated opt)
+  std_min: 0.001              # (default) hard lower bound on every component std
+  std_max: 1.0                # (default) hard upper bound on every component std
+
+  # --- annealed mean-repulsion sweep (the decoy-trap escape; see Exp 9) ---
+  repulsion_coef: 0.0         # (default) 0 disables. >0 adds coef * sum_{i<j} ||mu_i-mu_j||_1
+  repulsion_ramp: 0.2         # (default) fraction of training ramping 0 -> coef
+  repulsion_hold: 0.5         # (default) fraction held at coef; the rest anneals back to 0
+
+init:
+  means: spread               # "spread" (diagonal spread across the box, = trainer init) |
+                              #   "diagonal" (same as spread) |
+                              #   a (K, dim) list, e.g. [[-1,-1],[0,0],[1,1]] |
+                              #   a per-player pair [means0, means1], each a (K, dim) list
+  weights: null               # (default) null = uniform init; or a length-K list (need not sum to 1)
+  log_std: null               # (default) null => (high-low)/(2K), the trainer's init;
+                              #   or a positive number = the actual std (NOT log) for every component
+
+log:
+  every: 200                  # record history every N iterations
+  rows: 10                    # number of rows to print from the recorded history
+  out: null                   # (default) optional path to dump the full history as JSON

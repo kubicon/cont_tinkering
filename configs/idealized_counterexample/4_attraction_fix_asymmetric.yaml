@@ -1,0 +1,81 @@
+# Idealized (noise-free, exact-gradient) MMD.  Run: python run_idealized.py <this file>
+#
+# HYPERPARAMETER FIX for 3_asymmetric_decoys_and_peaks.yaml. Same game, same init,
+# same everything as file 3 -- only `repulsion_coef` changes sign and magnitude, from
+# `3.0` (repulsion, fails) to `-1.7` (attraction, near-Nash). Confirms the attraction
+# fix from 2_attraction_sweep_fix.yaml generalizes past the symmetric case: it is not
+# an artifact of the mirror symmetry, it's the same "pull inward through the peak"
+# mechanism, it just needs re-tuning per layout.
+#
+# Coefficient sweep (40k steps, all else identical to file 3):
+#     -0.5   too weak, both stall short          (-2.12, +1.42), expl 0.948
+#     -1.0   left captured, right stalls short   (-1.50, +1.33), expl 0.845
+#     -1.5   still converging at t=40k (knife-edge, not yet settled), expl 0.570
+#     -1.7   BEST: both captured                 (-1.49, +0.80), expl 0.083
+#     -1.8   captured                            (-1.49, +0.80), expl 0.085
+#     -1.9   captured                            (-1.49, +0.79), expl 0.088
+#     -2.0   captured, slightly worse            (-1.49, +0.79), expl 0.091
+#     -2.1   captured, slightly worse            (-1.49, +0.79), expl 0.094
+#     -2.5   captured, worse                     (-1.49, +0.79), expl 0.108
+#     -3.0   captured, worse                     (-1.49, +0.79), expl 0.128
+# Window is roughly [-2.5, -1.0], with a sharp floor below -1.5 (components haven't
+# both reached their peak by 40k steps) -- unlike the symmetric case (file 2), the two
+# components here have to travel different distances to reach asymmetric peaks under a
+# SHARED coefficient (means are trained per-player but the repulsion term uses one
+# global `lam`), so there's a real risk one side gets under-pulled while the other
+# overshoots. -1.7 threads it, but the residual exploitability (0.083) is noticeably
+# higher than the symmetric fix's 0.008 -- the single shared coefficient is doing two
+# unequal jobs at once, and it shows.
+#
+# Takeaway: the attraction-sweep fix generalizes to asymmetric peaks/decoys, but loses
+# precision doing it, and needs a fresh coefficient search per layout -- exactly as
+# flagged in file 2's caveat. There is still no single knob setting (or even a single
+# sign convention) that works across all decoy placements without knowing where the
+# decoys sit relative to the peaks.
+#
+# Every settable field is listed; "(default)" marks values left at the schema default.
+
+game:
+  name: decoy_well
+  peaks: [-1.5, 0.8]
+  weights: null
+  peak_width: 0.05
+  peak_height: 1.0
+  decoys: [[-2.4, 0.60, 0.50], [1.5, 0.80, 0.30]]
+  coupling: 1.0
+  action_margin: 2.0
+
+mmd:
+  lr: 0.05
+  steps: 40000
+  magnet_interval: 200
+  magnet_coef: 0.05
+  entropy_coef: 0.0
+  num_components: 2
+
+  train_means: true
+  train_std: true
+  freeze_weights: true
+
+  anneal_std_from: 0.0
+  std_min: 0.001
+  std_max: 0.10
+
+  # --- the fix: attraction, re-tuned for the asymmetric layout ---
+  repulsion_coef: -1.7    # <- negative = attraction; magnitude re-derived for this
+                            #    layout (was -1.0 for the symmetric case in file 2)
+  repulsion_ramp: 0.2
+  repulsion_hold: 0.5
+
+  backend: auto
+  grid_points: 801
+
+init:
+  means: [-2.4, 1.5]
+  weights: null
+  log_std: 0.05
+
+log:
+  every: 500
+  rows: 10
+  out: null

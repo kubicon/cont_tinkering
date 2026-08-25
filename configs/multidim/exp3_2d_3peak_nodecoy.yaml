@@ -1,0 +1,20 @@
+# Exp 3 -- 2-D, THREE peaks per axis (K=3), no decoys. Tests multi-peak per axis.
+game:
+  name: multidim_decoy_well
+  dim: 2
+  peaks: [-1.0, 0.0, 1.0]
+  decoys: []
+  peak_width: 0.08
+  coupling: 1.0
+  action_margin: 1.0
+mmd:
+  lr: 0.05
+  steps: 8000
+  magnet_interval: 200
+  magnet_coef: 0.2
+  num_components: 3
+init:
+  means: spread
+log:
+  every: 200
+  rows: 10

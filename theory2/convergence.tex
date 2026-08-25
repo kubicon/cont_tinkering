@@ -1,0 +1,1366 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage{enumitem}
+\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue]{hyperref}
+
+\newlist{conditions}{description}{1}
+\setlist[conditions]{style=unboxed, leftmargin=0pt, labelsep=0.35em,
+                     itemsep=5pt, parsep=2pt, font=\normalfont}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{assumption}{Assumption}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{example}{Example}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\cA}{\mathcal{A}}
+\newcommand{\cB}{\mathcal{B}}
+\newcommand{\cP}{\mathcal{P}}
+\newcommand{\cN}{\mathcal{N}}
+\newcommand{\cT}{\mathcal{T}}
+\newcommand{\ip}[2]{\left\langle #1, #2 \right\rangle}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\Lip}{\operatorname{Lip}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator{\supp}{supp}
+\DeclareMathOperator{\conv}{conv}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\tr}{tr}
+\newcommand{\GC}[1]{\textsf{GC-#1}}
+
+\title{Convergence of Magnetic Mirror Descent with Gaussian-Mixture Policies\\
+on the Class $\mathfrak{G}$\\
+\large A theorem, and a proof}
+\author{\texttt{cont\_tinkering} / \texttt{theory2}}
+\date{August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note discharges the principal open item of \texttt{game\_class.tex} (its
+\S5.6, item~1, and Decision~1 of \texttt{paper\_outline.tex}): the composition of
+the three input-to-state-stable blocks into a global convergence theorem for the
+class $\mathfrak{G}(M,\Sigma,\cN,\rho)$. We state a convergence theorem
+(Theorem~\ref{thm:main}) and prove it. Closing the argument costs \emph{one}
+substantive new hypothesis --- that the star-concavity modulus $\rho$ is
+\emph{linear}, $\rho(r) \ge \alpha r$ with $\alpha > 0$ possibly tiny
+(hypothesis~(L)) --- together with a quantified form of the qualitative small-gain
+condition (D) already in the class, and the explicit constants that (S)
+already promises but does not name. Hypothesis~(L) is not an extra restriction on
+which games qualify in any case of interest: on a compact cell it is implied by
+continuity of $\rho$ together with nondegeneracy of the branch maximum, and it is
+what supplies the uniform branch curvature that the scale block needs anyway.
+
+The technical content is three observations. First, the mean update's step is
+proportional to the tracking error ($\|\nabla Q^{\mathrm{reg}}(a)\| \le L\|a -
+\xi_j\|$, because the branch point is a critical point), so the drift each block
+injects into its neighbours is proportional to that block's own error --- which is
+what converts the qualitative ISS estimates into a genuine contraction rather
+than convergence to an $O(\eta)$ ball. Second, and this is the resolution of
+\S5.6 item~5, the Fisher preconditioner $\sigma^2$ appears in the contraction
+rate \emph{and} in every drift term, so it cancels out of every cycle gain: the
+small-gain condition is scale-free and step-size-free, and the ``scale collapse
+throttles transport'' objection is quantitatively void. Third, and this is the
+resolution of \S5.6 item~1, the tension between ``small gain wants
+$\tau^{\mathrm{cat}}$ large'' and ``low bias wants $\tau^{\mathrm{cat}}$ small''
+is only apparent: the magnet refresh is a Bregman proximal-point iteration whose
+fixed point is the Nash of $\bar A$ for \emph{every} $\tau^{\mathrm{cat}} > 0$,
+so $\tau^{\mathrm{cat}}$ enters the rate and not the limit, and may be taken as
+large as the gain condition requires.
+
+The conclusion is the one advertised: means converge to branch points, scales to
+the floor, weights to the Nash of the smoothed atom matrix, and the induced
+policy pair is $\varepsilon$-Nash with $\varepsilon = O((s^{\min}_0)^2 +
+(s^{\min}_1)^2)$ --- with, as a by-product, a sharper constant than the one
+previously stated, and a linear rate. Section~\ref{sec:remaining} lists what is
+\emph{still} not proved, which is now a shorter and more specific list.
+\end{abstract}
+
+\tableofcontents
+
+\section{Roadmap: the idea of every step}\label{sec:roadmap}
+
+This section is the proof in words. Each entry says what is \emph{obvious} or
+imported about a step, and then what the step actually has to add --- which is
+almost always the same thing: the object being chased is moving, and the work is
+in charging that motion to something that vanishes.
+
+\subsection*{The three ideas}
+
+\begin{enumerate}[leftmargin=1.4em]
+\item \textbf{Every block's step is proportional to its own error.} A component
+  mean moves fast only when it is far from where it is going, because the branch
+  point is a critical point of the landscape it is climbing
+  (Lemma~\ref{lem:dom}). The same is true of the categorical head. So the
+  disturbance each block injects into its neighbours is proportional to that
+  block's own error, and ``everything is disturbing everything'' becomes a system
+  that can contract to zero rather than to a ball of radius $O(\eta)$.
+\item \textbf{The preconditioner cancels.} The Fisher factor $\sigma^2$ slows the
+  mean update down as the scales collapse --- and slows down, by at least as much,
+  every disturbance the mean update is trying to reject. Around any cycle of the
+  interconnection it appears once upstairs and once downstairs
+  (Lemma~\ref{lem:cyclefree}). So the stability condition contains no $\sigma$ and
+  no step size: it is a statement about the \emph{game}.
+\item \textbf{The categorical magnet temperature is free.} It sets how stiff the
+  weight block's target is against the means moving underneath it, and it does
+  not move the limit (Lemma~\ref{lem:weight}(iii)). So it can be turned up until
+  the loop closes, at no asymptotic cost.
+\end{enumerate}
+
+\subsection*{The blocks}
+
+There are four errors --- the two players' mean tracking errors $\tilde r_0,
+\tilde r_1$ and their two categorical errors $\delta_0, \delta_1$ --- plus the two
+scale variables, which are handled separately because they converge in finite
+time rather than asymptotically. The lemmas come in four groups.
+
+\paragraph{Group 1: what a branch point is
+(Lemmas~\ref{lem:dom}--\ref{lem:branchdrift}).}
+\begin{description}[leftmargin=0pt, style=unboxed, font=\normalfont\itshape]
+\item[Lemma~\ref{lem:dom}.] First, a point of logic: the branch point is
+  \emph{not} defined as a critical point. It is data of hypothesis~(C) --- a point
+  of the cell, posited to exist, toward which the gradient leans from everywhere
+  in that cell --- and criticality is a \emph{consequence}, proved here along with
+  uniqueness and maximality. (Setting it up this way is what makes (C) one
+  checkable inequality rather than three separate claims, and it is why (C) can be
+  verified by counting modes on a scale ladder.) What the lemma then adds, and
+  the reason it exists: since the gradient vanishes at $\xi_j$ and is
+  $L$-Lipschitz, it is at most $L$ times the distance to $\xi_j$ everywhere in the
+  cell --- so the mean's step shrinks as it arrives. That one line is what later
+  separates ``converges'' from ``converges to an $O(\eta)$ ball'', and it is used
+  in every subsequent estimate.
+\item[Lemma~\ref{lem:curv}.] Obvious: a nondegenerate maximum is curved. What it
+  adds: hypothesis~(L) --- star-concavity with a \emph{linear} modulus --- is
+  exactly the statement that this curvature is bounded away from zero uniformly
+  in the opponent and the scale. So the uniform curvature the scale block needs
+  does not have to be assumed separately; it comes free with (L).
+\item[Lemma~\ref{lem:branchdrift}.] Obvious: change the smoothing width and the
+  peak of the smoothed landscape moves. What it adds: it moves by $O(1)$ per unit
+  of $s^2/2$, not per unit of $\log s$. Since the algorithm updates $\log s$, the
+  branch drift caused by a scale step carries a factor $\sigma^2$. That factor is
+  banked here and spent in Lemma~\ref{lem:scalefree}.
+\end{description}
+
+\paragraph{Group 2: the means (Lemmas~\ref{lem:contract}--\ref{lem:mean}).}
+\begin{description}[leftmargin=0pt, style=unboxed, font=\normalfont\itshape]
+\item[Lemma~\ref{lem:contract}.] Obvious: preconditioned gradient ascent on a
+  star-concave function converges. What it adds: the rate, written in the metric
+  the algorithm actually uses --- anisotropic $\Sigma_k$, the $w_k$ preconditioner
+  artifact of \GC{Remark~2} --- and the observation that the second-order term of
+  the expansion is proportional to $r^2$ rather than constant, so the contraction
+  is geometric and not merely a decrease.
+\item[Lemma~\ref{lem:inv}.] Obvious: if you always step toward the branch point
+  you never leave the cell. What it adds: the explicit radius $R_i$ within which
+  that is true, which is the budget hypothesis~(G$_\sigma$) then has to fit the
+  entire transient inside.
+\item[Lemma~\ref{lem:mean}.] This is Lemma~\ref{lem:contract} with the target
+  moving. The branch point moves for four reasons --- the opponent's means, the
+  opponent's weights, either player's scales, and the magnet centre --- and
+  (D$^+$) is what lets each be charged separately. Output: one inequality reading
+  ``error contracts by a fixed fraction, plus however far the target moved''.
+\end{description}
+
+\paragraph{Group 3: the scales (Lemmas~\ref{lem:scale}--\ref{lem:scalefree}).}
+\begin{description}[leftmargin=0pt, style=unboxed, font=\normalfont\itshape]
+\item[Lemma~\ref{lem:scale}.] Obvious: at a maximum the Laplacian is negative, so
+  blurring costs value, so the scale update pushes the scale down --- this is
+  \GC{Lemma~3}, and it is why no annealing schedule is needed. What it adds: the
+  same holds throughout a ball of radius $\delta^\kappa$ around the branch point,
+  uniformly in the opponent. That is what lets the scales be shown to fall while
+  the means have only \emph{approximately} arrived, and it converts an asymptotic
+  statement into a finite arrival time at the floor --- after which the scale
+  contributes exactly zero disturbance, which is what Step 4 of the theorem needs.
+\item[Lemma~\ref{lem:scalefree}.] The objection it answers is \GC{\S5.6},
+  item~5: as the scales collapse the mean update's rate falls by four orders of
+  magnitude, so how can transport possibly survive? Answer: the disturbance that
+  the scale collapse injects into the mean block falls by \emph{six} --- $\sigma^2$
+  from Lemma~\ref{lem:branchdrift} and $\sigma^2$ from the preconditioner in the
+  scale update itself, against $\sigma^2$ in the contraction. The ratio, which is
+  all that matters, improves as the scales fall.
+\end{description}
+
+\paragraph{Group 4: the weights (Lemma~\ref{lem:weight}).}
+\begin{description}[leftmargin=0pt, style=unboxed, font=\normalfont\itshape]
+\item[Lemma~\ref{lem:weight}.] Obvious, and imported: for a \emph{fixed} payoff
+  matrix, tabular MMD converges to the regularised equilibrium, and iterating the
+  magnet refresh drives that to Nash. This is the paper's spine (\GC{Lemma~1}(i))
+  and needs no hypothesis on the game at all. What the lemma adds is everything
+  that follows from the matrix \emph{not} being fixed: $\bar A(t)$ changes every
+  step because the means and scales move under it, so the statement needed is a
+  \emph{lag} bound --- the weights sit behind their moving target by an amount
+  proportional to the speed of the means, which by Lemma~\ref{lem:dom} is itself
+  proportional to the means' own tracking error. That is part~(v), and it is the
+  whole content; parts (i), (ii), (iv) are its three constants (how fast the gap
+  closes, how far the target moves per unit of matrix perturbation --- the
+  $O(1/\tau^{\mathrm{cat}})$ stiffness --- and how fast $w$ moves per unit of its
+  own error). Part~(iv) exists because the opponent's weights tilt \emph{your}
+  landscape: this block is a feedback edge, not a read-out, which is why a
+  small-gain argument is needed rather than a sequential one.
+\end{description}
+
+\subsection*{Composition, and the limit}
+
+\begin{description}[leftmargin=0pt, style=unboxed, font=\normalfont\itshape]
+\item[Lemma~\ref{lem:sg}.] Obvious: four contracting blocks, each disturbing the
+  others, still converge if the disturbances are small enough. What it adds:
+  ``small enough'' in a form that can be checked --- the spectral radius of the
+  $4\times4$ matrix of (disturbance)/(own rate) ratios --- together with the
+  invariant-ball version needed for the transient phase, while the scales are
+  still falling and the disturbance has not yet reached zero.
+\item[Lemma~\ref{lem:cyclefree}.] The bookkeeping that makes the previous lemma's
+  hypothesis usable: around any cycle, each $\eta_i$ and each $\sigma$ appears
+  once in a numerator and once in a denominator. So (G) can be evaluated offline
+  from game data, before choosing any hyperparameter.
+\item[Lemma~\ref{lem:fp}.] The four errors going to zero says the configuration
+  stops moving; it does not say \emph{where}. This lemma names the limit: the
+  unique configuration that is self-consistent --- every mean at the branch point
+  induced by the opponent's policy, every weight vector the Nash of the matrix
+  those means induce. Existence and uniqueness come from the same constants as
+  (G), because the consistency map is a contraction with the same gains. Then (M)
+  says the true equilibrium atoms are an $O(s^2)$-\emph{approximate} fixed point
+  of that map, so the actual fixed point is $O(s^2)$ away from them.
+\item[Lemma~\ref{lem:exp}.] Once the limit is located, exploitability is a short
+  computation, and it comes out cleaner than expected: because the categorical
+  head equalises all $M_0$ cells exactly at a Nash of $\bar A$, the regret is not
+  a weighted average of per-atom smoothing deficits but literally
+  $\max Q_\nu - \max (Q_\nu)_s$ --- a deficit at a single point.
+\end{description}
+
+\subsection*{The theorem}
+
+Theorem~\ref{thm:main} is then six steps, in this order:
+assign components to cells (K); assemble the four blocks into the comparison
+system and apply Lemma~\ref{lem:sg}; note that the transient never leaves the
+cells and enters the ball where the scales are monotone; let the scales fall to
+the floor in finite time, at which point the exogenous disturbance is
+\emph{exactly} zero; then the same small-gain estimate with zero input drives all
+four errors to zero geometrically; finally identify the limit with
+Lemma~\ref{lem:fp} and read off the bias with Lemma~\ref{lem:exp}.
+
+The ordering of hypotheses matters and is not circular: $\tau^{\mathrm{cat}}$ is
+chosen from the gain condition \eqref{eq:cycleweight}, then the refresh period $T$
+from (T), then the step sizes from \eqref{eq:step}. This is the ordering
+\GC{\S5.6}, item~1 could not settle, and Lemma~\ref{lem:weight}(iii) is what
+unblocks it.
+
+The corollaries are variations on the same argument:
+Corollary~\ref{cor:unfloored} releases the floor and observes that the two
+players' scales fall at proportional rates, so Lemma~\ref{lem:cyclefree} still
+applies with time-varying rates whose sum diverges --- convergence survives,
+degraded from geometric to polynomial. Corollary~\ref{cor:overcap} notes that
+spare components are harmless because there is no spurious attractor inside the
+class to catch them. Corollary~\ref{cor:flat} is the case $\kappa_i = 0$, where
+Group~3 fails and nothing else does, so the conclusion degrades to convergence of
+the induced measure. Proposition~\ref{prop:cap} evaluates (G) in closed form when
+the coupling has finite rank.
+
+\section{Setting, and what is imported}\label{sec:setting}
+
+Throughout, references of the form \GC{Definition~1}, \GC{Lemma~1},
+\GC{(2.4)} point into \texttt{theory2/game\_class.tex}; that document's notation
+is used without change. We recall only what the proof consumes.
+
+\paragraph{Game and equilibrium.} Player $0$ maximises, player $1$ minimises a
+bounded measurable $u : \cA \times \cB \to \R$ on compact convex bodies
+$\cA \subset \R^{n_0}$, $\cB \subset \R^{n_1}$. The effective landscapes are
+$Q_\nu(a) = \int u(a,b)\,d\nu(b)$ and $W_\mu(b) = -\int u(a,b)\,d\mu(a)$; both
+players maximise. $\Lambda_s := \Lambda * \cN(0,\diag(s^2))$. A mixed Nash
+equilibrium $(\mu^\star,\nu^\star)$ is fixed and assumed purely atomic with
+finite support, $\mu^\star = \sum_{j\le M_0} w^\star_j \delta_{p_j}$,
+$\nu^\star = \sum_{l\le M_1} v^\star_l \delta_{r_l}$, all weights positive.
+
+\paragraph{Policy and update.} Player $i$ carries $K_i$ diagonal Gaussian
+components with means $m^{(i)}_k$, log-scales $\rho^{(i)}_k = \log\sigma^{(i)}_k$
+clipped to $\Sigma_i = [s^{\min}_i, s^{\max}_i]$ coordinatewise, and categorical
+logits $\ell^{(i)}$. Writing $\Sigma_k := \diag\big((\sigma^{(i)}_k)^2\big)$ and
+using \GC{(2.13)}
+\begin{equation}\label{eq:Qreg}
+  Q^{\mathrm{reg}}_{\nu,s,\bar a}(a) \;=\; (Q_\nu)_s(a)
+  \;-\; \frac{\tau^{\mathrm g}_0}{2}\|a - \bar a\|^2_{\bar\sigma^{-2}},
+\end{equation}
+\GC{Lemma~1}(ii) puts the Gaussian-head update of player $0$ in the form we use
+throughout:
+\begin{equation}\label{eq:meanupd}
+  m^{(0),+}_k \;=\; m^{(0)}_k \;+\; \eta_0\, w^{(0)}_k\, \Sigma_k\,
+  \nabla_a Q^{\mathrm{reg}}_{\nu,\sigma_k,\bar a_k}\big(m^{(0)}_k\big),
+\end{equation}
+\begin{equation}\label{eq:scaleupd}
+  \rho^{(0),+}_{k,d} \;=\; \Big[\rho^{(0)}_{k,d}
+  \;+\; \tfrac{\eta_0}{2}\, w^{(0)}_k\, \sigma_{k,d}^2\,
+  \partial^2_d (Q_\nu)_{\sigma_k}\big(m^{(0)}_k\big)
+  \;+\; \tfrac{\eta_0}{2}\tau^{\mathrm g}_0 w^{(0)}_k
+        \big(1 - \sigma_{k,d}^2/\bar\sigma_{k,d}^2\big)\Big]_{\Sigma_0},
+\end{equation}
+$[\cdot]_{\Sigma_0}$ denoting the clip to the scale range; the identity
+$\partial_{(s_d^2/2)}\Lambda_s = \partial_d^2 \Lambda_s$ (the heat equation, as in
+\GC{Lemma~3}) has been used. The categorical head runs \GC{(2.6)}, which by
+\GC{Lemma~1}(i) is verbatim tabular MMD on the component matrix
+$\bar A_{kl}(m,\sigma)$. Player $1$'s equations are the same with $W_\mu$ in place
+of $Q_\nu$.
+
+\paragraph{Class.} $u \in \mathfrak{G}(M,\Sigma,\cN,\rho)$ means \GC{Definition~1}:
+conditions (C) uniform attracting cell structure with branch maps $\xi_j$,
+(D) branch regularity and small gain, (M) modal match, (B) atom regularity,
+(I) nondegeneracy of the atom matrix game $A_{jl} = u(p_j,r_l)$, (K) capacity and
+covering, (S) algorithmic caps, (W) weight non-degeneracy. We use all of them.
+
+\paragraph{Standing regularity.} By \GC{(2.4)}, for every $k \ge 1$ there is
+$C_k$ with $\|\nabla^k (Q_\nu)_s\|_\infty \le C_k \|u\|_\infty / (s^{\min}_0)^k$
+uniformly in $\nu \in \cN_1$ and $s \in \Sigma_0^{n_0}$. All constants below are
+therefore finite; the floor $s^{\min}_i > 0$ is used for exactly this.
+
+\section{The constants}\label{sec:constants}
+
+Everything in the proof is expressed in the following constants. They are stated
+for player $0$; player $1$'s are the same objects for $W_\mu$, with subscript $1$.
+All suprema are over $j \le M_0$, $a \in \cA_j$, $\nu \in \cN_1$,
+$s \in \Sigma_0^{n_0}$, $\bar a \in \cA_j$, unless said otherwise, and all are
+finite by the standing regularity.
+
+\begin{center}
+\begin{tabular}{@{}l p{0.72\textwidth}@{}}
+\hline
+symbol & meaning\\
+\hline
+$\alpha_0 > 0$ & linear star-concavity modulus, hypothesis~(L) below:
+  $\rho(r) \ge \alpha_0 r$ on $(0,\, \mathrm{diam}\,\cA]$.\\
+$L_0$ & $\sup \|\nabla^2_a Q^{\mathrm{reg}}_{\nu,s,\bar a}\|_{\mathrm{op}}$, a
+  Lipschitz constant for $\nabla_a Q^{\mathrm{reg}}$. Finite; $\le C_2\|u\|_\infty
+  /(s^{\min}_0)^2 + \tau^{\mathrm g}_0/(s^{\min}_0)^2$.\\
+$L^{(3)}_0$ & $\sup \|\nabla_a \Delta_a (Q_\nu)_s\|$.\\
+$\kappa_0 \ge 0$ & uniform branch curvature:
+  $\partial_d^2 (Q_\nu)_s(\xi_j) \le -\kappa_0$ for every coordinate $d$. See
+  Lemma~\ref{lem:curv}: $\kappa_0 \ge \alpha_0 - \tau^{\mathrm g}_0/(s^{\min}_0)^2$,
+  and $\kappa_0 = \alpha_0$ when $\tau^{\mathrm g}_0 = 0$.\\
+$w_{\min,0}$ & the weight floor of (W); $\bar w_0 := \max_k w^{(0)}_k \le 1$.\\
+$\chi_0$ & anisotropy ratio $\sup_{t,k} \bar\sigma_k/\underline\sigma_k$ where
+  $\underline\sigma_k = \min_d \sigma_{k,d}$, $\bar\sigma_k = \max_d\sigma_{k,d}$.
+  Equals $1$ for isotropic scales; bounded by $s^{\max}_0/s^{\min}_0$ always.\\
+$g^m_0$ & $\Lip$ of $\xi_j$ in the opponent's component means (max over the
+  opponent's components, $\ell_\infty$ on the index).\\
+$g^w_0$ & $\Lip$ of $\xi_j$ in the opponent's categorical weights ($\ell_1$).\\
+$g^\varsigma_0$ & $\Lip$ of $\xi_j$ in the opponent's scale variables
+  $(\sigma^{(1)}_l)^2/2$.\\
+$g^s_0$ & $\Lip$ of $\xi_j$ in its own scale variable $s^2/2$. By the implicit
+  function theorem at the branch, $g^s_0 \le L^{(3)}_0/\alpha_0$
+  (Lemma~\ref{lem:branchdrift}).\\
+$g^{\bar a}_0$ & $\Lip$ of $\xi_j$ in the magnet centre $\bar a$; $= 0$ when
+  $\tau^{\mathrm g}_0 = 0$, and $\le \tau^{\mathrm g}_0/
+  (\bar\sigma^2\alpha_0)$ in general.\\
+$R_0$ & invariance radius: $\inf_{j,\nu,s,\bar a}
+  \mathrm{dist}\big(\xi_j(\nu,s,\bar a),\, \partial\cA_j\big) > 0$.\\
+$\Lambda^{A}_0$ & $\sup_{k,l}\|\partial \bar A_{kl}/\partial m^{(0)}_k\|
+  = \sup \|\nabla (Q_{\nu_l})_{\sigma_k}(m_k)\|$, the sensitivity of the
+  component matrix to player $0$'s means.\\
+$\tau_i$ & shorthand for $\tau^{\mathrm{cat}}_i > 0$.\\
+$c^-_i,\, c^{\mathrm{qre}}_i,\, c^v_i$ & categorical block constants of
+  Lemma~\ref{lem:weight}: contraction rate to the QRE, Lipschitz constant of the
+  QRE map in the payoff matrix ($\le C/\tau_i$), and per-step weight displacement
+  per unit weight error.\\
+$\beta_i$ & the magnet brake factor $\big(1 - e^{-\eta_i\tau^{\mathrm g}_iT}\big)/
+  (\eta_i\tau^{\mathrm g}_iT) \in (0,1]$ of \GC{Lemma~6}.\\
+\hline
+\end{tabular}
+\end{center}
+
+\section{The additional hypotheses}\label{sec:hyp}
+
+Definition~\GC{1} is qualitative in three places: $\rho$ is only required
+positive, (D) only requires the round-trip gain of the \emph{mean} blocks to be a
+contraction, and (S) only requires the step sizes ``below the threshold set by
+the Lipschitz constant''. The following name the missing quantities. (L) is
+substantive; (D$^+$), (G) and (S$^+$) are the quantitative forms of hypotheses
+already present.
+
+\begin{conditions}
+\item[\textbf{(L) Linear modulus.}] $\displaystyle
+  \alpha_0 \;:=\; \inf_{0 < r \le \mathrm{diam}\,\cA} \frac{\rho(r)}{r} \;>\; 0$,
+  and likewise $\alpha_1 > 0$ for player $1$.
+
+\item[\textbf{(D$^+$) Quantified branch regularity.}] The constants
+  $g^m_i, g^w_i, g^\varsigma_i, g^s_i, g^{\bar a}_i$ of
+  Section~\ref{sec:constants} are finite. (This is (D), with the Lipschitz
+  dependence on $\nu$ resolved into its three arguments --- opponent means,
+  opponent weights, opponent scales --- rather than left implicit in a metric for
+  weak convergence.)
+
+\item[\textbf{(G) Small gain.}] The $4 \times 4$ nonnegative matrix
+  $\hat\Gamma$ of \eqref{eq:Gamma} below, indexed by the blocks
+  $(r_0, r_1, \delta_0, \delta_1)$, has spectral radius
+  $\varrho(\hat\Gamma) < 1$. It suffices that the magnet self-gains obey
+  \begin{equation}\label{eq:selfgain}
+    \frac{g^{\bar a}_i\, \bar w_i\, L_i\, \chi_i^3}{w_{\min,i}\, \alpha_i}
+    \;<\; 1 \qquad (i = 0,1),
+  \end{equation}
+  and every simple cycle of $\hat\Gamma$ has product $< 1$; the two cycles that
+  bind are
+  \begin{equation}\label{eq:cyclemean}
+    \frac{g^m_0\,g^m_1\,\bar w_0\,\bar w_1\,L_0\,L_1\,\chi_0^3\chi_1^3}
+         {w_{\min,0}\,w_{\min,1}\,\alpha_0\,\alpha_1} \;<\; 1
+    \tag{mean\,$\leftrightarrow$\,mean}
+  \end{equation}
+  and, for $\{i,i'\} = \{0,1\}$,
+  \begin{equation}\label{eq:cycleweight}
+    \frac{g^w_i\, c^v_{i'}\, c^{\mathrm{qre}}_{i'}\, \Lambda^A_i\,
+          \bar w_i\, L_i\, \chi_i^3}
+         {c^-_{i'}\, w_{\min,i}\, \alpha_i} \;<\; 1 .
+    \tag{mean\,$\leftrightarrow$\,weight}
+  \end{equation}
+
+\item[\textbf{(G$_\sigma$) Scale-drift dominance.}] With
+  \begin{equation}\label{eq:barr}
+    \bar r_i \;:=\; \frac{2}{\epsilon}\cdot
+    \frac{g^s_i\, \bar w_i\, L_i\, (s^{\max}_i)^2\, \chi_i^2
+        \;+\; g^\varsigma_i\, \bar w_{i'}\, L_{i'}\, (s^{\max}_{i'})^2\,
+              \chi_{i'}^2 \,\pi_{i'}/\pi_i}
+         {2\, w_{\min,i}\, \alpha_i}
+  \end{equation}
+  ($\epsilon$ and $\pi$ from Lemma~\ref{lem:sg}, $\{i,i'\} = \{0,1\}$), one has
+  \begin{equation}
+    \bar r_i \;<\; \min\Big\{\, \tfrac{1}{2}R_i,\;\; \delta^\kappa_i \,\Big\},
+    \qquad
+    \delta^\kappa_i \;:=\; \frac{\kappa_i}{2 L^{(3)}_i},
+  \end{equation}
+  and the initial means satisfy $\|m^{(i)}_k(0) - \xi_{j(k)}(0)\| < R_i - \bar r_i$
+  (the quantitative form of the covering clause of (K)).
+
+\item[\textbf{(S$^+$) Explicit step sizes.}] For $i = 0, 1$,
+  \begin{equation}\label{eq:step}
+    \eta_i \;<\; \frac{w_{\min,i}\,\alpha_i}
+                      {\bar w_i^2\, (s^{\max}_i)^2\, L_i^2\, \chi_i^2},
+  \end{equation}
+  which makes the second-order term of Lemma~\ref{lem:contract} at most half the
+  first-order one.
+
+\item[\textbf{(T) Refresh separation.}] The magnet period $T$ satisfies
+  $\eta_i\tau_i T \ge 1$: the categorical block contracts by a definite factor
+  between refreshes.
+\end{conditions}
+
+\begin{remark}[What (L) costs, and what it buys]\label{rem:L}
+(L) is the only hypothesis here that can exclude a game, and it excludes very
+little. On a bounded cell, $\alpha_0 > 0$ is equivalent to
+$\liminf_{r \to 0}\rho(r)/r > 0$ together with $\rho > 0$ on compacts, i.e.\ to
+\emph{nondegeneracy of the branch maximum}, uniformly in $(\nu,s,\bar a)$. It
+does not require $\alpha_0$ to be large: for the codebase's Gaussian-bump
+landscapes $\rho(r) \asymp (h/w^2)\,r\,e^{-r^2/2w^2}$, so
+$\alpha_0 \asymp (h/w^2)e^{-\mathrm{diam}^2/2w^2}$ --- exponentially small, exactly
+the ``dead zone is a rate, not a failure'' reading of $s_{\mathrm{reach}}$ in
+\GC{\S3.2}. Every conclusion below is uniform in $\alpha_0 > 0$; only the
+\emph{rate} degrades as $\alpha_0 \to 0$.
+
+What (L) buys is two things at once: it turns the Lyapunov estimate into a
+geometric contraction (Lemma~\ref{lem:contract}), and it supplies the uniform
+branch curvature $\kappa_0$ that the scale block needs
+(Lemma~\ref{lem:curv}) --- which would otherwise have to be assumed separately.
+\end{remark}
+
+\begin{remark}[Why (G) is a legitimate closure and not a restatement]
+\label{rem:G}
+The point of the constants in \eqref{eq:cyclemean}--\eqref{eq:cycleweight} is
+that \emph{no step size and no scale appears in them}. The block contraction
+rates are $\eta_i \sigma^2 w \alpha$ and the drifts injected between blocks are
+$\eta_{i'}\sigma'^2 w' L$; both $\eta$ and $\sigma^2$ therefore appear once in a
+numerator and once in a denominator around any cycle and cancel identically
+(Lemma~\ref{lem:scalefree}). This is why (G) can be checked once, offline, from
+game data --- and it is the reason the objection of \GC{\S5.6}, item~5 (``the
+scale collapse throttles transport by four orders of magnitude'') does not
+threaten the argument: it throttles the drift by the same four orders.
+\end{remark}
+
+\begin{remark}[$\tau^{\mathrm{cat}}$ is free]\label{rem:tau}
+\eqref{eq:cycleweight} is $\propto 1/\tau_{i'}$, since
+$c^{\mathrm{qre}}_{i'} \le C/\tau_{i'}$: the mean\,$\leftrightarrow$\,weight cycle
+is made a contraction by taking the categorical magnet temperature
+\emph{large}. \GC{\S5.6} item~1 records this as an unresolved tension, on the
+grounds that large $\tau^{\mathrm{cat}}$ should cost bias. It does not.
+Lemma~\ref{lem:weight}(iii) below is the reason: the magnet-refresh outer loop is
+a Bregman proximal-point iteration on the matrix game, whose fixed point is a
+Nash equilibrium of $\bar A$ for \emph{every} $\tau^{\mathrm{cat}} > 0$. So
+$\tau^{\mathrm{cat}}$ enters the convergence \emph{rate} of the outer loop and
+not the limit, and may be chosen as large as \eqref{eq:cycleweight} demands. The
+ordering of limits that \GC{\S5.6} could not settle is: pick $\tau^{\mathrm{cat}}$
+from \eqref{eq:cycleweight}, then $T$ from (T), then $\eta$ from
+\eqref{eq:step} --- in that order, with no circularity.
+\end{remark}
+
+\section{Preparatory lemmas}\label{sec:lemmas}
+
+\subsection{Regularity at the branch point}
+
+\begin{lemma}[Branch points are critical, and the gradient is dominated]
+\label{lem:dom}
+Assume (C). For every $j$, $\nu \in \cN_1$, $s \in \Sigma_0^{n_0}$ and
+$\bar a \in \cA_j$:
+\begin{enumerate}
+\item[(i)] $\nabla_a Q^{\mathrm{reg}}_{\nu,s,\bar a}(\xi_j) = 0$, and $\xi_j$ is
+  the unique critical point of $Q^{\mathrm{reg}}_{\nu,s,\bar a}$ in $\cA_j$ and
+  its unique maximiser over $\overline{\cA_j}$;
+\item[(ii)] $\big\|\nabla_a Q^{\mathrm{reg}}_{\nu,s,\bar a}(a)\big\|
+  \le L_0 \|a - \xi_j\|$ for every $a \in \cA_j$.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+(i) $\cA_j$ is open and $\xi_j \in \cA_j$, so for small $\epsilon > 0$ and any
+unit $v$ the point $a = \xi_j + \epsilon v$ lies in $\cA_j$, and \GC{(3.1)}
+reads $\ip{\nabla Q^{\mathrm{reg}}(\xi_j + \epsilon v)}{-\epsilon v} \ge
+\rho(\epsilon)\epsilon > 0$, i.e.\
+$\ip{\nabla Q^{\mathrm{reg}}(\xi_j + \epsilon v)}{v} \le -\rho(\epsilon) < 0$.
+Letting $\epsilon \downarrow 0$ and using continuity of $\nabla Q^{\mathrm{reg}}$
+gives $\ip{\nabla Q^{\mathrm{reg}}(\xi_j)}{v} \le 0$ for every $v$, hence
+$\nabla Q^{\mathrm{reg}}(\xi_j) = 0$. If $a \ne \xi_j$ were another critical
+point, \GC{(3.1)} at $a$ would give $0 \ge \rho(\|\xi_j - a\|)\|\xi_j - a\| > 0$.
+For the maximiser claim, integrate \GC{(3.1)} along the segment
+$a_t = \xi_j + t(a - \xi_j)$, $t \in (0,1]$, which lies in $\cA_j$ whenever
+$\cA_j$ is star-shaped about $\xi_j$ --- and it is, because \GC{(3.1)} makes the
+radial derivative of $Q^{\mathrm{reg}}$ toward $\xi_j$ strictly positive on all of
+$\cA_j$, so the flow of $\nabla Q^{\mathrm{reg}}$ from any $a \in \cA_j$ reaches
+$\xi_j$ without leaving $\cA_j$; along that flow $Q^{\mathrm{reg}}$ is strictly
+increasing, so $Q^{\mathrm{reg}}(a) < Q^{\mathrm{reg}}(\xi_j)$. Continuity extends
+the inequality to $\overline{\cA_j}$ with $\le$.
+
+(ii) $\nabla Q^{\mathrm{reg}}$ is $L_0$-Lipschitz on $\R^{n_0}$ by the definition
+of $L_0$ (the smoothed part by \GC{(2.4)}, the quadratic part exactly), and
+vanishes at $\xi_j$ by (i).
+\end{proof}
+
+\begin{lemma}[(L) gives uniform curvature at the branch]\label{lem:curv}
+Assume (C) and (L). Then for all $(\nu,s,\bar a)$,
+\[
+  \nabla^2_a Q^{\mathrm{reg}}_{\nu,s,\bar a}(\xi_j) \;\preceq\; -\alpha_0 I,
+  \qquad\text{hence}\qquad
+  \partial^2_d (Q_\nu)_s(\xi_j) \;\le\; -\alpha_0
+  \;+\; \frac{\tau^{\mathrm g}_0}{\bar\sigma_{d}^2}
+  \;=:\; -\kappa_0 \quad \text{for every } d .
+\]
+In particular $\kappa_0 = \alpha_0 > 0$ when $\tau^{\mathrm g}_0 = 0$, and
+$\kappa_0 > 0$ whenever the landscape rather than the magnet supplies the
+curvature, $\alpha_0 > \tau^{\mathrm g}_0/\bar\sigma_d^2$.
+\end{lemma}
+
+\begin{proof}
+Put $f = Q^{\mathrm{reg}}_{\nu,s,\bar a}$, $\xi = \xi_j$, and let $v$ be a unit
+vector, $a = \xi + \epsilon v$. By Lemma~\ref{lem:dom}(i) and a Taylor expansion,
+$\nabla f(a) = \epsilon \nabla^2 f(\xi) v + o(\epsilon)$, so \GC{(3.1)} with (L)
+gives
+\[
+  -\epsilon^2 \ip{\nabla^2 f(\xi) v}{v} + o(\epsilon^2)
+  \;=\; \ip{\nabla f(a)}{\xi - a}
+  \;\ge\; \rho(\epsilon)\epsilon \;\ge\; \alpha_0 \epsilon^2 .
+\]
+Dividing by $\epsilon^2$ and letting $\epsilon \downarrow 0$ yields
+$\ip{\nabla^2 f(\xi)v}{v} \le -\alpha_0$. The second claim is
+$\nabla^2 f = \nabla^2 (Q_\nu)_s - \tau^{\mathrm g}_0 \diag(\bar\sigma^{-2})$
+applied to $v = e_d$.
+\end{proof}
+
+\begin{lemma}[Branch drift in the scale variable is $O(1)$, not $O(s^{-2})$]
+\label{lem:branchdrift}
+Assume (C), (L), and that $(\nu,s,\bar a) \mapsto \xi_j$ is differentiable.
+Writing $t_d = s_d^2/2$,
+\[
+  \Big\|\frac{\partial \xi_j}{\partial t_d}\Big\|
+  \;\le\; \frac{L^{(3)}_0}{\alpha_0} \;=:\; g^s_0 .
+\]
+\end{lemma}
+
+\begin{proof}
+Differentiate $\nabla_a Q^{\mathrm{reg}}(\xi_j(t)) = 0$ in $t_d$. Since
+$\partial_{t_d}(Q_\nu)_s = \partial_d^2 (Q_\nu)_s$ (heat equation) and the
+magnet term does not depend on $s$,
+\[
+  \nabla^2_a Q^{\mathrm{reg}}(\xi_j)\, \frac{\partial\xi_j}{\partial t_d}
+  \;+\; \nabla_a\, \partial_d^2 (Q_\nu)_s(\xi_j) \;=\; 0 ,
+\]
+and $\nabla^2_a Q^{\mathrm{reg}}(\xi_j) \preceq -\alpha_0 I$ is invertible with
+$\|(\nabla^2)^{-1}\| \le 1/\alpha_0$ by Lemma~\ref{lem:curv}.
+\end{proof}
+
+\begin{remark}
+Lemma~\ref{lem:branchdrift} is small but load-bearing. Measured in the
+\emph{log}-scale variable $\rho = \log s$ that the algorithm actually updates,
+the branch drift is $\|\partial\xi_j/\partial\rho_d\| = s_d^2\,
+\|\partial \xi_j/\partial t_d\| \le s_d^2 g^s_0$: it carries a factor $s^2$. That
+factor is the same one carried by the Fisher preconditioner in
+\eqref{eq:meanupd}, and their cancellation is what makes
+Lemma~\ref{lem:scalefree} work.
+\end{remark}
+
+\subsection{The mean block}
+
+\begin{lemma}[One-step contraction toward a frozen branch point]
+\label{lem:contract}
+Assume (C), (L), (W) and \eqref{eq:step}. Fix a component $k$ of player $0$ in
+cell $\cA_j$, let $\xi = \xi_j(\nu,\sigma_k,\bar a_k)$ be the branch point for the
+\emph{current} $(\nu,\sigma_k,\bar a_k)$, and set
+$\tilde r_k := \|m_k - \xi\|_{\Sigma_k^{-1}}$. Then $m_k^+$ of
+\eqref{eq:meanupd} satisfies
+\begin{equation}\label{eq:contract}
+  \|m^+_k - \xi\|_{\Sigma_k^{-1}}
+  \;\le\; \Big(1 - \tfrac{1}{2}\eta_0\, w_{\min,0}\, \alpha_0\,
+  \underline\sigma_k^2\Big)\, \tilde r_k .
+\end{equation}
+Moreover the Euclidean displacement obeys
+\begin{equation}\label{eq:vel}
+  \|m^+_k - m_k\| \;\le\; \eta_0\, \bar w_0\, \bar\sigma_k^{3}\, L_0\, \tilde r_k .
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+Write $d = m_k - \xi$, $G = \nabla_a Q^{\mathrm{reg}}(m_k)$, $w = w^{(0)}_k \in
+[w_{\min,0}, \bar w_0]$, and $V = \tfrac12\|d\|^2_{\Sigma_k^{-1}}$. Then
+\[
+  \tfrac12\|m^+_k - \xi\|^2_{\Sigma_k^{-1}}
+  = \tfrac12\|d + \eta_0 w \Sigma_k G\|^2_{\Sigma_k^{-1}}
+  = V + \eta_0 w \ip{G}{d} + \tfrac{\eta_0^2 w^2}{2}\|G\|^2_{\Sigma_k} .
+\]
+By (C) and (L), $\ip{G}{d} = -\ip{G}{\xi - m_k} \le -\rho(\|d\|)\|d\| \le
+-\alpha_0\|d\|^2$. By Lemma~\ref{lem:dom}(ii), $\|G\|^2_{\Sigma_k} \le
+\bar\sigma_k^2 L_0^2 \|d\|^2$. Also $\|d\|^2 \ge \underline\sigma_k^2
+\|d\|^2_{\Sigma_k^{-1}} = 2\underline\sigma_k^2 V$ and $\|d\|^2 \le
+\bar\sigma_k^2\|d\|^2_{\Sigma_k^{-1}} = 2\bar\sigma_k^2 V$. Hence
+\[
+  \tfrac12\|m^+_k - \xi\|^2_{\Sigma_k^{-1}}
+  \;\le\; V\Big(1 - 2\eta_0 w_{\min,0}\alpha_0\underline\sigma_k^2
+  + \eta_0^2 \bar w_0^2 \bar\sigma_k^4 L_0^2\Big).
+\]
+By \eqref{eq:step}, $\eta_0 \bar w_0^2\bar\sigma_k^4L_0^2 <
+w_{\min,0}\alpha_0 \underline\sigma_k^2$ (using
+$\bar\sigma_k^4 \le (s^{\max}_0)^2\chi_0^2\underline\sigma_k^2$), so the bracket is
+at most $1 - \eta_0 w_{\min,0}\alpha_0\underline\sigma_k^2$; taking square roots
+and using $\sqrt{1-x} \le 1 - x/2$ gives \eqref{eq:contract}. For
+\eqref{eq:vel}, $\|m^+_k - m_k\| = \eta_0 w\|\Sigma_k G\| \le \eta_0\bar w_0
+\bar\sigma_k^2 L_0\|d\| \le \eta_0\bar w_0\bar\sigma_k^3 L_0 \tilde r_k$.
+\end{proof}
+
+\begin{lemma}[Cell invariance]\label{lem:inv}
+Under the hypotheses of Lemma~\ref{lem:contract}, if at every step the
+\emph{moving} tracking error satisfies $\|m_k(t) - \xi_j(t)\| \le R_0$, then
+$m_k(t) \in \cA_j$ for all $t$: the cell assignment $k \mapsto j(k)$ fixed at
+initialisation never changes.
+\end{lemma}
+
+\begin{proof}
+$\|m_k - \xi_j\| \le R_0 \le \mathrm{dist}(\xi_j, \partial\cA_j)$ places $m_k$ in
+the ball $B(\xi_j, R_0) \subseteq \cA_j$ by the definition of $R_0$.
+\end{proof}
+
+\begin{lemma}[Mean block, moving target]\label{lem:mean}
+Under (C), (L), (D$^+$), (W), \eqref{eq:step}, and while $m_k(t) \in \cA_j$, the
+quantity $\tilde r_0(t) := \max_k \|m^{(0)}_k(t) - \xi_{j(k)}(t)\|_{\Sigma_k^{-1}}$
+obeys
+\begin{align}
+  \tilde r_0(t+1) \;\le\;& \big(1 - \eta_0 a_0\big)\, \tilde r_0(t)
+  \;+\; \frac{g^m_0}{\underline\sigma_0}\, \eta_1 \bar w_1\bar\sigma_1^3 L_1\,
+        \tilde r_1(t)
+  \;+\; \frac{g^w_0}{\underline\sigma_0}\, \eta_1 \tau_1 c^v_1\, \delta_1(t)
+  \nonumber\\
+  &\;+\; \frac{1}{\underline\sigma_0}\Big[
+        g^s_0\,\big|\Delta (\sigma_0^2/2)\big|
+      + g^\varsigma_0\,\big|\Delta (\sigma_1^2/2)\big| \Big],
+  \label{eq:meaniss}
+\end{align}
+where $a_0 := \tfrac12 w_{\min,0}\alpha_0\underline\sigma_0^2
+- g^{\bar a}_0\bar w_0\bar\sigma_0^3 L_0 / \underline\sigma_0$, $\underline\sigma_0
+= \min_k \underline\sigma_k$, $\bar\sigma_0 = \max_k\bar\sigma_k$, and $\delta_1$
+is the categorical error of Lemma~\ref{lem:weight}.
+\end{lemma}
+
+\begin{proof}
+Insert the frozen-target step of Lemma~\ref{lem:contract} and then move the
+target:
+\[
+  \|m^+_k - \xi^+_j\|_{\Sigma_k^{-1}}
+  \le \|m^+_k - \xi_j\|_{\Sigma_k^{-1}}
+    + \|\xi^+_j - \xi_j\|_{\Sigma_k^{-1}}
+  \le \big(1 - \tfrac{\eta_0}{2} w_{\min}\alpha_0\underline\sigma_k^2\big)\tilde r_k
+    + \frac{\|\xi^+_j - \xi_j\|}{\underline\sigma_k}.
+\]
+By (D$^+$) the target displacement decomposes over its arguments,
+\[
+  \|\xi^+_j - \xi_j\| \le g^m_0 \max_l \|m^{(1),+}_l - m^{(1)}_l\|
+   + g^w_0 \|v^+ - v\|_1
+   + g^\varsigma_0 |\Delta(\sigma_1^2/2)|
+   + g^s_0 |\Delta(\sigma_0^2/2)|
+   + g^{\bar a}_0 \|\bar a^+_k - \bar a_k\| ,
+\]
+and the five displacements are bounded by \eqref{eq:vel} for player $1$, by
+Lemma~\ref{lem:weight}(iv) for the weights, by the scale update
+\eqref{eq:scaleupd} for the two scale terms, and --- for the magnet centre --- by
+the observation that $\bar a_k$ is refreshed to $m_k$ every $T$ steps, so the
+total displacement of $\bar a_k$ over any window of $T$ steps is at most the total
+displacement of $m_k$ over the previous window, i.e.\ at most
+$T\eta_0 \bar w_0 \bar\sigma_0^3 L_0 \sup \tilde r_0$; amortised over the window
+this is the term absorbed into $a_0$. (For $\tau^{\mathrm g}_0 = 0$,
+$g^{\bar a}_0 = 0$ and no amortisation is needed; \eqref{eq:meaniss} then holds
+step-by-step rather than window-by-window.)
+\end{proof}
+
+\subsection{The scale block}
+
+\begin{lemma}[Scale descent and finite-time arrival at the floor]
+\label{lem:scale}
+Assume (C), (L), (W), and $\kappa_0 > 0$. If at time $t$ every component of
+player $0$ satisfies $\|m_k - \xi_{j(k)}\| \le \delta^\kappa_0 =
+\kappa_0/(2L^{(3)}_0)$, then every coordinate of every log-scale strictly
+decreases,
+\begin{equation}\label{eq:scaledesc}
+  \rho^{(0)}_{k,d}(t+1) \;\le\; \Big[\rho^{(0)}_{k,d}(t)
+  \;-\; \tfrac{\eta_0}{4}\,\beta_0\, w_{\min,0}\, \kappa_0\, \sigma_{k,d}^2(t)
+  \Big]_{\Sigma_0} ,
+\end{equation}
+and consequently, if the hypothesis persists, $\sigma^{(0)}_{k,d}$ reaches the
+floor $s^{\min}_0$ in at most
+\[
+  T^\sigma_0 \;=\; \frac{4}{\eta_0\beta_0 w_{\min,0}\kappa_0 (s^{\min}_0)^2}
+  \, \log\frac{s^{\max}_0}{s^{\min}_0}
+\]
+steps, after which it is constant and $\Delta(\sigma_0^2/2) \equiv 0$.
+\end{lemma}
+
+\begin{proof}
+By Lemma~\ref{lem:curv}, $\partial_d^2 (Q_\nu)_{\sigma_k}(\xi_j) \le -\kappa_0$.
+By the definition of $L^{(3)}_0$, $|\partial_d^2 (Q_\nu)_{\sigma_k}(m_k) -
+\partial_d^2 (Q_\nu)_{\sigma_k}(\xi_j)| \le L^{(3)}_0\|m_k - \xi_j\| \le
+\kappa_0/2$, so $\partial_d^2 (Q_\nu)_{\sigma_k}(m_k) \le -\kappa_0/2$. Inserting
+this in \eqref{eq:scaleupd} and using $w^{(0)}_k \ge w_{\min,0}$ bounds the
+landscape term by $-\tfrac{\eta_0}{4} w_{\min,0}\kappa_0\sigma_{k,d}^2$. The
+magnet term of \eqref{eq:scaleupd} is $\tfrac{\eta_0}{2}\tau^{\mathrm g}_0
+w_k(1 - \sigma_{k,d}^2/\bar\sigma_{k,d}^2)$, which is a logistic relaxation
+toward the snapshot $\bar\sigma_{k,d}$; by \GC{Lemma~6}(ii) its effect over a
+refresh cycle is exactly to rescale the descent rate by
+$\beta_0 \in (0,1]$, giving \eqref{eq:scaledesc}. The arrival time follows by
+summing: $\rho$ falls by at least $\tfrac{\eta_0}{4}\beta_0 w_{\min,0}\kappa_0
+(s^{\min}_0)^2$ per step while above the floor, and the total distance to fall is
+$\log(s^{\max}_0/s^{\min}_0)$. Once at the floor the clip holds it there, because
+the unclipped increment is negative.
+\end{proof}
+
+\begin{lemma}[Scale-induced tracking error is $O(\sigma^2)$]\label{lem:scalefree}
+The exogenous drift terms in \eqref{eq:meaniss} obey
+\[
+  \frac{1}{\underline\sigma_0}\Big[
+        g^s_0\big|\Delta(\sigma_0^2/2)\big|
+      + g^\varsigma_0\big|\Delta(\sigma_1^2/2)\big|\Big]
+  \;\le\; \frac{\eta_0}{2}\, \frac{g^s_0 \bar w_0 \bar\sigma_0^4 L_0}
+                                   {\underline\sigma_0}
+        + \frac{\eta_1}{2}\, \frac{g^\varsigma_0 \bar w_1 \bar\sigma_1^4 L_1}
+                                   {\underline\sigma_0} ,
+\]
+so the residual tracking error they can sustain against the contraction rate
+$\eta_0 a_0 \asymp \eta_0 w_{\min,0}\alpha_0\underline\sigma_0^2$ is, in Euclidean
+units,
+\[
+  \bar\sigma_0 \cdot \frac{\text{drift}}{\eta_0 a_0}
+  \;\asymp\; \frac{g^s_0 \bar w_0 L_0\, \bar\sigma_0^2 \chi_0^2}
+                  {w_{\min,0}\alpha_0}
+   \;+\; \frac{\eta_1}{\eta_0}\,
+         \frac{g^\varsigma_0 \bar w_1 L_1\, \bar\sigma_1^4 \chi_0^2}
+              {w_{\min,0}\alpha_0\,\bar\sigma_0^2} ,
+\]
+i.e.\ it is $O(\sigma^2)$ and \emph{shrinks} as the scales fall.
+\end{lemma}
+
+\begin{proof}
+$|\Delta(\sigma_{k,d}^2/2)| = \sigma_{k,d}^2 |\Delta\rho_{k,d}| \le
+\sigma_{k,d}^2 \cdot \tfrac{\eta_0}{2} \bar w_0 \sigma_{k,d}^2 L_0$ from
+\eqref{eq:scaleupd} with $|\partial_d^2 (Q_\nu)_s| \le L_0$ (and the magnet term
+only reduces the increment, by \GC{Lemma~6}). The displayed ratio follows on
+dividing by $\eta_0 a_0$ and multiplying by $\bar\sigma_0$ to convert
+$\|\cdot\|_{\Sigma^{-1}}$ back to $\|\cdot\|$.
+\end{proof}
+
+\begin{remark}[Resolution of \GC{\S5.6}, item~5]\label{rem:gap5}
+That item objects that Steps~1 and~2 of the skeleton proof are not sequential,
+because the mean contraction rate carries $\sigma^2$ and falls by four orders of
+magnitude as the scale collapses. Lemmas~\ref{lem:branchdrift} and
+\ref{lem:scalefree} answer it: the branch drift generated by the scale collapse
+carries $\sigma^4$ --- one factor $\sigma^2$ from the log-scale to scale change of
+variables and one from the Fisher preconditioner in the scale update --- so the
+\emph{ratio} of drift to contraction carries $\sigma^2$ and improves. Transport is
+not throttled relative to what it is chasing; both slow down together, and the
+one that slows faster is the disturbance. The same cancellation, applied to the
+opponent's mean velocity, is what makes the cycle gains of (G) scale-free
+(Remark~\ref{rem:G}).
+\end{remark}
+
+\subsection{The weight block}
+
+Let $\bar A$ be the component matrix \GC{(2.9)}, let
+$\mathrm{QRE}_\tau(\bar A, \bar w, \bar v)$ be the unique solution of the
+$\tau$-entropy-regularised matrix game with magnet $(\bar w, \bar v)$, and let
+$\mathrm{Nash}(\bar A)$ be the set of Nash equilibria of $\bar A$. Write
+$\delta_0 := \|w^{(0)} - w^{\mathrm{qre}}\|_1$ for the inner tracking error of
+player $0$'s categorical head, and $D_0 := \mathrm{dist}_1(\bar w^{(0)},
+\mathrm{Nash}(\bar A))$ for the outer error.
+
+\begin{lemma}[Categorical block]\label{lem:weight}
+Assume $\tau_i > 0$ and (T). With $\bar A$ and the magnet held fixed:
+\begin{enumerate}
+\item[(i)] \emph{(inner contraction)} the iteration \GC{(2.6)} is the Bregman
+  proximal step for the $\tau$-regularised bilinear game, hence contracts to
+  $\mathrm{QRE}_\tau$ at a linear rate: $\delta_i(t+1) \le
+  (1 - \eta_i\tau_i c^-_i)\,\delta_i(t)$ with $c^-_i > 0$ absolute;
+\item[(ii)] \emph{(sensitivity)} $\mathrm{QRE}_\tau$ is
+  $c^{\mathrm{qre}}_i$-Lipschitz in $\bar A$ with $c^{\mathrm{qre}}_i \le C/\tau_i$,
+  $C$ absolute;
+\item[(iii)] \emph{(outer loop)} the magnet-refresh map $(\bar w,\bar v) \mapsto
+  \mathrm{QRE}_\tau(\bar A, \bar w, \bar v)$ is the resolvent of the monotone
+  operator of the bilinear game in the KL geometry; its iteration is Bregman
+  proximal point, its fixed points are exactly $\mathrm{Nash}(\bar A)$ for every
+  $\tau > 0$, and since the associated variational inequality is polyhedral
+  (hence metrically subregular), $D_i(n) \to 0$ at a linear rate in the number
+  $n$ of refreshes;
+\item[(iv)] \emph{(velocity)} the per-step weight displacement obeys
+  $\|w^{(i),+} - w^{(i)}\|_1 \le \eta_i\tau_i c^v_i \delta_i$;
+\item[(v)] \emph{(ISS)} for time-varying $\bar A(t)$,
+  \[
+    \delta_i(t+1) \;\le\; (1 - \eta_i\tau_i c^-_i)\,\delta_i(t)
+    \;+\; c^{\mathrm{qre}}_i \big\|\bar A(t+1) - \bar A(t)\big\| .
+  \]
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+(i)--(ii) are the tabular MMD statements of Sokota et al.\ (2023) applied, via
+\GC{Lemma~1}(i), to the finite zero-sum game $\bar A$; the lift of a bilinear
+zero-sum game is monotone, and the $\tau$-regularised game is $\tau$-strongly
+monotone in the KL geometry, which gives both the linear inner rate and the
+$1/\tau$ sensitivity of its unique solution to a perturbation of the payoff.
+(iii): a fixed point of the refresh map satisfies $z = \mathrm{QRE}_\tau(\bar
+A, z)$, whose first-order condition is exactly the variational inequality of
+$\bar A$ --- the regularisation term vanishes at $\bar w = w$ --- so the fixed
+points are the Nash equilibria for every $\tau > 0$; convergence of Bregman
+proximal point on a monotone operator is standard, and linear convergence follows
+from metric subregularity, which holds automatically here because the operator
+is polyhedral (Robinson). (iv) The step \GC{(2.6)} moves the logits by
+$\eta_i(q - \tau_i\log(w/\bar w))/(1 + \eta_i\tau_i)$, which vanishes at the QRE;
+$\ell_1$-Lipschitzness of $\mathrm{softmax}$ on the region $w \ge w_{\min,i}$
+supplied by (W) gives the constant $c^v_i$. (v) Combine (i) and (ii) with the
+triangle inequality through the moved QRE.
+\end{proof}
+
+\subsection{A discrete-time small-gain lemma}
+
+\begin{lemma}[Weighted max-form small gain]\label{lem:sg}
+Let $x(t) \in \R^N_{\ge 0}$ satisfy, for all $t$ and $i$,
+\[
+  x_i(t+1) \;\le\; \big(1 - a_i(t)\big)x_i(t)
+  \;+\; \sum_{j \ne i} b_{ij}(t)\, x_j(t) \;+\; d_i(t),
+\]
+with $a_i(t) \in (0,1)$, $b_{ij}(t), d_i(t) \ge 0$. Suppose the matrix
+$\hat\Gamma$ with entries $\hat\Gamma_{ij} := \sup_t b_{ij}(t)/a_i(t)$
+($i \ne j$, $\hat\Gamma_{ii} := 0$) has $\varrho(\hat\Gamma) < 1$. Then there are
+$\pi \in \R^N_{>0}$ and $\epsilon \in (0,1)$ with $\sum_{j\ne i}
+\hat\Gamma_{ij}\pi_j \le (1-\epsilon)\pi_i$ for all $i$, and
+$V(t) := \max_i x_i(t)/\pi_i$ satisfies
+\[
+  V(t+1) \;\le\; \big(1 - \epsilon\, \underline a(t)\big)\,V(t)
+  \;+\; \max_i \frac{d_i(t)}{\pi_i},
+  \qquad \underline a(t) := \min_i a_i(t) .
+\]
+Consequently: (a) if $d \equiv 0$ and $\sum_t \underline a(t) = \infty$ then
+$V(t) \to 0$; (b) if $\max_i d_i(t)/\pi_i \le \theta\,\epsilon\,\underline a(t)$
+for all $t$, then $\limsup_t V(t) \le \theta$, and the ball $\{V \le \theta\}$ is
+forward invariant.
+\end{lemma}
+
+\begin{proof}
+Existence of $\pi,\epsilon$: choose $\epsilon \in (0,1)$ small enough that
+$\varrho\big(\hat\Gamma/(1-\epsilon)\big) < 1$, put
+$\hat\Gamma' := \hat\Gamma/(1-\epsilon)$ and
+$\pi := (I - \hat\Gamma')^{-1}\mathbf{1} = \sum_{n\ge0}(\hat\Gamma')^n\mathbf{1}$,
+a convergent Neumann series with $\pi \ge \mathbf{1} > 0$. Then
+$\hat\Gamma'\pi = \pi - \mathbf{1} \le \pi$, so
+$\hat\Gamma\pi \le (1-\epsilon)\pi$ componentwise. Then
+\[
+  \frac{x_i(t+1)}{\pi_i}
+  \le (1-a_i)\frac{x_i}{\pi_i}
+    + \frac{a_i}{\pi_i}\sum_{j\ne i}\hat\Gamma_{ij}\pi_j\frac{x_j}{\pi_j}
+    + \frac{d_i}{\pi_i}
+  \le (1-a_i)V + (1-\epsilon)a_i V + \frac{d_i}{\pi_i}
+  = (1-\epsilon a_i)V + \frac{d_i}{\pi_i},
+\]
+and $1 - \epsilon a_i \le 1 - \epsilon\underline a$. Claim (a) is
+$V(t) \le V(0)\prod_{u<t}(1 - \epsilon\underline a(u)) \le
+V(0)e^{-\epsilon\sum \underline a}$. Claim (b): if $V(t) \le \theta$ then
+$V(t+1) \le (1-\epsilon\underline a)\theta + \theta\epsilon\underline a = \theta$;
+and if $V(t) > \theta$ then $V(t+1) \le V(t) - \epsilon\underline a(V(t)-\theta)$,
+which drives $V$ into the ball.
+\end{proof}
+
+\begin{remark}
+For $N = 2$ with zero diagonal, $\varrho(\hat\Gamma) < 1$ is exactly
+$\hat\Gamma_{12}\hat\Gamma_{21} < 1$, so the two-block condition
+\eqref{eq:cyclemean} is not merely sufficient. For $N = 4$, ``every simple cycle
+has product $< 1$'' is necessary for $\varrho < 1$ and sufficient for the
+max-form interconnection; for the sum form used here we take
+$\varrho(\hat\Gamma) < 1$ itself as the hypothesis (G), which is a $4\times4$
+eigenvalue computation from the constants of Section~\ref{sec:constants}.
+\end{remark}
+
+\subsection{The limiting configuration}
+
+\begin{lemma}[Self-consistent configuration: existence, uniqueness, and
+$O(s^2)$ location]\label{lem:fp}
+Assume (C), (L), (D$^+$), (M), (I) and (G). Fix the scales at the floor
+$s^{\min} = (s^{\min}_0, s^{\min}_1)$ and define the \emph{consistency map}
+$\cT_{s^{\min}}$ on $\big(\prod_j \cA_j\big) \times \Delta_{M_0} \times
+\big(\prod_l \cB_l\big) \times \Delta_{M_1}$ by
+\[
+  \cT_{s^{\min}}(m, w, n, v) \;=\;
+  \Big(\ \big(\xi_j(\nu(n,v), s^{\min}_0, m_j)\big)_j,\ \
+  \mathrm{Nash}_0\big(\bar A(m,n,s^{\min})\big),\ \ \cdots \Big),
+\]
+the omitted entries being player $1$'s two analogues. Then
+\begin{enumerate}
+\item[(i)] $\cT_{s^{\min}}$ is a contraction in the norm
+  $\|(m,w,n,v)\|_\pi := \max\{\|m\|_\infty/\pi_1, \|w\|_1/\pi_3,
+  \|n\|_\infty/\pi_2, \|v\|_1/\pi_4\}$, with modulus $1 - \epsilon$, where
+  $\pi,\epsilon$ are those of Lemma~\ref{lem:sg}; hence it has a unique fixed
+  point $z^\infty_{s^{\min}}$;
+\item[(ii)] $\|z^\infty_{s^{\min}} - z^\star\|_\pi = O\big((s^{\min}_0)^2 +
+  (s^{\min}_1)^2\big)$, where $z^\star = (p, w^\star, r, v^\star)$ collects the
+  equilibrium atoms and weights.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+(i) The Lipschitz constants of the four coordinate maps of $\cT$ are precisely
+the numerators $b_{ij}$ of the gain matrix $\hat\Gamma$ of \eqref{eq:Gamma},
+divided by the corresponding block ``gain to steady state'' $a_i$: for the mean
+coordinates, the steady state of \eqref{eq:meaniss} with the drift terms removed
+is $\tilde r_0 = (\sum_j b_{0j}x_j)/a_0$; for the weight coordinates it is
+Lemma~\ref{lem:weight}(ii)--(iii). So $\cT$ has $\pi$-weighted Lipschitz constant
+$\le \max_i \sum_{j} \hat\Gamma_{ij}\pi_j/\pi_i \le 1-\epsilon$ by
+Lemma~\ref{lem:sg}. Banach gives the fixed point; the domain is a product of
+compact convex sets mapped into itself by (C) (branch points lie in their cells)
+and by the simplex structure.
+
+(ii) By (M), $\xi_j(\nu^\star, s^{\min}_0, \cdot) = p_j + O((s^{\min}_0)^2)$, and
+by (I) with $\bar A(p, r, s^{\min}) = A + O((s^{\min})^2)$ --- the $O(s^2)$ being
+the smoothing of a $C^2$ landscape at its atoms, (B) --- nondegeneracy is an open
+condition, so $\mathrm{Nash}(\bar A)$ is single-valued near $A$ and
+$\mathrm{Nash}(\bar A(p,r,s^{\min})) = w^\star + O((s^{\min})^2)$. Hence
+$\|\cT_{s^{\min}}(z^\star) - z^\star\|_\pi = O((s^{\min}_0)^2 + (s^{\min}_1)^2)$:
+$z^\star$ is an approximate fixed point. The standard contraction estimate
+$\|z^\infty - z^\star\| \le \|\cT(z^\star) - z^\star\|/\epsilon$ finishes.
+\end{proof}
+
+\begin{lemma}[Exploitability at a self-consistent configuration]\label{lem:exp}
+Let $(\mu,\nu)$ be the mixture pair induced by a fixed point of
+$\cT_{s^{\min}}$: player $0$'s components sit at the branch points
+$\xi_j(\nu, s^{\min}_0)$ with weights a Nash of $\bar A$, and symmetrically for
+player $1$. Assume (C), (I) and (B). Then, with $a^\star \in \argmax_\cA Q_\nu$
+and $b^\star \in \argmax_\cB W_\mu$,
+\[
+  \varepsilon(\mu,\nu)
+  \;=\; \Big[\max_\cA Q_\nu - \max_\cA (Q_\nu)_{s^{\min}_0}\Big]
+      + \Big[\max_\cB W_\mu - \max_\cB (W_\mu)_{s^{\min}_1}\Big]
+  \;\le\; \tfrac{1}{2}\big(s^{\min}_0\big)^2 \big|\Delta Q_\nu(a^\star)\big|
+      \;+\; \tfrac{1}{2}\big(s^{\min}_1\big)^2 \big|\Delta W_\mu(b^\star)\big|
+      \;+\; O(s^4).
+\]
+Moreover the first bracket is also bounded by $\min_j \big[Q_\nu(p_j) -
+(Q_\nu)_{s^{\min}_0}(p_j)\big]$, and at $\nu = \nu^\star$ all $M_0$ of these
+quantities coincide.
+\end{lemma}
+
+\begin{proof}
+Player $0$'s regret is $\max_\cA Q_\nu - \E_\mu Q_\nu$, and
+$\E_\mu Q_\nu = \sum_j w_j (Q_\nu)_{s^{\min}_0}(\xi_j)$ by \GC{Lemma~1}. Write
+$q_j := (Q_\nu)_{s^{\min}_0}(\xi_j) = (\bar A v)_j$. Since $w$ is a Nash of
+$\bar A$ and, by (I) plus Lemma~\ref{lem:fp}(ii), fully mixed, complementary
+slackness makes all $q_j$ equal to $\max_j q_j$; hence $\E_\mu Q_\nu = \max_j q_j$.
+By Lemma~\ref{lem:dom}(i), $\xi_j$ maximises $(Q_\nu)_{s^{\min}_0}$ over
+$\overline{\cA_j}$, and the cells cover $\cA$ up to a null set, so by continuity
+$\max_j q_j = \max_\cA (Q_\nu)_{s^{\min}_0}$. This gives the displayed identity.
+For the bound, $(Q_\nu)_s \le \max Q_\nu$ pointwise (an average of values of
+$Q_\nu$), so the bracket is nonnegative; and evaluating $(Q_\nu)_s$ at any point
+$a$ gives $\max_\cA (Q_\nu)_s \ge (Q_\nu)_s(a) = Q_\nu(a) + \tfrac{s^2}{2}\Delta
+Q_\nu(a) + O(s^4)$ by (B). Taking $a = a^\star$ gives the stated bound; taking
+$a = p_j$ and minimising over $j$ gives the second. At $\nu = \nu^\star$ all $p_j$
+are maximisers of $Q_{\nu^\star}$ (\GC{Remark~1}) and, by the same complementary
+slackness in the smoothed game, all $(Q_{\nu^\star})_s(p_j)$ agree, so the
+deficits agree.
+\end{proof}
+
+\begin{remark}[A sharper constant than the one previously stated]
+\GC{Theorem~1} gives the constant $\tfrac12\sum_j w^\star_j
+|\nabla^2 Q_{\nu^\star}(p_j)|$, i.e.\ the \emph{weighted average} of the per-atom
+smoothing deficits. Lemma~\ref{lem:exp} shows the exploitability equals a deficit
+at a \emph{single} point --- $\max Q_\nu - \max (Q_\nu)_s$ --- because the
+categorical head equalises the cells exactly. The two agree at the equilibrium
+(all deficits are then equal), so this is a sharpening off the limit rather than
+a correction, but it is the form that generalises: it holds with $\min_j$ in place
+of $\sum_j w_j$, and it needs no smoothness away from the maximiser.
+\end{remark}
+
+\section{The theorem}\label{sec:thm}
+
+Assemble the four ISS blocks with error vector
+$x = (\tilde r_0, \tilde r_1, \delta_0, \delta_1)$. Lemma~\ref{lem:mean} for the
+two mean blocks and Lemma~\ref{lem:weight}(v) for the two weight blocks give the
+comparison system of Lemma~\ref{lem:sg} with
+\[
+  a_{r_i} = \eta_i a_i, \qquad a_{\delta_i} = \eta_i\tau_i c^-_i,
+\]
+and the gain matrix $\hat\Gamma_{ij} = \sup_t b_{ij}(t)/a_i(t)$ equal, in the
+block order $(r_0, r_1, \delta_0, \delta_1)$, to
+\begin{equation}\label{eq:Gamma}
+  \hat\Gamma \;=\;
+  \begin{pmatrix}
+    0
+      & \dfrac{\eta_1 g^m_0 \bar w_1 \bar\sigma_1^3 L_1}
+              {\eta_0 a_0 \underline\sigma_0}
+      & 0
+      & \dfrac{\eta_1 g^w_0 \tau_1 c^v_1}{\eta_0 a_0 \underline\sigma_0}
+    \\[10pt]
+    \dfrac{\eta_0 g^m_1 \bar w_0 \bar\sigma_0^3 L_0}
+          {\eta_1 a_1 \underline\sigma_1}
+      & 0
+      & \dfrac{\eta_0 g^w_1 \tau_0 c^v_0}{\eta_1 a_1 \underline\sigma_1}
+      & 0
+    \\[10pt]
+    \dfrac{c^{\mathrm{qre}}_0 \Lambda^A_0 \bar w_0 \bar\sigma_0^3 L_0}
+          {\tau_0 c^-_0}
+      & \dfrac{\eta_1 c^{\mathrm{qre}}_0 \Lambda^A_1 \bar w_1 \bar\sigma_1^3 L_1}
+              {\eta_0 \tau_0 c^-_0}
+      & 0 & 0
+    \\[10pt]
+    \dfrac{\eta_0 c^{\mathrm{qre}}_1 \Lambda^A_0 \bar w_0 \bar\sigma_0^3 L_0}
+          {\eta_1 \tau_1 c^-_1}
+      & \dfrac{c^{\mathrm{qre}}_1 \Lambda^A_1 \bar w_1 \bar\sigma_1^3 L_1}
+              {\tau_1 c^-_1}
+      & 0 & 0
+  \end{pmatrix}.
+\end{equation}
+The exogenous inputs $d_{r_i}$ are the scale-drift terms of
+Lemma~\ref{lem:scalefree}; $d_{\delta_i}$ collects the scale-induced drift of
+$\bar A$, of the same order.
+
+\begin{lemma}[The cycle gains are scale-free and step-size-free]
+\label{lem:cyclefree}
+Every simple cycle of \eqref{eq:Gamma} has a product in which all $\eta_i$ and
+all $\sigma$'s cancel, up to the anisotropy ratios $\chi_i$. In particular the
+two two-cycles are \eqref{eq:cyclemean} and \eqref{eq:cycleweight}, and the
+four-cycle $r_0 \to \delta_1 \to r_1 \to \delta_0 \to r_0$ has product
+\[
+  \frac{g^w_0\, g^w_1\, c^v_0\, c^v_1\, c^{\mathrm{qre}}_0\, c^{\mathrm{qre}}_1\,
+        \Lambda^A_0\,\Lambda^A_1\, \bar w_0\,\bar w_1\, L_0\, L_1\,
+        \chi_0^3\chi_1^3}
+       {c^-_0\, c^-_1\, w_{\min,0}\,w_{\min,1}\,\alpha_0\,\alpha_1},
+\]
+which is the product of the two cycles \eqref{eq:cycleweight} and is therefore
+$< 1$ whenever they are.
+\end{lemma}
+
+\begin{proof}
+In $\hat\Gamma_{ij}$ the factor $\eta_j$ appears in the numerator and $\eta_i$ in
+the denominator; around a cycle each index appears once as $i$ and once as $j$,
+so the $\eta$'s cancel. Likewise the numerator of an edge \emph{out of} a mean
+block carries $\bar\sigma_j^3$ and the denominator of an edge \emph{into} it
+carries $a_j\underline\sigma_j \asymp w_{\min,j}\alpha_j\underline\sigma_j^3$; the
+ratio is $\chi_j^3$. Weight-block edges carry no scale in the denominator and
+$\bar\sigma^3$ in the numerator only when their source is a mean block, which
+supplies the matching $\underline\sigma^3$ on the next edge. Substituting
+$a_i \asymp \tfrac12 w_{\min,i}\alpha_i\underline\sigma_i^2$ (which requires the
+magnet self-gain bound \eqref{eq:selfgain}) gives the displayed products.
+\end{proof}
+
+\begin{theorem}[Global convergence on $\mathfrak{G}$]\label{thm:main}
+Let $u \in \mathfrak{G}(M,\Sigma,\cN,\rho)$ in the sense of \GC{Definition~1},
+and assume in addition (L), (D$^+$), (G), (G$_\sigma$), (S$^+$), (T), and
+$\kappa_0, \kappa_1 > 0$. Run the two-head update --- \GC{(2.6)} on the
+categorical heads, \eqref{eq:meanupd}--\eqref{eq:scaleupd} on the Gaussian heads
+--- from any initialisation satisfying the covering clause of (K) in the quantitative form of
+(G$_\sigma$). Then:
+\begin{enumerate}
+\item[(a)] \emph{(cell invariance)} the assignment of components to cells fixed at
+  initialisation is preserved for all time;
+\item[(b)] \emph{(scales)} there is a finite $T^\sigma := \max_i T^\sigma_i$
+  such that for $t \ge t_1 + T^\sigma$ every scale of both players equals its
+  floor, where $t_1 = O\big(\log(1/\bar r)/(\epsilon\,\eta\,\underline a)\big)$;
+\item[(c)] \emph{(transport and equilibration)} $\tilde r_0(t), \tilde r_1(t),
+  \delta_0(t), \delta_1(t) \to 0$ geometrically: for $t \ge t_1 + T^\sigma$,
+  \[
+    \max\Big\{\tfrac{\tilde r_0(t)}{\pi_1}, \tfrac{\tilde r_1(t)}{\pi_2},
+    \tfrac{\delta_0(t)}{\pi_3}, \tfrac{\delta_1(t)}{\pi_4}\Big\}
+    \;\le\; C_0 \big(1 - \epsilon\,\underline a\big)^{\,t - t_1 - T^\sigma},
+    \qquad
+    \underline a = \min_i\Big\{\tfrac{\eta_i w_{\min,i}\alpha_i (s^{\min}_i)^2}{2},
+    \ \eta_i\tau_i c^-_i\Big\};
+  \]
+\item[(d)] \emph{(limit)} consequently $(m,w,n,v)(t) \to z^\infty_{s^{\min}}$, the
+  unique self-consistent configuration of Lemma~\ref{lem:fp}; every component mean
+  converges to the branch point of its own cell, the component matrix converges to
+  $\bar A^\infty = A + O(s^2)$, and the categorical heads converge to its unique
+  Nash equilibrium --- which by (I) is $(w^\star, v^\star) + O(s^2)$, and without
+  (I) is some Nash of $\bar A^\infty$;
+\item[(e)] \emph{(location and bias)} $\|m^\infty_j - p_j\| =
+  O\big((s^{\min}_0)^2\big)$ for each $j$ after relabelling, and the induced
+  policy pair is an $\varepsilon$-Nash equilibrium of the continuous game with
+  \[
+    \varepsilon \;\le\; \tfrac12 (s^{\min}_0)^2\, \big|\Delta Q_{\nu^\infty}(a^\star)\big|
+    \;+\; \tfrac12 (s^{\min}_1)^2\, \big|\Delta W_{\mu^\infty}(b^\star)\big|
+    \;+\; O(s^4)
+    \;=\; O\big((s^{\min}_0)^2 + (s^{\min}_1)^2\big).
+  \]
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+\emph{Step 0 (initial assignment).} By (K) each cell contains at least one
+initial mean, and by (G$_\sigma$) each initial mean is within $R_i - \bar r_i$ of
+its cell's branch point. Fix the map $k \mapsto j(k)$ accordingly.
+
+\emph{Step 1 (the comparison system).} While all means remain in their cells,
+Lemmas~\ref{lem:mean} and \ref{lem:weight}(v) give exactly the hypotheses of
+Lemma~\ref{lem:sg} for $x = (\tilde r_0, \tilde r_1, \delta_0, \delta_1)$ with the
+gain matrix \eqref{eq:Gamma} and the exogenous inputs
+$d = (d_{r_0}, d_{r_1}, d_{\delta_0}, d_{\delta_1})$ of
+Lemma~\ref{lem:scalefree}. Hypothesis (G) is $\varrho(\hat\Gamma) < 1$, so
+Lemma~\ref{lem:sg} applies and yields $\pi, \epsilon$ and the Lyapunov function
+$V = \max_i x_i/\pi_i$. By Lemma~\ref{lem:cyclefree} the entries of $\hat\Gamma$
+are bounded uniformly in $t$ --- this is where the scale-freeness is used, and it
+is what makes $\sup_t$ in Lemma~\ref{lem:sg} finite even though the rates
+$a_i(t)$ themselves vary by orders of magnitude along the run.
+
+\emph{Step 2 (the transient ball, and invariance).} By
+Lemma~\ref{lem:scalefree}, $\max_i d_i(t)/\pi_i \le \theta\epsilon\underline a(t)$
+with $\theta$ the right-hand side of \eqref{eq:barr}; hypothesis (G$_\sigma$) says
+$\theta$ translates to Euclidean tracking errors $\bar r_i < \min\{R_i/2,
+\delta^\kappa_i\}$. By Lemma~\ref{lem:sg}(b) the ball $\{V \le \max(V(0),\theta)\}$
+is forward invariant and $V$ enters $\{V \le \theta\}$ at some finite $t_1$, with
+$t_1 \le \log(V(0)/\theta)/(\epsilon\underline a)$. Throughout, the Euclidean
+tracking error stays below $R_i$ --- at $t = 0$ by (G$_\sigma$)'s initialisation
+clause and thereafter because $V$ never increases beyond its initial value --- so
+Lemma~\ref{lem:inv} gives (a).
+
+\emph{Step 3 (scales, giving (b)).} For $t \ge t_1$ every Euclidean tracking error
+is $\le \bar r_i \le \delta^\kappa_i$, so Lemma~\ref{lem:scale} applies at every
+step: every log-scale decreases by at least $\tfrac{\eta_i}{4}\beta_i w_{\min,i}
+\kappa_i (s^{\min}_i)^2$ per step until it is clipped at the floor, which happens
+within $T^\sigma_i$ steps. The clip then holds it there, since the unclipped
+increment remains negative (the hypothesis of Lemma~\ref{lem:scale} continues to
+hold, by the invariance in Step 2). This proves (b).
+
+\emph{Step 4 (exact convergence, giving (c)).} For $t \ge t_1 + T^\sigma$ all
+scales are constant at their floors, so $\Delta(\sigma_i^2/2) \equiv 0$ and the
+exogenous inputs vanish: $d(t) \equiv 0$. Lemma~\ref{lem:sg}(a) with the constant
+rates $a_{r_i} = \tfrac12 \eta_i w_{\min,i}\alpha_i (s^{\min}_i)^2$ and
+$a_{\delta_i} = \eta_i\tau_i c^-_i$ gives the geometric decay stated in (c). This
+is the step at which the argument would fail without Lemma~\ref{lem:dom}(ii): if
+the mean update's step were merely $O(\eta)$ rather than $O(\eta\,\tilde r)$, the
+inputs $b_{ij}x_j$ would not vanish with $x$ and Lemma~\ref{lem:sg} would deliver
+only an $O(\eta)$ ball.
+
+\emph{Step 5 (identifying the limit, giving (d)).} $x(t) \to 0$ means the
+configuration converges to a point at which every mean is exactly at its own
+cell's branch point for the limiting opponent policy, and every categorical head
+is exactly at the QRE for the limiting component matrix; by
+Lemma~\ref{lem:weight}(iii) and (T), the outer magnet-refresh loop drives that
+QRE to a Nash of $\bar A^\infty$ at a linear rate in the number of refreshes, and
+the refresh count grows linearly in $t$, so the composite rate is again
+geometric. The limit is therefore a fixed point of the consistency map
+$\cT_{s^{\min}}$ of Lemma~\ref{lem:fp}; by Lemma~\ref{lem:fp}(i) that fixed point
+is unique, so the limit is $z^\infty_{s^{\min}}$. Duplicated components in one
+cell converge to the same branch point; the induced matrix then has duplicated
+rows and the Nash is non-unique in $w$ but unique as a measure on the branch
+points, which is the object the conclusion is stated for.
+
+\emph{Step 6 (location and bias, giving (e)).} Lemma~\ref{lem:fp}(ii) gives
+$\|m^\infty_j - p_j\| = O((s^{\min}_0)^2)$ and $\|w^\infty - w^\star\|_1 =
+O(s^2)$. Lemma~\ref{lem:exp} applied at $z^\infty_{s^{\min}}$ --- which is a fixed
+point of $\cT$, so its hypotheses hold exactly --- gives the exploitability bound.
+\end{proof}
+
+\begin{remark}[Which hypothesis does which job]
+(C)+(L) do all the work in Steps 2--4 and are the only conditions the negative
+result \GC{Proposition~1} forces. (D$^+$)+(G) are used exactly once, to bound
+$\varrho(\hat\Gamma)$, i.e.\ to stop the two players' targets from chasing each
+other. (G$_\sigma$) is used exactly once, to guarantee that the transient
+tracking error is inside the radius where the scale block is monotone. (M)+(I)+(B)
+are used only in Step 6, to \emph{name} the limit and give the bias its exponent;
+if they fail, (a)--(d) survive verbatim and only (e) is lost. (K) is used only in
+Step 0, and (W) only through $w_{\min}$ in Lemma~\ref{lem:contract} --- vacuous
+under the corrected preconditioner of \GC{Remark~2}. (S$^+$) and (T) are step-size
+bookkeeping.
+\end{remark}
+
+\section{Corollaries}\label{sec:cor}
+
+\begin{corollary}[Released floor: transport survives, and $\varepsilon =
+\Theta(1/t)$]\label{cor:unfloored}
+Suppose the hypotheses of Theorem~\ref{thm:main} hold for every floor
+$s^{\min} \in (0, \bar s]$ with constants uniform in $s^{\min}$ --- which they do
+whenever $L_i, L^{(3)}_i, \alpha_i, \kappa_i$ are taken as the landscape's own
+constants near its atoms rather than the worst-case bounds of \GC{(2.4)} --- and
+release the floor. Then:
+\begin{enumerate}
+\item[(i)] $\sigma_{i}(t) = \big(\sigma_i(0)^{-2} + 2c_it\big)^{-1/2} =
+  \Theta(t^{-1/2})$ with $c_i = \tfrac{\eta_i}{2}\beta_i w_i\kappa_i$, so the
+  ratio $\sigma_1(t)/\sigma_0(t) \to \sqrt{c_0/c_1}$ is bounded;
+\item[(ii)] consequently the entries of $\hat\Gamma$ remain uniformly bounded, so
+  (G) still holds and Lemma~\ref{lem:sg} still applies, now with time-varying
+  rates $\underline a(t) = \Theta(\eta/t)$;
+\item[(iii)] since $\sum_t \underline a(t) = \Theta(\log t) \to \infty$, the
+  tracking errors still converge to zero, at the polynomial rate
+  $V(t) = O(t^{-\lambda})$ with $\lambda = \epsilon\,\min_i w_{\min,i}\alpha_i
+  /(2c_i)$;
+\item[(iv)] and $\varepsilon(t) = \Theta(1/t)$, as in \GC{Corollary~2}.
+\end{enumerate}
+\end{corollary}
+
+\begin{proof}
+(i) is \GC{Corollary~2} together with \GC{Lemma~6}; the ratio statement follows
+from the closed form. (ii) is Lemma~\ref{lem:cyclefree}: the cycle gains involve
+$\sigma$ only through $\chi_i$ and through the ratio $\bar\sigma_1/\underline
+\sigma_0$ in individual entries, and (i) bounds the latter. (iii) is
+Lemma~\ref{lem:sg}(a) with $\underline a(t) = \eta w_{\min}\alpha\sigma^2(t)/2
+= \Theta(1/t)$: $\prod_{u \le t}(1 - \epsilon\underline a(u)) =
+\exp(-\epsilon\sum_u \underline a(u)) = \exp(-\lambda\log t + O(1))$. (iv) is Step
+6 of Theorem~\ref{thm:main} with $s^{\min}$ replaced by $\sigma(t)$, valid because
+by (iii) the tracking error decays polynomially and hence faster than the
+$\Theta(1/t)$ bias for $\lambda > 1$; for $\lambda \le 1$ the exploitability is
+$\Theta(t^{-\min(1,\lambda)})$.
+\end{proof}
+
+\begin{remark}
+Corollary~\ref{cor:unfloored} is the second half of the answer to \GC{\S5.6},
+item~5. That item worried that unfloored, ``both the contraction and the branch
+drift vanish together and the ISS estimate needs their \emph{ratio} controlled''.
+It does, and the ratio is controlled: by Lemma~\ref{lem:cyclefree} it is exactly
+the scale-free cycle gain, and the only new thing needed is that the two players'
+scales fall at comparable rates, which (i) supplies in closed form. The price is
+that the convergence of the \emph{means} degrades from geometric to polynomial,
+with an exponent $\lambda$ that the user controls through $\eta$ and $\tau^{\rm g}$
+(both enter $c_i$).
+\end{remark}
+
+\begin{corollary}[Overcapacity]\label{cor:overcap}
+Under the hypotheses of Theorem~\ref{thm:main}, taking $K_i \gg M_i$ with a
+space-filling initialisation discharges the covering clause of (K) and
+(G$_\sigma$) automatically, at no cost to conclusions (a)--(e): spare components
+converge to branch points of whichever cell they start in, i.e.\ to genuine atoms,
+and the induced measure is unaffected (Step 5).
+\end{corollary}
+
+\begin{corollary}[Flat directions: measure convergence only]\label{cor:flat}
+Suppose $\kappa_i = 0$ in some directions --- e.g.\ a pure-coupling game, where
+$Q_{\nu^\star} \equiv \mathrm{const}$ and (C) holds only via
+$\tau^{\mathrm g}_i > 0$ with $\alpha_i = \tau^{\mathrm g}_i/\bar\sigma^2$ and a
+single cell (\GC{Remark~5}). Then Steps 1, 2, 4 and 5 of
+Theorem~\ref{thm:main} go through unchanged --- the mean and weight blocks are
+unaffected --- but Step 3 fails: the scales do not descend from landscape
+curvature, and the limit set of Lemma~\ref{lem:fp} is a manifold (any
+moment-matched configuration) rather than a point, so $\cT$ is not a contraction
+in the parameters. The surviving conclusion is convergence of the \emph{induced
+measure} and of the exploitability, with the bias set by whatever scale the
+magnet's own relaxation $\sigma \to \bar\sigma$ settles at, and no statement about
+the individual means.
+\end{corollary}
+
+\begin{proposition}[Closed-form (G) under a finite-rank coupling]
+\label{prop:cap}
+Let $u(a,b) = D_0(a) - D_1(b) + \ip{\varphi(a)}{C\psi(b)}$ as in \GC{(6.1)}, and
+suppose $\nabla^2 D_{i,s} \preceq -\alpha_i I$ near the branches. Then
+$g^m_0 \le \|C\|\,\|\nabla\varphi_s\|\,\|\nabla\psi_s\|/\alpha_0$ and
+symmetrically, so \eqref{eq:cyclemean} is implied by
+\begin{equation}\label{eq:capplus}
+  \alpha_0^2\,\alpha_1^2 \;>\;
+  \|C\|^2\,\sup\|\nabla\varphi\|^2\,\sup\|\nabla\psi\|^2 \cdot
+  \frac{\bar w_0\bar w_1 L_0L_1 \chi_0^3\chi_1^3}{w_{\min,0}w_{\min,1}} .
+\end{equation}
+This is \GC{Proposition~2}'s cap $\alpha_0\alpha_1 > \|C\|^2\sup\|\nabla\varphi\|
+\sup\|\nabla\psi\|$ with the condition numbers $L_i/\alpha_i$ and
+$\bar w_i/w_{\min,i}$ made explicit; on \texttt{TWO\_POINT}
+($\alpha = 100$, $\|f'\| = 2$, $c = 1$, $L \approx \alpha$, isotropic scales,
+$K = M = 2$ so $\bar w/w_{\min} \approx 1$), the left side is $10^8$ and the right
+side $\approx 16$, so \eqref{eq:capplus} holds with more than six orders of
+margin --- consistent with \GC{Example~1}, which found $g_0g_1 = 4\times10^{-4}$.
+\end{proposition}
+
+\begin{proof}
+$\xi_j$ solves $\nabla D_{0,s}(\xi) + \nabla\varphi_s(\xi)^\top C y = 0$ with
+$y = \E_\nu\psi$; the implicit function theorem with
+$\|(\nabla^2 D_{0,s})^{-1}\| \le 1/\alpha_0$ gives
+$\|\partial\xi/\partial y\| \le \|\nabla\varphi_s\|\|C\|/\alpha_0$, and
+$\|\partial y/\partial m^{(1)}_l\| \le \|\nabla\psi_s\|$ by the chain rule through
+the mixture. Substitute in \eqref{eq:cyclemean}.
+\end{proof}
+
+\section{What is still not proved}\label{sec:remaining}
+
+Theorem~\ref{thm:main} closes items~1 and~5 of \GC{\S5.6}, and
+Corollary~\ref{cor:flat} converts item~4 from ``stated but not proved'' into a
+proved but weaker statement. What remains:
+
+\begin{enumerate}
+\item \textbf{Exact gradients.} Everything above assumes $U$ and its derivatives
+  are available exactly. With stochastic estimates the mean block acquires an
+  additive noise term whose variance does not vanish with $\tilde r$, so
+  Lemma~\ref{lem:sg} would give an $O(\sqrt{\eta})$ ball rather than zero, and a
+  decreasing step size or variance reduction would be needed. This is the single
+  largest remaining gap between the theorem and the implementation.
+\item \textbf{Verification of (C) and of (L).} Unchanged from \GC{\S5.6} item~3:
+  the quantifier over $\nu \in \cN_1$ and $s \in \Sigma_i$ is collapsed by a
+  finite-rank coupling (Proposition~\ref{prop:cap}) or by one-dimensional
+  scale-space causality, and not otherwise. Note that (L) inherits exactly the
+  same checkability: $\alpha_i$ is a mode-ladder computation, not a new one.
+\item \textbf{Quantitative $\rho$, i.e.\ $\alpha_i$ in closed form.}
+  \GC{\S5.6} item~2. The theorem is now explicitly uniform in $\alpha_i > 0$ and
+  every rate is proportional to it, so this has been reduced from ``a missing
+  hypothesis'' to ``a missing constant''; computing $\alpha_i$ for
+  Gaussian-bump landscapes is elementary and gives
+  $\alpha \asymp (h/w^2)e^{-\mathrm{diam}^2/2w^2}$, from which
+  Theorem~\ref{thm:main}(c) yields an explicit finite-horizon bound --- the honest
+  form of the old $s_{\mathrm{reach}}$ edge.
+\item \textbf{The anisotropy ratio $\chi_i$.} It enters the cycle gains as
+  $\chi_i^3$, and is bounded a priori only by $s^{\max}_i/s^{\min}_i$. It equals
+  $1$ for isotropic scales, and can be removed entirely by imposing (C) in
+  preconditioned form (star-concavity of $Q^{\mathrm{reg}}$ measured in the
+  $\Sigma_k^{-1}$ metric); whether the resulting condition is still checkable by
+  mode counting is not settled.
+\item \textbf{The Gaussian magnet's refresh.} Lemma~\ref{lem:mean} amortises the
+  magnet-centre jump over a refresh window rather than handling it stepwise, which
+  costs a factor $T$ hidden in the constant $C_0$ of Theorem~\ref{thm:main}(c).
+  For $\tau^{\mathrm g}_i = 0$ --- the configuration \GC{\S5.4} recommends in
+  curved games --- this is vacuous.
+\item \textbf{Extensive form.} Unchanged: the payoff is bilinear in sequence form
+  but the policy parameterises behavioural strategies per infoset, and the
+  cellwise analysis would have to be redone with continuation values as the
+  landscape.
+\end{enumerate}
+
+\section{Summary}
+
+The class $\mathfrak{G}$ was defined so that the only obstruction to convergence
+lives in the mean dynamics. Making that into a theorem needed three things, all
+now supplied. The mean update's \emph{step} is proportional to its own tracking
+error, because the branch point is a critical point of the regularised landscape
+(Lemma~\ref{lem:dom}); this converts input-to-state stability into contraction.
+The Fisher preconditioner $\sigma^2$ appears once in every contraction rate and
+once in every drift term, so it cancels around every cycle
+(Lemma~\ref{lem:cyclefree}); this makes the small-gain condition a property of the
+game rather than of the schedule, and voids the ``scale collapse throttles
+transport'' objection. And the categorical magnet temperature is free to be taken
+large, because the magnet refresh is a proximal-point iteration whose fixed point
+is Nash for every $\tau^{\mathrm{cat}} > 0$ (Lemma~\ref{lem:weight}(iii)); this
+resolves the ordering of limits that blocked the composition.
+
+The cost is one substantive hypothesis, (L): the star-concavity modulus is linear,
+with a constant that may be exponentially small. That constant does not gate
+convergence --- it sets the rate. Which is the same statement, in the language of
+the class, that \GC{\S3.2} made about the dead zone: it is a rate, not a failure.
+
+\end{document}

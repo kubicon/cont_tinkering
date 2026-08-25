@@ -14,3 +14,11 @@ wheels/
 
 pyproject.toml
 uv.lock
+
+*.toc
+*.out
+*.log
+*.aux
+*.pdf
+*.pkl
+*.xdv

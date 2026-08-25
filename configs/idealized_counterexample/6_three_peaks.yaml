@@ -1,0 +1,92 @@
+# Idealized (noise-free, exact-gradient) MMD.  Run: python run_idealized.py <this file>
+#
+# K=3 / 3-peak extension of the attraction-sweep fix (2_attraction_sweep_fix.yaml,
+# 4_attraction_fix_asymmetric.yaml). Question: does the "pull means together instead
+# of apart" fix survive going from 2 to 3 components? ANSWER: yes, and cleanly -- a
+# working global repulsion_coef exists, and it needs LESS magnitude than the K=2 case,
+# not more.
+#
+# Layout: peaks [-2.0, 0.0, 2.0] (uniform weights, Nash 1/3 each), decoys placed
+# OUTSIDE only the two outer peaks (mirroring 1_decoys_to_sides.yaml): [[-3.0, 0.7,
+# 0.45], [3.0, 0.7, 0.45]]. Init starts left/right ON their outside decoys and the
+# MIDDLE component already on its own peak (0.0) -- see the theory below for why.
+#
+# THEORY (confirmed empirically): for K components, each component i's repulsion-term
+# gradient is `lam * sum_{j != i} sign(mean_i - mean_j)`. For K=3 with a stable
+# left < mid < right ordering:
+#     left:   sign(left-mid)  + sign(left-right)  = -1 + -1 = -2   -> pulled by 2*lam
+#     mid:    sign(mid-left)  + sign(mid-right)    = +1 + -1 =  0   -> pulled by 0
+#     right:  sign(right-left)+ sign(right-mid)    = +1 + +1 = +2   -> pulled by 2*lam
+# So the median component needs exactly zero attraction to hold its peak (nothing
+# pulls it away, as long as it starts there), while the two outer components feel
+# DOUBLE the force a lone K=2 pair would for the same `lam`. That predicts the working
+# window sits at roughly HALF the magnitude found for K=2 (2_attraction_sweep_fix.yaml
+# used -1.0) -- confirmed below (best here is -0.7).
+#
+# Coefficient sweep (30k steps, all else as below); mid stayed at 0.0 to ~1e-10
+# precision for every single value tested, exactly as predicted:
+#     -0.1   too weak                        (-3.09, 0.00, +3.09)  expl 1.604
+#     -0.2   too weak                        (-2.95, 0.00, +2.95)  expl 1.376
+#     -0.3   too weak                        (-2.79, 0.00, +2.79)  expl 0.695
+#     -0.5   too weak                        (-2.37, 0.00, +2.37)  expl 0.697
+#     -0.7   BEST                            (-1.994, 0.00, +1.994) expl 0.059
+#     -1.0   captured, slightly worse        (-1.989, 0.00, +1.989) expl 0.081
+#     -1.5   captured, more residual         (-1.982, 0.00, +1.982) expl 0.138
+#     -2.0   COLLAPSE -- all three -> ~0     (~0, 0.00, ~0)         expl 1.731
+#     -3.0   collapse                        (~0, 0.00, ~0)         expl 1.729
+#     -5.0   collapse                        (~0, 0.00, ~0)         expl 1.729
+#     -8.0   collapse                        (~0, 0.00, ~0)         expl 1.729
+# Window is roughly [-1.5, -0.3], best near -0.7 -- narrower AND smaller in magnitude
+# than the K=2 window ([-2.0,-0.5], best -1.0), and collapse (all components merging
+# onto one point, same catastrophic failure mode seen in the K=2 case) sets in earlier
+# (-2.0 here vs. -8 to -15 for K=2), exactly as predicted by the 2x force multiplier.
+#
+# Takeaway: going from 2 to 3 peaks did not break the attraction fix -- if anything the
+# median peak is "free" (the pairwise sign-sum cancels for whichever component sits in
+# the middle), so K=3 needed careful re-tuning (smaller coefficient, narrower window)
+# but not a different mechanism. No counterexample found here.
+#
+# Every settable field is listed; "(default)" marks values left at the schema default.
+
+game:
+  name: decoy_well
+  peaks: [-2.0, 0.0, 2.0]
+  weights: null
+  peak_width: 0.05
+  peak_height: 1.0
+  decoys: [[-3.0, 0.7, 0.45], [3.0, 0.7, 0.45]]
+  coupling: 1.0
+  action_margin: 2.0
+
+mmd:
+  lr: 0.05
+  steps: 40000
+  magnet_interval: 200
+  magnet_coef: 0.05
+  entropy_coef: 0.0
+  num_components: 3
+
+  train_means: true
+  train_std: true
+  freeze_weights: true
+
+  anneal_std_from: 0.0
+  std_min: 0.001
+  std_max: 0.10
+
+  repulsion_coef: -0.7    # <- the fix, re-tuned for K=3 (K=2 used -1.0)
+  repulsion_ramp: 0.2
+  repulsion_hold: 0.5
+
+  backend: auto
+  grid_points: 801
+
+init:
+  means: [-3.0, 0.0, 3.0]   # outer two start ON the outside decoys, mid on its own peak
+  weights: null
+  log_std: 0.05
+
+log:
+  every: 500
+  rows: 10
+  out: null

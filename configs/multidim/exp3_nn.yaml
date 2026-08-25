@@ -1,0 +1,25 @@
+# Exp 3 with the NEURAL NETWORK (PPO MixtureActorCritic) instead of idealized MMD.
+# Same game as exp3_2d_3peak_nodecoy.yaml: 2-D, three peaks/axis, no decoy, K=3.
+# Question: do random init + sampling noise + PPO's entropy bonuses escape the
+# weight-starvation collapse that the noise-free idealized MMD fell into?
+game:
+  name: multidim_decoy_well
+  dim: 2
+  peaks: [-1.0, 0.0, 1.0]
+  decoys: []
+  peak_width: 0.08
+  coupling: 1.0
+  action_margin: 1.0
+
+network:
+  num_components: 3
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+
+train:
+  mode: self_play
+  steps: 100
+  epochs: 200
+  seed: 0
+  checkpoint_dir: data/multidim/exp3_nn

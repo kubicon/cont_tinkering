@@ -1,0 +1,24 @@
+# Exp 4 -- THE DECOY TRAP in 2-D. Same as the 1-D counterexample (configs/idealized_decoy_well.yaml)
+# but with dim=2: two tall/narrow peaks per axis + one broad/low decoy per axis at the origin.
+# K=2 == per-axis Nash support, so the Nash IS representable (diagonal). Expectation: MMD is
+# pulled onto the decoy (per axis) and freezes at a non-Nash fixed point.
+game:
+  name: multidim_decoy_well
+  dim: 2
+  peaks: [-1.0, 1.0]
+  peak_width: 0.05
+  peak_height: 1.0
+  decoys: [[0.0, 0.7, 0.45]]
+  coupling: 1.0
+  action_margin: 2.0        # box [-3,3]; spread init lands at +-1.5, inside the dead zone
+mmd:
+  lr: 0.05
+  steps: 20000
+  magnet_interval: 200
+  magnet_coef: 0.2
+  num_components: 2
+init:
+  means: spread
+log:
+  every: 500
+  rows: 10
