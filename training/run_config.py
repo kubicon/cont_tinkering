@@ -1,7 +1,9 @@
 """Hierarchical YAML run config: the single argument `train.py` takes.
 
 A config file has up to five top-level sections -- `game`, `network`,
-`optimizer`, `ppo`, `train` -- each optional (defaults apply if omitted).
+`optimizer`, `ppo`, `train` -- each optional (defaults apply if omitted). A
+sixth, `idealized`, is accepted and ignored: it carries the solver-only knobs
+`run_idealized.py` needs, so the *same* file runs under both entry points.
 `game.name` selects one of `games.configs.GAME_CONFIGS`; only that game's own
 fields are needed there, not every game's arguments. See `configs/*.yaml` for
 worked examples, one per game.
@@ -91,7 +93,10 @@ def run_config_from_dict(raw: dict) -> RunConfig:
     """Builds a `RunConfig` from an already-parsed config dict (e.g. `yaml.safe_load`'s
     output, or one produced by `sweep.py` for a single sweep combination).
     """
-    unknown_sections = set(raw) - {"game", "network", "optimizer", "ppo", "train"}
+    # `idealized` holds solver-only knobs for `run_idealized.py` (grid resolution,
+    # std bounds, custom init). It is accepted and ignored here so one config file
+    # can drive both `train.py` and `run_idealized.py`.
+    unknown_sections = set(raw) - {"game", "network", "optimizer", "ppo", "train", "idealized"}
     if unknown_sections:
         raise ValueError(f"unknown top-level config section(s): {sorted(unknown_sections)}")
 
