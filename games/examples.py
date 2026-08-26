@@ -552,16 +552,23 @@ class MultiDimDecoyWellGame(ZeroSumGame):
 class ContinuousMatchingPennies(ZeroSumGame):
     """Matching pennies embedded in a continuous action: `a1, a2 in [0, 1]`.
 
-    payoff(a1, a2) = (2*a1 - 1) * (2*a2 - 1), bilinear in a1 and a2. Because
-    it's linear in each action for any fixed opponent action, every best
-    response sits at an endpoint (0 or 1) -- never in the interior -- so
-    there's no pure Nash equilibrium, exactly as in matching pennies. The
-    unique equilibrium is each player playing 0 and 1 with probability 1/2
-    each (value 0), i.e. a mixed strategy with finite (2-point) support
-    despite the action space being a continuum. A unimodal policy (e.g. a
-    diagonal Gaussian) cannot represent this equilibrium exactly: it can
-    only spread mass around the midpoint, which is precisely where the true
-    equilibrium places zero mass.
+    payoff(a1, a2) = a1 * a2
+    """
+
+    def __init__(self):
+        self._space = box(-jnp.ones(1), jnp.ones(1))
+
+    def action_space(self, player: int) -> ActionSpace:
+        return self._space
+
+    def payoff(self, action_1: chex.Array, action_2: chex.Array) -> chex.Array:
+        return jnp.sum(action_1 * action_2)
+
+
+class ContinuousMatchingPenniesShifted(ZeroSumGame):
+    """Matching pennies embedded in a continuous action: `a1, a2 in [0, 1]`.
+
+    payoff(a1, a2) = (2*a1 - 1) * (2*a2 - 1), bilinear in a1 and a2. 
     """
 
     def __init__(self):
@@ -572,3 +579,4 @@ class ContinuousMatchingPennies(ZeroSumGame):
 
     def payoff(self, action_1: chex.Array, action_2: chex.Array) -> chex.Array:
         return jnp.sum((2 * action_1 - 1) * (2 * action_2 - 1))
+
