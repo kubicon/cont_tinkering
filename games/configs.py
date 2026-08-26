@@ -16,6 +16,7 @@ from .examples import (
     AsymmetricWellGame,
     ContinuousBlottoGame,
     ContinuousMatchingPennies,
+    ContinuousMatchingPenniesShifted,
     CurvaturePumpGame,
     DecoyWellGame,
     ForsakenGame,
@@ -29,6 +30,12 @@ from .examples import (
 class MatchingPenniesConfig:
     def build(self) -> ZeroSumGame:
         return ContinuousMatchingPennies()
+
+
+@dataclasses.dataclass
+class MatchingPenniesShiftedConfig:
+    def build(self) -> ZeroSumGame:
+        return ContinuousMatchingPenniesShifted()
 
 
 @dataclasses.dataclass
@@ -147,6 +154,7 @@ class MultiDimDecoyWellConfig:
 
 GAME_CONFIGS: dict[str, type] = {
     "matching_pennies": MatchingPenniesConfig,
+    "matching_pennies_shifted": MatchingPenniesShiftedConfig,
     "multi_point": MultiPointConfig,
     "quadratic": QuadraticConfig,
     "blotto": BlottoConfig,
