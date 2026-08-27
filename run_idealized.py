@@ -185,6 +185,7 @@ _UNUSED_SHARED_FIELDS = {
     ("network", "hidden_dims"): "no network -- the policy IS the mixture parameters",
     ("network", "activation"): "no network",
     ("network", "normalization"): "no network",
+    ("network", "clip_means"): "the solver always projects means onto the box (`player_step`)",
     ("optimizer", "max_grad_norm"): "clips gradients w.r.t. network weights, which do not exist here",
     ("optimizer", "optimizer"): "the update is mirror/natural-gradient, not Adam",
     ("optimizer", "weight_decay"): "no network weights to decay",

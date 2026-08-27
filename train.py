@@ -60,6 +60,7 @@ def build_hyperparams(game: ZeroSumGame, player: int, config: RunConfig) -> Mixt
         num_envs=ppo.batch_size,
         num_epochs=ppo.ppo_epochs,
         num_components=network.num_components,
+        clip_means=network.clip_means,
         low=low,
         high=high,
         target_tau=ppo.target_tau,
