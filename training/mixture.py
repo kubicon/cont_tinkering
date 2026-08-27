@@ -61,28 +61,7 @@ from .config import MixturePPOHyperparams
 
 OpponentActionFn = Callable[[chex.PRNGKey, int], chex.Array]
 
-# Lower bound on each component's log-std, applied in `MixtureActorCritic.__call__`.
-# The upper bound is `log(high - low)` (a std as wide as the whole action range),
-# computed there since it is per-action-dimension.
-#
-# Both bounds are load-bearing, not defensive padding:
-#   * ceiling -- the Gaussian entropy bonus in `mixture_ppo_loss` is
-#     `-gaussian_entropy_coef * (-log p(a))` on the *marginal* mixture density, and
-#     `-log p(a)` is unbounded above as std -> inf. So the bonus has no interior
-#     optimum in the std: any `gaussian_entropy_coef` large enough to matter drives
-#     log_std to +inf and the run NaNs (it does, reliably, above ~0.5).
-#   * floor -- as std -> 0 the density (hence `gaussian_log_prob` and
-#     `mixture_marginal_log_prob`) blows up, which NaNs the loss from the other side.
-#     This mirrors the `[log 1e-3, log 1]` clip that `idealized_mmd.run` already applies.
 LOG_STD_MIN = -6.907755  # log(1e-3)
-
-# Narrowest action box the std bounds will pretend to see, per dimension. A box
-# can legitimately have zero width -- a bet whose size is fixed, say, leaving the
-# continuous action carrying no information at all -- and then `log(high - low)`
-# is `-inf`, which makes the log-std ceiling `-inf`, every clip a NaN, and the
-# whole run NaN from the first step. Flooring the width at `exp(LOG_STD_MIN)`
-# collapses that case to a spread pinned at the floor, which is the right answer
-# for an action that cannot vary.
 MIN_ACTION_WIDTH = 1e-3  # == exp(LOG_STD_MIN)
 
 
@@ -93,12 +72,6 @@ def _action_width(low: chex.Array, high: chex.Array) -> chex.Array:
 
 def _spread_bias_init(low: chex.Array, high: chex.Array, num_components: int) -> Callable:
     """Bias initializer spreading each component's mean evenly across `[low, high]`.
-
-    Component `k` (of `num_components`, 0-indexed) starts at fraction
-    `(k + 0.5) / num_components` of the way from `low` to `high`. For
-    `num_components=2` and `low=0, high=1` that's `[0.25, 0.75]` — distinct
-    starting points so components don't collapse onto the same mean before
-    training has a chance to separate them.
     """
 
     def init_fn(key: chex.PRNGKey, shape: tuple[int, ...], dtype=jnp.float32) -> chex.Array:
@@ -112,20 +85,6 @@ def _spread_bias_init(low: chex.Array, high: chex.Array, num_components: int) ->
 
 def _std_bias_init(low: chex.Array, high: chex.Array, num_components: int) -> Callable:
     """Bias initializer for `log_std_head`, scaled to the action range.
-
-    A zero-initialized log-std means each component starts at `std = 1`,
-    which is far too wide for a bounded action space (for `[0, 1]` almost
-    all mass falls outside the bounds and clips to the endpoints, and the
-    components' spread means -- see `_spread_bias_init` -- are swamped, so
-    the modes are indistinguishable early and separate only slowly). This
-    instead starts each component at `std = (high - low) / (2 *
-    num_components)`, i.e. roughly half the spacing between adjacent
-    component means, so the modes are distinct from the first step. Paired
-    with a zero kernel on the head, the initial log-std is exactly this
-    (obs-independent), matching how `means_head` is initialized.
-
-    Floored at `MIN_ACTION_WIDTH` so a zero-width box yields `log(1e-3)` rather
-    than `-inf`.
     """
 
     def init_fn(key: chex.PRNGKey, shape: tuple[int, ...], dtype=jnp.float32) -> chex.Array:
@@ -140,32 +99,6 @@ def _std_bias_init(low: chex.Array, high: chex.Array, num_components: int) -> Ca
 
 class MixtureActorCritic(nn.Module):
     """Shared torso, four linear heads: component logits, means, log-stds, value.
-
-    The torso (`hidden_dims` Dense -> normalization -> activation layers) is
-    computed once and shared; `logits`, `means`, `log_std`, and `value` are
-    each a single `nn.Dense` projection of that shared representation,
-    rather than four separate networks — cheaper, and lets the heads share
-    whatever features the torso learns.
-
-    `__call__` returns `(logits, means, log_std, value)`:
-      - `logits`: `(num_atoms + num_components,)`, the categorical distribution over
-        the `num_atoms` parameterless atoms followed by the `num_components`
-        Gaussian components
-      - `means`: `(num_components, action_dim)`, each *Gaussian* component's mean
-        (clipped to `[low, high]` when `clip_means` is set -- off by default, since
-        clipping also zeroes the gradient of a mean that has left the box)
-      - `log_std`: `(num_components, action_dim)`, each component's own spread
-      - `value`: scalar state-value estimate
-
-    Note the asymmetry: only the categorical head knows about atoms. An atom
-    carries no continuous parameter, so it has no mean and no spread to learn --
-    which is exactly the point, and why `means`/`log_std` are indexed by
-    `component - num_atoms` rather than by `component`.
-
-    The logits head keeps flax's default (near-zero) initialization, so every
-    kind starts at roughly equal probability: with one atom and two components
-    a fresh policy folds about a third of the time. A game wanting a different
-    prior should bias its payoffs, not this head.
     """
 
     action_dim: int
@@ -198,16 +131,6 @@ class MixtureActorCritic(nn.Module):
         )(torso)
         means = means_flat.reshape(self.num_components, self.action_dim)
         if self.clip_means:
-            # Discard any gradient that would push a mean out of the action box: `clip`
-            # has zero derivative outside `[low, high]`, so the update that first moves
-            # a mean past the bound is the last one the head sees in that direction.
-            # This is the network-side counterpart of the projection the idealized
-            # solver does (`run_idealized.player_step`: `jnp.clip(means, lo, hi)`), and
-            # it is what stops the mean from diffusing to |mu| ~ 1e3 while every sampled
-            # action clips to the same corner anyway (see the `failing_gaussian_wo_magnet`
-            # experiment). Note the derivative is zero on *both* sides once out, so a
-            # mean that overshoots the bound by one step stays pinned there: it can be
-            # driven back only by whatever also moves the torso.
             means = jnp.clip(means, self.low, self.high)
 
         log_std_flat = nn.Dense(
@@ -226,13 +149,6 @@ class MixtureActorCritic(nn.Module):
 
 def expand_kind_mask(kind_mask: chex.Array, num_components: int) -> chex.Array:
     """A game's `(num_atoms + 1,)` kind mask, widened to the categorical head's logits.
-
-    A game reasons about *kinds* -- fold, call, "bet something" -- and knows
-    nothing about how many Gaussians a policy uses to cover the continuous one.
-    So the single trailing bit for the continuous kind is replicated across all
-    `num_components` components, giving `(num_atoms + num_components,)`. A
-    consequence worth relying on: the Gaussian components are always legal
-    together or illegal together.
     """
     num_atoms = kind_mask.shape[-1] - 1
     return jnp.concatenate(
@@ -243,19 +159,12 @@ def expand_kind_mask(kind_mask: chex.Array, num_components: int) -> chex.Array:
 
 def component_to_kind(component: chex.Array, num_atoms: int) -> chex.Array:
     """The `HybridAction.kind` a sampled categorical index plays.
-
-    Atoms map to themselves; every Gaussian component maps to the single
-    continuous kind `num_atoms`.
     """
     return jnp.minimum(component, num_atoms).astype(jnp.int32)
 
 
 def gaussian_component_index(component: chex.Array, num_atoms: int) -> chex.Array:
     """Row of `means`/`log_stds` that `component` refers to, clamped to be in range.
-
-    Meaningless (and clamped to 0) for an atom, whose Gaussian factor is masked
-    out of every term of the loss anyway -- the clamp exists only so the gather
-    stays in bounds.
     """
     return jnp.maximum(component - num_atoms, 0)
 
@@ -271,19 +180,6 @@ def mixture_log_probs(
 ) -> tuple[chex.Array, chex.Array]:
     """`(category_log_prob, gaussian_log_prob)` for one sample -- kept as separate factors.
 
-    The component choice is treated as part of the stochastic action (the
-    same way hybrid discrete+continuous action spaces are usually handled
-    in PPO): the environment's payoff never sees `component`, but the
-    log-probs of the actual sampling path (component, then Gaussian) are
-    what make the PPO importance ratios well-defined. Returning them
-    separately (rather than summed into one joint log-prob) lets each head
-    get its own PPO ratio and clip in `mixture_ppo_loss`, instead of only
-    the product of the two being bounded.
-
-    When `component` is an atom the sampling path stopped at the categorical
-    draw, so the Gaussian factor is returned as exactly `0.0` -- an importance
-    ratio of 1, contributing nothing. `mask` is the per-logit legality mask
-    recorded at sampling time; the categorical factor is conditioned on it.
     """
     category_log_prob = masked_log_softmax(logits, mask)[component]
     index = gaussian_component_index(component, num_atoms)
@@ -300,31 +196,6 @@ def mixture_marginal_log_prob(
     num_atoms: int,
 ) -> chex.Array:
     """`log p(a | a is continuous)` of the marginal mixture density at a single `raw_action`.
-
-    Marginalizes the component out: `log sum_k softmax(logits)_k * N(a;
-    means_k, std_k)`, computed stably with `logsumexp`. Used to estimate the
-    action policy's entropy as `-log p(a)` (single-sample Monte Carlo).
-
-    **Conditional on the continuous branch**, and deliberately so. With atoms
-    present the policy is a mixture of a discrete measure and a continuous one,
-    which have no common dominating measure -- discrete entropy is in nats over
-    counting measure, differential entropy is over Lebesgue, and adding them is
-    incoherent. So the weights here are renormalized over the *Gaussian*
-    components alone (`log_softmax` of `logits[num_atoms:]`), leaving the
-    discrete part entirely to the categorical entropy term. Leaving them
-    unnormalized instead would silently make this term a function of the atoms'
-    probability, so an entropy bonus meant to keep the bet-size modes apart
-    would also be quietly pushing on how often the policy folds.
-
-    Unlike the average of the per-component Gaussian entropies (`E_k[H(a |
-    component=k)]`), this depends on how far apart the component means are:
-    when the modes collapse onto the same mean the marginal is a single
-    Gaussian with the lowest possible entropy, and pulling them apart raises
-    it. Maximizing it therefore rewards keeping the modes separated, whereas
-    the joint entropy `H(component) + E_k[H(a | k)]` is maximized by a
-    uniform categorical no matter where the means sit -- so components could
-    (and, with permutation symmetry, would tend to) collapse together while
-    the entropy metric still looked healthy.
     """
     log_weights = masked_log_softmax(logits[num_atoms:], mask[num_atoms:])  # (num_components,)
     per_component = jax.vmap(gaussian_log_prob, in_axes=(None, 0, 0))(raw_action, means, log_stds)
@@ -334,15 +205,7 @@ def mixture_marginal_log_prob(
 @chex.dataclass
 class Episode:
     """Everything recorded while sampling one batch of transitions from a `MixtureActorCritic`.
-
-    Storing the full sampling-time distribution (`logits`/`means`/`log_stds`,
-    not just the log-prob of the action actually taken), and the magnet
-    snapshot's distribution at that same `obs` (`magnet_logits`/
-    `magnet_means`/`magnet_log_stds`), means both reference policies
-    `mixture_ppo_loss` regularizes against are exactly what's in here
-    already. `mixture_ppo_loss` only ever forward-passes `params` itself --
-    no `old_params`/`magnet_params` need to be carried around or re-applied
-    during the loss; everything else is data captured once, at rollout time.
+ 
     """
 
     obs: chex.Array
@@ -370,13 +233,6 @@ def sample_mixture_component(
     key: chex.PRNGKey,
 ) -> tuple[chex.Array, chex.Array]:
     """Draw one `(component, raw_action)` from a masked hybrid mixture policy.
-
-    The Gaussian is drawn unconditionally, even when `component` turns out to be
-    an atom -- it costs one `normal` and keeps the returned pytree a fixed shape,
-    where branching would not. The draw is taken from
-    `gaussian_component_index(component)`, which clamps to component 0 for an
-    atom, so the stored value is always finite and inside the usual range; the
-    game ignores it and every loss term masks it out.
     """
     component_key, noise_key = jax.random.split(key)
     component = jax.random.categorical(component_key, jnp.where(mask, logits, MASKED_LOGIT))
@@ -426,10 +282,6 @@ def sample_mixture_actions(
     num_samples: int,
 ) -> chex.Array:
     """Draw `num_samples` clipped actions from the mixture policy at a single `obs`.
-
-    A Monte-Carlo picture of the policy's mixed strategy (component draw
-    then Gaussian, clipped to the space), used to estimate the mixture's
-    exploitability -- see `ZeroSumGame.mixture_exploitability`.
     """
     if network.num_atoms != 0:
         raise ValueError(

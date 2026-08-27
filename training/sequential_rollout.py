@@ -1,31 +1,5 @@
 """Sampling trajectories from a `SequentialZeroSumGame`. Sampling only -- no losses.
 
-The one-shot rollout in `training/mixture.py` draws a single simultaneous move
-and is done. Here an episode is a *path down a game tree*, so three things that
-were trivial there need saying:
-
-  * **Both players are sampled from one trajectory.** They alternate, so a
-    single episode carries some of player 0's decisions and some of player 1's.
-    Each step records only the *acting* player's observation, distribution and
-    draw, tagged with `player`; a trainer recovers one player's data by masking
-    on that tag rather than by keeping two separate rollouts.
-  * **Both networks are evaluated at every step anyway.** Which player acts is a
-    traced value, so there is no branching to be had: both are run and the
-    acting one selected with `jnp.where`. That is the price of a `vmap`ed batch
-    in which different environments sit at different nodes, and it is why both
-    players' networks must agree on `num_atoms` and `num_components`.
-  * **Episodes end at different times.** The scan is a fixed `max_steps` long
-    and `step` is a no-op once terminal, so the trailing steps are real arrays
-    holding meaningless values. `live` marks which steps were genuine decisions;
-    every consumer must mask on it.
-
-Payoffs arrive only at the leaf, so the return for every decision in an episode
-is that one terminal payoff, signed for whoever made the decision. There is no
-bootstrapping and no discounting -- `reward` is already the Monte-Carlo return.
-
-The unit of work here is **one episode**: `build_episode_sampler` returns a
-function that plays exactly one, and `collect_sequential_batch` `vmap`s it over
-a batch of rng keys.
 """
 
 from __future__ import annotations
@@ -52,15 +26,6 @@ from .mixture import (
 class SequentialEpisode:
     """One trajectory. Every field carries a leading `max_steps` (time) axis -- except
     `payoff`, which is one number for the whole episode.
-
-    All the per-step policy fields describe the *acting* player at that step --
-    whichever of the two `player` names -- so a single row is exactly the
-    `Episode` that `mixture_ppo_loss` already knows how to score, and
-    `to_transitions` just drops the two bookkeeping fields to say so.
-
-    `live` is the only defence against the padding: once an episode terminates,
-    the remaining rows hold whatever the (no-op) step produced. They are finite
-    and safely shaped, and they are meaningless.
     """
 
     player: chex.Array  # (T,) int32, who acted -- `TERMINAL` on padding steps
@@ -83,10 +48,6 @@ class SequentialEpisode:
 
     def to_transitions(self) -> Episode:
         """The same rows as a plain `Episode`, ready for `mixture_ppo_loss`.
-
-        Drops `player`/`live`, which say *whose* transition a row is and whether
-        it happened -- questions the per-transition loss has no opinion about.
-        The caller keeps them and masks with them.
         """
         return Episode(
             obs=self.obs,
@@ -108,11 +69,6 @@ class SequentialEpisode:
 
 def _validate_players_match(game: SequentialZeroSumGame, networks: tuple[MixtureActorCritic, ...]) -> None:
     """Both players' observations and categorical heads must be the same shape.
-
-    Not a limitation of the games -- a limitation of selecting between the two
-    players with `jnp.where`, which needs both operands to have one shape. The
-    bet *bounds* may still differ per player; those are handled by clipping with
-    each player's own space and selecting the result.
     """
     if game.obs_dim(0) != game.obs_dim(1):
         raise ValueError(
@@ -148,10 +104,6 @@ def build_episode_sampler(
 ) -> Callable[..., SequentialEpisode]:
     """Bind the (static) game and networks; return a sampler for **one** episode.
 
-    The returned function has signature
-    `(params_0, magnet_params_0, params_1, magnet_params_1, key) -> SequentialEpisode`
-    and plays exactly one trajectory. Batch it with `collect_sequential_batch`,
-    which `vmap`s over rng keys alone -- everything else is shared.
     """
     _validate_players_match(game, (network_0, network_1))
 
@@ -231,10 +183,6 @@ def collect_sequential_batch(
     num_envs: int,
 ) -> SequentialEpisode:
     """`num_envs` independent episodes: `sample_episode` `vmap`ed over rng keys.
-
-    Returns a `SequentialEpisode` whose per-step fields carry
-    `(num_envs, max_steps, ...)` -- the batch axis in front, the time axis behind
-    it -- and whose `payoff` carries `(num_envs,)`.
     """
     keys = jax.random.split(key, num_envs)
     return jax.vmap(sample_episode, in_axes=(None, None, None, None, 0))(

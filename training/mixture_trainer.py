@@ -41,10 +41,6 @@ def _strategy_str(
 ) -> str:
     """The full behavioral strategy at `obs`.
 
-    Atoms print as a bare probability (`atom0 0.31`) since they carry no mean or
-    spread; Gaussian components print as `weight x mean ± std`. `mask` is the
-    per-logit legality mask -- illegal entries are dropped from the listing
-    rather than shown at probability ~0.
     """
     logits, means, log_stds, _ = network.apply(params, obs)
     if mask is None:
@@ -64,12 +60,6 @@ def _strategy_str(
 
 class MixtureTrainState(TrainState):
     """`TrainState` plus two extra, non-trained copies of `params`.
-
-    `target_params` Polyak-averages towards `params` every step
-    (`optax.incremental_update`, coefficient `target_tau`). `magnet_params`
-    is a hard snapshot of `params` taken every `magnet_interval` iterations
-    (`optax.periodic_update`). Both trail `params`, which remains the only
-    set of weights actually trained by `ppo_update`.
     """
 
     target_params: chex.ArrayTree

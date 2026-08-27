@@ -1,32 +1,4 @@
 """PPO on a `SequentialZeroSumGame`: the per-episode loss, and the self-play trainer.
-
-Sampling lives in `training/sequential_rollout.py`; this module only scores what
-came back and takes the gradient step. The split matters because the two halves
-have different shapes of concern -- sampling is about walking a tree with traced
-control flow, training is about masked reductions over the padding that walk
-leaves behind.
-
-Three differences from the one-shot loss in `training/mixture.py`, all of them
-consequences of an episode being a *path* rather than a point:
-
-  * **Masking, not slicing.** A trajectory holds both players' decisions
-    interleaved, and its tail is padding once the episode ended. Player `p`'s
-    loss weights each step by `live & (player == p)` -- there is no compaction,
-    because which steps belong to whom varies per episode and a `vmap`ed batch
-    cannot have ragged rows. Padding rows are still forward-passed; they are
-    finite and multiplied by zero.
-  * **Masked statistics.** Advantage normalization and every logged metric are
-    means over the steps that survive the mask, not over the padded array. The
-    normalizer is the batch-wide count of that player's live decisions, so the
-    loss scale does not depend on how often a player happens to act.
-  * **Monte-Carlo returns, no bootstrapping.** Payoffs land only at leaves, so
-    the return at every decision is the episode's terminal payoff signed for the
-    player who made it (`SequentialEpisode.reward`), and the advantage is still
-    just `reward - value`. There is no GAE here and no need for one; adding
-    intermediate rewards is what would call for it.
-
-The unit of work is **one episode**: `sequential_ppo_loss` scores exactly one,
-and `build_sequential_ppo_loss_fn` `vmap`s it over the batch.
 """
 
 from __future__ import annotations
@@ -63,10 +35,6 @@ def masked_mean(values: chex.Array, weight: chex.Array) -> chex.Array:
 
 def normalized_advantage(raw: chex.Array, weight: chex.Array) -> chex.Array:
     """Standardize `raw` using only the entries `weight` selects.
-
-    Normalizing over the padded array instead would let the number of dead steps
-    -- a property of how long episodes happened to run, not of the policy --
-    shift and rescale every real advantage in the batch.
     """
     mean = masked_mean(raw, weight)
     variance = masked_mean(jnp.square(raw - mean), weight)
@@ -94,16 +62,6 @@ def sequential_ppo_loss(
     magnet_gaussian_kl_coef: float,
 ) -> tuple[chex.Array, dict[str, chex.Array], chex.Array]:
     """`player`'s PPO loss over a **single** episode, summed over their live steps.
-
-    Each row of the trajectory is exactly the `Episode` that `mixture_ppo_loss`
-    already scores -- atoms, legality masks and all -- so this adds only the two
-    things that are new in a tree: `vmap` over the time axis, and the weighting
-    that discards the other player's steps and the post-terminal padding.
-
-    Returns `(loss_sum, metric_sums, count)` rather than means. The caller sums
-    all three across the batch and divides once, which is the only way to get a
-    true masked mean out of a `vmap` whose rows contain different numbers of
-    live steps.
     """
     weight = player_weight(episode, player)
 
@@ -132,11 +90,6 @@ def build_sequential_ppo_loss_fn(
 ):
     """Batch `sequential_ppo_loss` over a `SequentialEpisode`'s leading (env) axis.
 
-    Binds `player` and the six per-head coefficients and returns a function
-    matching `ppo_update`'s `loss_fn` contract, so the epoch scan and the
-    optimizer step are shared with every other trainer here. `entropy_coef` (the
-    generic `PPOHyperparams` field) is accepted and unused, exactly as in
-    `build_mixture_ppo_loss_fn`.
     """
 
     def loss_fn(
@@ -215,20 +168,6 @@ def _build_self_play_train_step(
 
 class SequentialSelfPlayPPOTrainer:
     """Trains both players' `MixtureActorCritic`s on a sequential game, simultaneously.
-
-    The counterpart of `MixtureSelfPlayPPOTrainer` for extensive-form games. The
-    policies are unchanged -- the same mixture-with-atoms head, now reading an
-    infoset observation instead of a constant -- and so are the target/magnet
-    mechanics; what differs is that a rollout is a tree walk and the loss is
-    masked. Both players learn from the *same* batch of trajectories, since one
-    episode contains decisions belonging to both.
-
-    Exploitability is not built in: best-responding in a tree with a continuous
-    action is nothing like the projected-gradient ascent
-    `ZeroSumGame.mixture_exploitability` performs, and how to do it depends on
-    the shape of the game's tree. Pass a `metric_fn` to `train` to report one --
-    `training.kuhn_evaluation.build_kuhn_metric_fn` supplies it for
-    `ContinuousKuhnPoker`.
     """
 
     def __init__(
@@ -288,13 +227,6 @@ class SequentialSelfPlayPPOTrainer:
     ) -> list[dict]:
         """Trains for `steps` chunks of `epochs` `lax.scan`-ned iterations each,
         logging and checkpointing once per chunk (`steps * epochs` iterations total).
-
-        Both hooks are called once per chunk with this trainer. `metric_fn`
-        returns numbers, which are merged into that chunk's history record and
-        printed; `strategy_log_fn` returns a block of text to print. They are
-        separate because what counts as "the strategy" -- and what counts as
-        exploitability -- depends on the game's tree, which this trainer knows
-        nothing about.
         """
         if checkpoint_dir is not None:
             self.save(checkpoint_dir, 0)
