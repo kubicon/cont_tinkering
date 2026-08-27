@@ -26,6 +26,7 @@ class NetworkConfig:
     activation: str = "gelu"
     normalization: str = "rms_norm"
     num_components: int = 2
+    clip_means: bool = False  # constrain the mean head to the action box; see `MixtureActorCritic`
 
 
 @dataclasses.dataclass

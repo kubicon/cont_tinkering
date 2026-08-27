@@ -57,6 +57,7 @@ class MixturePPOHyperparams(PPOHyperparams):
     num_components: int = 2
     low: tuple[float, ...] = (0.0,)
     high: tuple[float, ...] = (1.0,)
+    clip_means: bool = False  # constrain the mean head to `[low, high]`; see `MixtureActorCritic`
 
     # Target/magnet parameter tracking (see `training.mixture_trainer.MixtureTrainState`).
     target_tau: float = 0.005  # Polyak-averaging coefficient for `target_params`.

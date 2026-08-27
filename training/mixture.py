@@ -103,6 +103,8 @@ class MixtureActorCritic(nn.Module):
     `__call__` returns `(logits, means, log_std, value)`:
       - `logits`: `(num_components,)`, the categorical distribution over components
       - `means`: `(num_components, action_dim)`, each component's Gaussian mean
+        (clipped to `[low, high]` when `clip_means` is set -- off by default, since
+        clipping also zeroes the gradient of a mean that has left the box)
       - `log_std`: `(num_components, action_dim)`, each component's own spread
       - `value`: scalar state-value estimate
     """
@@ -114,6 +116,7 @@ class MixtureActorCritic(nn.Module):
     high: chex.Array
     activation: str = "tanh"
     normalization: str = "none"
+    clip_means: bool = False
 
     @nn.compact
     def __call__(
@@ -134,6 +137,18 @@ class MixtureActorCritic(nn.Module):
             name="means_head",
         )(torso)
         means = means_flat.reshape(self.num_components, self.action_dim)
+        if self.clip_means:
+            # Discard any gradient that would push a mean out of the action box: `clip`
+            # has zero derivative outside `[low, high]`, so the update that first moves
+            # a mean past the bound is the last one the head sees in that direction.
+            # This is the network-side counterpart of the projection the idealized
+            # solver does (`run_idealized.player_step`: `jnp.clip(means, lo, hi)`), and
+            # it is what stops the mean from diffusing to |mu| ~ 1e3 while every sampled
+            # action clips to the same corner anyway (see the `failing_gaussian_wo_magnet`
+            # experiment). Note the derivative is zero on *both* sides once out, so a
+            # mean that overshoots the bound by one step stays pinned there: it can be
+            # driven back only by whatever also moves the torso.
+            means = jnp.clip(means, self.low, self.high)
 
         log_std_flat = nn.Dense(
             self.num_components * self.action_dim,
@@ -562,4 +577,5 @@ def build_mixture_network(hyperparams: MixturePPOHyperparams) -> MixtureActorCri
         high=jnp.asarray(hyperparams.high, dtype=jnp.float32),
         activation=hyperparams.activation,
         normalization=hyperparams.normalization,
+        clip_means=hyperparams.clip_means,
     )
