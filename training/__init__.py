@@ -22,6 +22,7 @@ from .mixture import (
     mixture_log_probs,
     mixture_marginal_log_prob,
     mixture_ppo_loss,
+    mixture_ppo_loss_from_outputs,
     sample_mixture_actions,
     sample_mixture_component,
 )
@@ -82,6 +83,7 @@ __all__ = [
     "mixture_log_probs",
     "mixture_marginal_log_prob",
     "mixture_ppo_loss",
+    "mixture_ppo_loss_from_outputs",
     "sample_mixture_actions",
     "sample_mixture_component",
     "MixturePPOTrainer",

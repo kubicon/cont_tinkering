@@ -228,6 +228,8 @@ class SequentialSelfPlayPPOTrainer:
         """Trains for `steps` chunks of `epochs` `lax.scan`-ned iterations each,
         logging and checkpointing once per chunk (`steps * epochs` iterations total).
         """
+        if epochs < 1:
+            raise ValueError(f"epochs must be at least 1, got {epochs}")
         if checkpoint_dir is not None:
             self.save(checkpoint_dir, 0)
 
@@ -238,9 +240,14 @@ class SequentialSelfPlayPPOTrainer:
                 (self.state_0, self.state_1), step_keys
             )
 
+            # One device-to-host transfer for the whole chunk. Indexing the device
+            # arrays per iteration instead costs a dispatch and a sync *per metric
+            # per iteration*, which for a 300-iteration chunk takes several times
+            # longer than the training it is reporting on.
+            metrics_chunk = jax.device_get(metrics_stack)
             for offset in range(epochs):
                 iteration = chunk * epochs + offset + 1
-                record = {"iteration": iteration, **{k: float(v[offset]) for k, v in metrics_stack.items()}}
+                record = {"iteration": iteration, **{k: float(v[offset]) for k, v in metrics_chunk.items()}}
                 self.history.append(record)
 
             # Evaluated once per chunk, on the parameters as they now stand, so

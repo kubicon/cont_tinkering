@@ -28,6 +28,14 @@ class ZeroSumGame(abc.ABC):
     any pair of `ActionSpace`s.
     """
 
+    # Every sample of a rollout sees the same observation -- true of the default
+    # `observation` below (a constant), and hence of every game here. Override to
+    # `False` alongside an `observation` that varies per episode (sampled context,
+    # a repeated game's history): the trainers pass this to
+    # `build_mixture_ppo_loss_fn(shared_obs=...)`, which lifts the policy's forward
+    # pass out of the per-sample `vmap` when it holds.
+    constant_observation: bool = True
+
     @abc.abstractmethod
     def action_space(self, player: int) -> ActionSpace:
         """The action space for `player` (0 or 1)."""

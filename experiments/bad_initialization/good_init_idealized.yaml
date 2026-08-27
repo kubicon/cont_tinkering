@@ -1,0 +1,102 @@
+# python run_idealized.py experiments/bad_initialization/good_init_idealized.yaml
+#
+# Same `multi_point` game as bad_init_idealized.yaml (peaks -1.0/+1.0, weights
+# 0.5/0.5, Nash = both players split 0.5/0.5 across the two peaks), but the
+# good init: both components start near 0 (-0.1 and +0.1), close to the box
+# midpoint and to each other but not coincident -- each already sits fractionally
+# closer to one peak, which is enough for training to break the symmetry, send
+# one component to -1 and the other to +1, and split the categorical weights
+# 0.5/0.5. This is the control the bad_init.yaml pair is contrasted against.
+#
+# `optimizer.learning_rate` is the exact solver's `eta` here; the PPO
+# counterpart (good_init_ppo.yaml) uses a smaller network learning rate. See
+# plot_dynamics.py.
+
+game:
+  name: multi_point
+  peaks: [-1.0, 1.0]
+  weights: [0.5, 0.5]     # symmetric Nash: 0.5/0.5 over the two peaks
+  width: 0.1
+  coupling: 1.0
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 2
+  clip_means: false        # (default) off repo-wide; see failing_gaussian_wo_magnet
+                            #   README for why turning this on can zero the gradient
+                            #   of a mean sitting exactly at the box edge -- not an
+                            #   issue here (init is near the box midpoint), kept off
+                            #   only to match bad_init_idealized.yaml exactly
+
+optimizer:
+  learning_rate: 0.05   # idealized solver's eta; the PPO copy uses 0.001
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0        # only used by "adamw" and "muon"
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 256
+  ppo_epochs: 2
+
+  # Target/magnet parameter tracking.
+  target_tau: 0.001
+  magnet_interval: 500
+
+  # Entropy bonus, split per head.
+  category_entropy_coef: 0.1
+  gaussian_entropy_coef: 0.1
+
+  # KL regularization, split per head (0 disables a term).
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  mode: self_play    # "self_play" or "fixed_opponent"
+  perspective: 0       # fixed_opponent: which player trains
+  opponent: random      # fixed_opponent: "random" or "static"
+  steps: 50
+  epochs: 300
+  checkpoint_dir: data/good_initialization
+  seed: 0
+
+idealized:
+  # --- payoff backend ---
+  backend: auto             # auto | closed_form | quadrature
+  grid_points: 801          # quadrature backend; also the grid the closed-form
+                            #   backend integrates `gaussian_entropy: marginal` on
+  normalize_density: true
+
+  # --- std bounds / graduated optimization ---
+  std_min: 0.001
+  std_max: 1.0
+  anneal_std_from: 0.0      # 0 disables
+
+  # --- which heads train ---
+  train_means: true
+  train_std: true
+  freeze_weights: false     # true pins the categorical head
+
+  gaussian_entropy: marginal   # "marginal": exact differential entropy of the mixture
+  kl_weighting: policy         # "policy": weight each component's Gaussian KL by its policy weight
+
+  # --- annealed mean-repulsion sweep ---
+  repulsion_coef: 0.0        # 0 disables
+  repulsion_ramp: 0.2
+  repulsion_hold: 0.5
+
+  # --- the good initialization ---
+  init_means: [-0.1, 0.1]     # near 0 (the box midpoint), one fraction to each
+                               #   side so the symmetry between the two components
+                               #   is already broken at t=0
+  init_weights: null          # null -> uniform (0.5/0.5) categorical start
+  init_log_std: 0.1           # tight, so movement to +-1.0 is a clean, visible step
+
+  log_rows: 16
+  log_out: null
+  verbose: true

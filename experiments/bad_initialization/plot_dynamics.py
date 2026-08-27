@@ -238,12 +238,18 @@ def _clipped_handle(backend, p: ri.Params):
     see no mass at all and report zero exploitability. This puts each component's
     out-of-box tail mass back as a spike on the boundary grid point, which is exactly
     the law of the clipped action.
+
+    The in-box part comes from `backend.component_densities`, NOT from a fresh
+    `exp(...)` on the grid: that method honours `normalize_density`, and PPO drives
+    stds down to ~1e-3 while the scoring grid's `dx` is ~1.5e-2, so an unnormalized
+    component an order of magnitude narrower than the grid spacing lands an
+    essentially arbitrary amount of mass on whichever point it happens to straddle.
+    Unnormalized, this returned densities integrating to ~2 instead of 1, which made
+    both the PPO NashConv and the PPO W1 curves meaningless.
     """
     w = jax.nn.softmax(p.logits)
     mu, s = p.means[:, None], jnp.exp(p.log_std)[:, None]
-    grid = backend.grid[None, :]
-    pdf = jnp.exp(-((grid - mu) ** 2) / (2 * s**2)) / (jnp.sqrt(2 * jnp.pi) * s)
-    inside = jnp.where(backend.in_box[None, :], pdf, 0.0)
+    inside = jnp.where(backend.in_box[None, :], backend.component_densities(p), 0.0)
 
     cdf = lambda x: 0.5 * (1 + erf((x - mu[:, 0]) / (s[:, 0] * jnp.sqrt(2.0))))  # noqa: E731
     edge = jnp.zeros_like(inside)
@@ -409,7 +415,7 @@ def simulate(config_path: Path, engine: str, expl_points: int, seed_init: bool =
 # --------------------------------------------------------------------------- plotting
 
 
-def _fade(ax, x, y, cmap, label, style, width=1.1, alpha=1.0, end_size=15.0):
+def _fade(ax, x, y, cmap, label, style, width=1.1, alpha=1.0):
     """Draw `(x, y)` as a polyline whose color darkens along the trajectory."""
     pts = np.stack([x, y], axis=1).reshape(-1, 1, 2)
     segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
@@ -421,13 +427,45 @@ def _fade(ax, x, y, cmap, label, style, width=1.1, alpha=1.0, end_size=15.0):
     solid = plt.get_cmap(cmap)(0.85)
     if label is not None:
         ax.plot([], [], color=solid, linewidth=1.6, linestyle=style, label=label)
-    ax.plot(x[0], y[0], "o", color=solid, markersize=7, markerfacecolor="white",
-            markeredgewidth=1.6, alpha=alpha, zorder=5)
-    ax.plot(x[-1], y[-1], "*", color=solid, markersize=end_size, alpha=alpha, zorder=6)
     return solid
 
 
-def _component_tracks(ax, r: dict, cmap: str, style: str, label: str, offsets):
+def _endpoint(ax, pos: float, off: float, on_x: bool, kind: str, color, size: float,
+              limits: tuple[float, float]) -> None:
+    """One trajectory endpoint -- start circle or end star -- pinned if it is off-scale.
+
+    The axes are the action box, but `train.py` runs with `clip_means: false`, so a
+    PPO component mean is free to leave the box entirely (see the note in
+    `training.mixture.MixtureActorCritic.__call__`; here player 1's abandoned
+    component ends at +2.34 with the box at +-2). Matplotlib silently clips such a
+    marker away, which reads as "that component is gone" when in fact it ran off the
+    edge -- so instead it is drawn ON the boundary as an outward-pointing triangle
+    with its true value printed beside it. The idealized solver never needs this: it
+    projects every mean back into the box each step (`run_idealized.player_step`).
+    """
+    lo_ax, hi_ax = limits
+    if lo_ax <= pos <= hi_ax:
+        x, y = (pos, off) if on_x else (off, pos)
+        if kind == "start":
+            ax.plot(x, y, "o", color=color, markersize=7, markerfacecolor="white",
+                    markeredgewidth=1.6, zorder=5)
+        else:
+            ax.plot(x, y, "*", color=color, markersize=size, zorder=6)
+        return
+
+    over = pos > hi_ax
+    edge = hi_ax if over else lo_ax
+    tri = (">" if over else "<") if on_x else ("^" if over else "v")
+    x, y = (edge, off) if on_x else (off, edge)
+    ax.plot(x, y, tri, color=color, markersize=0.6 * size + 3, markeredgecolor="black",
+            markeredgewidth=0.7, zorder=8)
+    ax.annotate(f"{pos:+.2f}", (x, y), textcoords="offset points",
+                xytext=(-16 if over and on_x else 6, 6 if on_x else (-12 if over else 8)),
+                fontsize=7, color=color, zorder=8,
+                ha="right" if (over and on_x) else "left")
+
+
+def _component_tracks(ax, r: dict, cmap: str, style: str, label: str, offsets, limits):
     """One run's mixture components, each on its OWN player's axis.
 
     Player 0's components live on the x-axis and player 1's on the y-axis, so a
@@ -452,7 +490,8 @@ def _component_tracks(ax, r: dict, cmap: str, style: str, label: str, offsets):
 
     The end star is sized by that component's final categorical weight -- a component
     the mixture has abandoned (weight -> 0) shrinks to a dot, which the mean alone
-    would not show.
+    would not show. An endpoint that has left the axes is pinned to the edge rather
+    than dropped; see `_endpoint`.
     """
     solid = plt.get_cmap(cmap)(0.85)
     ax.plot([], [], color=solid, linewidth=1.6, linestyle=style, label=label)
@@ -462,8 +501,10 @@ def _component_tracks(ax, r: dict, cmap: str, style: str, label: str, offsets):
         for k in range(mu.shape[1]):
             pos, off = mu[:, k], np.full(mu.shape[0], offsets[k])
             x, y = (pos, off) if on_x else (off, pos)
-            _fade(ax, x, y, cmap, None, style,
-                  end_size=6.0 + 18.0 * float(w[-1, k]))
+            _fade(ax, x, y, cmap, None, style)
+            size = 7.0 + 17.0 * float(w[-1, k])
+            _endpoint(ax, float(pos[0]), offsets[k], on_x, "start", solid, size, limits)
+            _endpoint(ax, float(pos[-1]), offsets[k], on_x, "end", solid, size, limits)
     return solid
 
 
@@ -496,7 +537,8 @@ def plot(results: list[tuple[str, dict, str, str]], out: Path) -> None:
         hp, st = r["hyperparameters"], r["stats"]
         t = st["t"]
         tag = f"{label} (init {hp['init_mean_player0']:+.2f})"
-        solid = _component_tracks(ax_phase, r, cmap, style, tag, offsets)
+        solid = _component_tracks(ax_phase, r, cmap, style, tag, offsets,
+                                  (lo - pad, hi + pad))
         ax_expl.plot(st["expl_t"], st["expl"], color=solid, linewidth=1.4, linestyle=style,
                      label=f"{label}: current")
         ax_expl.plot(st["expl_t"], st["expl_avg"], color=solid, linewidth=1.1, linestyle=":",
@@ -521,6 +563,7 @@ def plot(results: list[tuple[str, dict, str, str]], out: Path) -> None:
                  title=f"mixture components -- {hp0['game']} ({engines})\n"
                        "circle = start, star = end (sized by final weight), "
                        "color darkens with iteration\n"
+                       "triangle = endpoint outside the box (value annotated); "
                        "one off-axis row per component, cosmetic only")
     ax_phase.set_aspect("equal")
     ax_phase.legend(loc="upper center", bbox_to_anchor=(0.5, -0.11), ncol=2, fontsize=8,

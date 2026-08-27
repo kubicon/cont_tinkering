@@ -9,6 +9,7 @@ from pathlib import Path
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
 from games.base import ZeroSumGame
@@ -36,24 +37,45 @@ from .ppo import TrainState, create_train_state, ppo_update
 EXPLOITABILITY_SAMPLES = 512
 
 
+def _build_strategy_fn(network: MixtureActorCritic):
+    """Jitted `(params, obs, mask) -> (probs, means, stds)` for `_strategy_str`.
+
+    Logging runs once per chunk, but an eager `network.apply` there costs more
+    than the whole chunk of training it reports on: every op dispatches
+    separately and every `float()` on a device scalar is its own
+    device-to-host sync. Jitting the forward pass and pulling the three arrays
+    back in one `device_get` makes the whole thing a rounding error again.
+    """
+
+    @jax.jit
+    def strategy_fn(params, obs: chex.Array, mask: chex.Array):
+        logits, means, log_stds, _ = network.apply(params, obs)
+        return jnp.exp(masked_log_softmax(logits, mask)), means, jnp.exp(log_stds)
+
+    return strategy_fn
+
+
 def _strategy_str(
-    network: MixtureActorCritic, params, obs: chex.Array, mask: chex.Array | None = None
+    network: MixtureActorCritic,
+    strategy_fn,
+    params,
+    obs: chex.Array,
+    mask: chex.Array | None = None,
 ) -> str:
     """The full behavioral strategy at `obs`.
 
     """
-    logits, means, log_stds, _ = network.apply(params, obs)
     if mask is None:
-        mask = jnp.ones_like(logits, dtype=bool)
-    probs = jnp.exp(masked_log_softmax(logits, mask))
-    stds = jnp.exp(log_stds)
+        mask = np.ones(network.num_atoms + network.num_components, dtype=bool)
+    probs, means, stds = jax.device_get(strategy_fn(params, obs, jnp.asarray(mask)))
+    mask = np.asarray(mask)
 
-    parts = [f"atom{i} {float(probs[i]):.2f}" for i in range(network.num_atoms) if bool(mask[i])]
+    parts = [f"atom{i} {probs[i]:.2f}" for i in range(network.num_atoms) if mask[i]]
     parts += [
-        f"{float(probs[network.num_atoms + k]):.2f}x"
+        f"{probs[network.num_atoms + k]:.2f}x"
         f"{tuple(round(float(x), 3) for x in means[k])}±{tuple(round(float(s), 3) for s in stds[k])}"
         for k in range(network.num_components)
-        if bool(mask[network.num_atoms + k])
+        if mask[network.num_atoms + k]
     ]
     return ", ".join(parts)
 
@@ -107,6 +129,7 @@ def _build_train_step(
         hyperparams.category_entropy_coef, hyperparams.gaussian_entropy_coef,
         hyperparams.trpo_category_kl_coef, hyperparams.trpo_gaussian_kl_coef,
         hyperparams.magnet_category_kl_coef, hyperparams.magnet_gaussian_kl_coef,
+        shared_obs=game.constant_observation,
     )
 
     def step(state: MixtureTrainState, key: jax.Array):
@@ -156,6 +179,7 @@ class MixturePPOTrainer:
         train_step = _build_train_step(game, self.network, opponent_action_fn, hyperparams, perspective)
         self._run_chunk = jax.jit(lambda state, keys: jax.lax.scan(train_step, state, keys))
         self._exploitability_fn = jax.jit(game.mixture_exploitability)
+        self._strategy_fn = _build_strategy_fn(self.network)
 
         self.history: list[dict] = []
 
@@ -189,6 +213,8 @@ class MixturePPOTrainer:
         Checkpoints are `{step}.pkl` inside `checkpoint_dir`: `0.pkl` is the
         untrained, freshly initialized params, `1.pkl` is after the first chunk, etc.
         """
+        if epochs < 1:
+            raise ValueError(f"epochs must be at least 1, got {epochs}")
         if checkpoint_dir is not None:
             self.save(checkpoint_dir, 0)
 
@@ -197,9 +223,14 @@ class MixturePPOTrainer:
             step_keys = jax.random.split(chunk_key, epochs)
             self.state, metrics_stack = self._run_chunk(self.state, step_keys)
 
+            # One device-to-host transfer for the whole chunk. Indexing the device
+            # arrays per iteration instead costs a dispatch and a sync *per metric
+            # per iteration*, which for a 300-iteration chunk takes several times
+            # longer than the training it is reporting on.
+            metrics_chunk = jax.device_get(metrics_stack)
             for offset in range(epochs):
                 iteration = chunk * epochs + offset + 1
-                record = {"iteration": iteration, **{k: float(v[offset]) for k, v in metrics_stack.items()}}
+                record = {"iteration": iteration, **{k: float(v[offset]) for k, v in metrics_chunk.items()}}
                 self.history.append(record)
 
             exploit_key, target_exploit_key = jax.random.split(exploit_key)
@@ -219,10 +250,10 @@ class MixturePPOTrainer:
             print(message)
             obs = self.game.observation(self.perspective, jax.random.PRNGKey(0))
             opponent_sample = jnp.squeeze(self.opponent_action_fn(jax.random.PRNGKey(0), 1), axis=0)
-            print(f"  player {self.perspective} strategy: {_strategy_str(self.network, self.state.params, obs)}")
+            print(f"  player {self.perspective} strategy: {_strategy_str(self.network, self._strategy_fn, self.state.params, obs)}")
             print(
                 f"  player {self.perspective} target strategy: "
-                f"{_strategy_str(self.network, self.state.target_params, obs)}"
+                f"{_strategy_str(self.network, self._strategy_fn, self.state.target_params, obs)}"
             )
             print(f"  opponent sample: {tuple(round(float(x), 3) for x in opponent_sample)}")
 
@@ -260,11 +291,13 @@ def _build_self_play_train_step(
         hyperparams_1.category_entropy_coef, hyperparams_1.gaussian_entropy_coef,
         hyperparams_1.trpo_category_kl_coef, hyperparams_1.trpo_gaussian_kl_coef,
         hyperparams_1.magnet_category_kl_coef, hyperparams_1.magnet_gaussian_kl_coef,
+        shared_obs=game.constant_observation,
     )
     loss_fn_2 = build_mixture_ppo_loss_fn(
         hyperparams_2.category_entropy_coef, hyperparams_2.gaussian_entropy_coef,
         hyperparams_2.trpo_category_kl_coef, hyperparams_2.trpo_gaussian_kl_coef,
         hyperparams_2.magnet_category_kl_coef, hyperparams_2.magnet_gaussian_kl_coef,
+        shared_obs=game.constant_observation,
     )
 
     def step(state_1: MixtureTrainState, state_2: MixtureTrainState, key: jax.Array):
@@ -328,6 +361,8 @@ class MixtureSelfPlayPPOTrainer:
 
         self._run_chunk = jax.jit(lambda states, keys: jax.lax.scan(scan_body, states, keys))
         self._exploitability_fn = jax.jit(game.mixture_exploitability)
+        self._strategy_fn_1 = _build_strategy_fn(self.network_1)
+        self._strategy_fn_2 = _build_strategy_fn(self.network_2)
 
         self.history: list[dict] = []
 
@@ -362,6 +397,8 @@ class MixtureSelfPlayPPOTrainer:
         players' params: `0.pkl` is the untrained, freshly initialized params,
         `1.pkl` is after the first chunk, etc.
         """
+        if epochs < 1:
+            raise ValueError(f"epochs must be at least 1, got {epochs}")
         if checkpoint_dir is not None:
             self.save(checkpoint_dir, 0)
 
@@ -372,9 +409,14 @@ class MixtureSelfPlayPPOTrainer:
                 (self.state_1, self.state_2), step_keys
             )
 
+            # One device-to-host transfer for the whole chunk. Indexing the device
+            # arrays per iteration instead costs a dispatch and a sync *per metric
+            # per iteration*, which for a 300-iteration chunk takes several times
+            # longer than the training it is reporting on.
+            metrics_chunk = jax.device_get(metrics_stack)
             for offset in range(epochs):
                 iteration = chunk * epochs + offset + 1
-                record = {"iteration": iteration, **{k: float(v[offset]) for k, v in metrics_stack.items()}}
+                record = {"iteration": iteration, **{k: float(v[offset]) for k, v in metrics_chunk.items()}}
                 self.history.append(record)
 
             exploit_key, target_exploit_key = jax.random.split(exploit_key)
@@ -397,10 +439,10 @@ class MixtureSelfPlayPPOTrainer:
             print(message)
             obs_1 = self.game.observation(0, jax.random.PRNGKey(0))
             obs_2 = self.game.observation(1, jax.random.PRNGKey(0))
-            print(f"  p1 strategy: {_strategy_str(self.network_1, self.state_1.params, obs_1)}")
-            print(f"  p2 strategy: {_strategy_str(self.network_2, self.state_2.params, obs_2)}")
-            print(f"  p1 target strategy: {_strategy_str(self.network_1, self.state_1.target_params, obs_1)}")
-            print(f"  p2 target strategy: {_strategy_str(self.network_2, self.state_2.target_params, obs_2)}")
+            print(f"  p1 strategy: {_strategy_str(self.network_1, self._strategy_fn_1, self.state_1.params, obs_1)}")
+            print(f"  p2 strategy: {_strategy_str(self.network_2, self._strategy_fn_2, self.state_2.params, obs_2)}")
+            print(f"  p1 target strategy: {_strategy_str(self.network_1, self._strategy_fn_1, self.state_1.target_params, obs_1)}")
+            print(f"  p2 target strategy: {_strategy_str(self.network_2, self._strategy_fn_2, self.state_2.target_params, obs_2)}")
 
             if checkpoint_dir is not None:
                 self.save(checkpoint_dir, chunk + 1)

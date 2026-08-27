@@ -407,9 +407,12 @@ def collect_mixture_self_play_episode(
     )
 
 
-def mixture_ppo_loss(
-    params,
-    network: MixtureActorCritic,
+def mixture_ppo_loss_from_outputs(
+    logits: chex.Array,
+    means: chex.Array,
+    log_stds: chex.Array,
+    value_pred: chex.Array,
+    num_atoms: int,
     episode: Episode,
     advantage: chex.Array,
     clip_eps: float,
@@ -421,7 +424,13 @@ def mixture_ppo_loss(
     magnet_category_kl_coef: float,
     magnet_gaussian_kl_coef: float,
 ) -> tuple[chex.Array, dict[str, chex.Array]]:
-    """Clipped-surrogate PPO loss plus KL penalties, for a single (unbatched) `Episode`.
+    """Clipped-surrogate PPO loss plus KL penalties, for a single (unbatched) `Episode`,
+    given the current policy's already-computed forward pass at `episode.obs`.
+
+    `mixture_ppo_loss` is the usual entry point -- it runs that forward pass
+    itself. Taking the outputs as arguments instead is what lets
+    `build_mixture_ppo_loss_fn(shared_obs=True)` evaluate the network *once*
+    for a whole batch that shares one observation, rather than once per sample.
 
     Computed as two *separate* factors (categorical, Gaussian) rather than
     summing the two heads' log-probs into one joint log-prob and clipping a
@@ -450,8 +459,8 @@ def mixture_ppo_loss(
     recorded at sampling time -- re-applying exactly that mask is what keeps the
     PPO ratio a ratio of two densities over the same support.
 
-    `params` is the *only* parameter set this function forward-passes
-    through -- `episode.logits`/`means`/`log_stds` (the sampling-time
+    The current policy's outputs are the *only* ones evaluated for this
+    update -- `episode.logits`/`means`/`log_stds` (the sampling-time
     distribution) and `episode.magnet_logits`/`magnet_means`/`magnet_log_stds`
     (the magnet snapshot's distribution, at the same `episode.obs`) come
     straight from the episode rather than being recomputed from
@@ -461,9 +470,7 @@ def mixture_ppo_loss(
     `magnet_*_kl_coef * KL(current || magnet)` pulls towards the
     periodically-snapshotted magnet policy.
     """
-    num_atoms = network.num_atoms
     mask = episode.action_mask
-    logits, means, log_stds, value_pred = network.apply(params, episode.obs)
 
     # An atom is the whole action: it has no Gaussian factor to weigh in on.
     is_gaussian = (episode.component >= num_atoms).astype(jnp.float32)
@@ -551,6 +558,30 @@ def mixture_ppo_loss(
     return loss, metrics
 
 
+def mixture_ppo_loss(
+    params,
+    network: MixtureActorCritic,
+    episode: Episode,
+    advantage: chex.Array,
+    clip_eps: float,
+    value_coef: float,
+    category_entropy_coef: float,
+    gaussian_entropy_coef: float,
+    trpo_category_kl_coef: float,
+    trpo_gaussian_kl_coef: float,
+    magnet_category_kl_coef: float,
+    magnet_gaussian_kl_coef: float,
+) -> tuple[chex.Array, dict[str, chex.Array]]:
+    """`mixture_ppo_loss_from_outputs`, forward-passing `params` at `episode.obs` first."""
+    logits, means, log_stds, value_pred = network.apply(params, episode.obs)
+    return mixture_ppo_loss_from_outputs(
+        logits, means, log_stds, value_pred, network.num_atoms, episode, advantage,
+        clip_eps, value_coef, category_entropy_coef, gaussian_entropy_coef,
+        trpo_category_kl_coef, trpo_gaussian_kl_coef,
+        magnet_category_kl_coef, magnet_gaussian_kl_coef,
+    )
+
+
 def build_mixture_ppo_loss_fn(
     category_entropy_coef: float,
     gaussian_entropy_coef: float,
@@ -558,6 +589,7 @@ def build_mixture_ppo_loss_fn(
     trpo_gaussian_kl_coef: float,
     magnet_category_kl_coef: float,
     magnet_gaussian_kl_coef: float,
+    shared_obs: bool = False,
 ):
     """Batches `mixture_ppo_loss` over an `Episode`'s leading (env) axis.
 
@@ -571,6 +603,18 @@ def build_mixture_ppo_loss_fn(
     happens here, before the per-sample `vmap`; `batch` (an `Episode` whose
     fields all carry the leading env axis) is `vmap`ed as a single pytree
     argument rather than unpacked field by field.
+
+    `shared_obs` says every sample in the batch carries the *same*
+    observation -- true of the one-shot games in `games.examples`, whose
+    `ZeroSumGame.observation` is a constant (see
+    `ZeroSumGame.constant_observation`, which is what the trainers pass
+    here). The forward pass is then lifted out of the `vmap` and run once on
+    `batch.obs[0]` instead of once per sample, which is the whole cost of the
+    update for a small torso and a large `num_envs`; only the cheap per-sample
+    log-prob/KL arithmetic stays batched. Mathematically identical -- the
+    lifted outputs are exactly what the per-sample apply would have returned
+    -- so it is purely a saving, but it is silently *wrong* if the
+    observations actually differ, hence off by default.
     """
 
     def loss_fn(
@@ -586,14 +630,24 @@ def build_mixture_ppo_loss_fn(
         advantage = batch.reward - batch.value
         advantage = (advantage - jnp.mean(advantage)) / (jnp.std(advantage) + 1e-8)
 
-        per_sample_loss, metrics = jax.vmap(
-            mixture_ppo_loss, in_axes=(None, None, 0, 0, None, None, None, None, None, None, None, None)
-        )(
-            params, network, batch, advantage, clip_eps, value_coef,
+        coefs = (
             category_entropy_coef, gaussian_entropy_coef,
             trpo_category_kl_coef, trpo_gaussian_kl_coef,
             magnet_category_kl_coef, magnet_gaussian_kl_coef,
         )
+        if shared_obs:
+            logits, means, log_stds, value_pred = network.apply(params, batch.obs[0])
+            per_sample_loss, metrics = jax.vmap(
+                mixture_ppo_loss_from_outputs,
+                in_axes=(None, None, None, None, None, 0, 0, None, None, None, None, None, None, None, None),
+            )(
+                logits, means, log_stds, value_pred, network.num_atoms, batch, advantage,
+                clip_eps, value_coef, *coefs,
+            )
+        else:
+            per_sample_loss, metrics = jax.vmap(
+                mixture_ppo_loss, in_axes=(None, None, 0, 0, None, None, None, None, None, None, None, None)
+            )(params, network, batch, advantage, clip_eps, value_coef, *coefs)
         return jnp.mean(per_sample_loss), jax.tree_util.tree_map(jnp.mean, metrics)
 
     return loss_fn
