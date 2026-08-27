@@ -44,6 +44,11 @@ from .self_play import SelfPlayPPOTrainer
 from .sequential_rollout import build_episode_sampler, collect_sequential_batch
 from .sequential_trainer import SequentialSelfPlayPPOTrainer
 from .trainer import PPOTrainer
+from .trainer_common import (
+    MixtureTrainState,
+    create_mixture_train_state,
+    update_target_and_magnet,
+)
 
 __all__ = [
     "ActorCritic",
@@ -84,6 +89,9 @@ __all__ = [
     "sample_mixture_component",
     "MixturePPOTrainer",
     "MixtureSelfPlayPPOTrainer",
+    "MixtureTrainState",
+    "create_mixture_train_state",
+    "update_target_and_magnet",
     "flatten_batch_axes",
     "masked_mean",
     "normalized_advantage",

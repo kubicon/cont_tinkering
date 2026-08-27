@@ -163,7 +163,7 @@ def _run_ppo(game, cfg, run_config, seed_init: bool) -> tuple[ri.Params, ...]:
             setattr(trainer, state_name,
                     state.replace(params=seeded, target_params=seeded, magnet_params=seeded))
 
-    step = mt._build_self_play_train_step(game, trainer.network_1, trainer.network_2, hp0, hp1)
+    step = mt._build_self_play_train_step(game, (trainer.network_1, trainer.network_2), (hp0, hp1))
     obs = (game.observation(0, jax.random.PRNGKey(0)), game.observation(1, jax.random.PRNGKey(0)))
 
     def head(network, params, player: int) -> ri.Params:

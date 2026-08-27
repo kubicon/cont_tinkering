@@ -10,7 +10,6 @@ import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 
 from games.base import ZeroSumGame
 
@@ -26,19 +25,43 @@ from .mixture import (
     MixtureActorCritic,
     OpponentActionFn,
     build_mixture_network,
-    build_mixture_ppo_loss_fn,
     collect_mixture_episode,
     collect_mixture_self_play_episode,
     sample_mixture_actions,
 )
-from .ppo import TrainState, create_train_state, ppo_update
+from .ppo import ppo_update
+from .trainer_common import (
+    MixtureTrainState,
+    append_chunk_records,
+    build_loss_fn,
+    create_mixture_train_state,
+    reject_batch_norm,
+    update_target_and_magnet,
+)
+
+__all__ = [
+    "MixturePPOTrainer",
+    "MixtureSelfPlayPPOTrainer",
+    "MixtureTrainState",
+    "create_mixture_train_state",
+    "update_target_and_magnet",
+]
 
 # Monte-Carlo samples drawn from each mixture policy when estimating its exploitability.
 EXPLOITABILITY_SAMPLES = 512
 
+# The observation of a one-shot game is a constant (see
+# `ZeroSumGame.constant_observation`), so the key it is drawn with is irrelevant
+# and fixing it keeps every readout comparable across chunks.
+_OBSERVATION_KEY = jax.random.PRNGKey(0)
 
-def _build_strategy_fn(network: MixtureActorCritic):
-    """Jitted `(params, obs, mask) -> (probs, means, stds)` for `_strategy_str`.
+
+def _format_vector(values) -> tuple[float, ...]:
+    return tuple(round(float(v), 3) for v in values)
+
+
+def _build_strategy_str(network: MixtureActorCritic):
+    """`(params, obs, mask=None) -> str`, the full behavioral strategy at `obs`.
 
     Logging runs once per chunk, but an eager `network.apply` there costs more
     than the whole chunk of training it reports on: every op dispatches
@@ -46,76 +69,31 @@ def _build_strategy_fn(network: MixtureActorCritic):
     device-to-host sync. Jitting the forward pass and pulling the three arrays
     back in one `device_get` makes the whole thing a rounding error again.
     """
+    num_atoms, num_components = network.num_atoms, network.num_components
+    default_mask = np.ones(num_atoms + num_components, dtype=bool)
+    default_mask_device = jnp.asarray(default_mask)
 
     @jax.jit
-    def strategy_fn(params, obs: chex.Array, mask: chex.Array):
+    def forward(params, obs: chex.Array, mask: chex.Array):
         logits, means, log_stds, _ = network.apply(params, obs)
         return jnp.exp(masked_log_softmax(logits, mask)), means, jnp.exp(log_stds)
 
-    return strategy_fn
+    def strategy_str(params, obs: chex.Array, mask: chex.Array | None = None) -> str:
+        if mask is None:
+            mask, mask_device = default_mask, default_mask_device
+        else:
+            mask, mask_device = np.asarray(mask), jnp.asarray(mask)
+        probs, means, stds = jax.device_get(forward(params, obs, mask_device))
 
+        parts = [f"atom{i} {probs[i]:.2f}" for i in range(num_atoms) if mask[i]]
+        parts += [
+            f"{probs[num_atoms + k]:.2f}x{_format_vector(means[k])}±{_format_vector(stds[k])}"
+            for k in range(num_components)
+            if mask[num_atoms + k]
+        ]
+        return ", ".join(parts)
 
-def _strategy_str(
-    network: MixtureActorCritic,
-    strategy_fn,
-    params,
-    obs: chex.Array,
-    mask: chex.Array | None = None,
-) -> str:
-    """The full behavioral strategy at `obs`.
-
-    """
-    if mask is None:
-        mask = np.ones(network.num_atoms + network.num_components, dtype=bool)
-    probs, means, stds = jax.device_get(strategy_fn(params, obs, jnp.asarray(mask)))
-    mask = np.asarray(mask)
-
-    parts = [f"atom{i} {probs[i]:.2f}" for i in range(network.num_atoms) if mask[i]]
-    parts += [
-        f"{probs[network.num_atoms + k]:.2f}x"
-        f"{tuple(round(float(x), 3) for x in means[k])}±{tuple(round(float(s), 3) for s in stds[k])}"
-        for k in range(network.num_components)
-        if mask[network.num_atoms + k]
-    ]
-    return ", ".join(parts)
-
-
-class MixtureTrainState(TrainState):
-    """`TrainState` plus two extra, non-trained copies of `params`.
-    """
-
-    target_params: chex.ArrayTree
-    magnet_params: chex.ArrayTree
-    magnet_step: chex.Array
-
-
-def create_mixture_train_state(
-    network: MixtureActorCritic, params, hyperparams: MixturePPOHyperparams
-) -> MixtureTrainState:
-    base = create_train_state(network, params, hyperparams)
-    return MixtureTrainState(
-        step=base.step,
-        apply_fn=base.apply_fn,
-        params=base.params,
-        tx=base.tx,
-        opt_state=base.opt_state,
-        target_params=params,
-        magnet_params=params,
-        magnet_step=jnp.zeros((), dtype=jnp.int32),
-    )
-
-
-def _update_target_and_magnet(
-    state: MixtureTrainState, hyperparams: MixturePPOHyperparams
-) -> MixtureTrainState:
-    magnet_step = state.magnet_step + 1
-    return state.replace(
-        target_params=optax.incremental_update(state.params, state.target_params, hyperparams.target_tau),
-        magnet_params=optax.periodic_update(
-            state.params, state.magnet_params, magnet_step, hyperparams.magnet_interval
-        ),
-        magnet_step=magnet_step,
-    )
+    return strategy_str
 
 
 def _build_train_step(
@@ -125,13 +103,7 @@ def _build_train_step(
     hyperparams: MixturePPOHyperparams,
     perspective: int,
 ):
-    loss_fn = build_mixture_ppo_loss_fn(
-        perspective,
-        hyperparams.category_entropy_coef, hyperparams.gaussian_entropy_coef,
-        hyperparams.trpo_category_kl_coef, hyperparams.trpo_gaussian_kl_coef,
-        hyperparams.magnet_category_kl_coef, hyperparams.magnet_gaussian_kl_coef,
-        shared_obs=game.constant_observation,
-    )
+    loss_fn = build_loss_fn(perspective, hyperparams, shared_obs=game.constant_observation)
 
     def step(state: MixtureTrainState, key: jax.Array):
         batch = collect_mixture_episode(
@@ -139,7 +111,7 @@ def _build_train_step(
             key, hyperparams.num_envs, perspective,
         )
         state, metrics = ppo_update(state, network, batch, hyperparams, loss_fn=loss_fn)
-        state = _update_target_and_magnet(state, hyperparams)
+        state = update_target_and_magnet(state, hyperparams)
         metrics = {**metrics, "mean_reward": jnp.mean(batch.reward)}
         return state, metrics
 
@@ -161,8 +133,14 @@ class MixturePPOTrainer:
         perspective: int = 0,
         seed: int = 0,
     ):
-        if hyperparams.normalization == "batch_norm":
-            raise ValueError("batch_norm is not supported (see PPOTrainer for why).")
+        reject_batch_norm("hyperparams", hyperparams)
+        if hyperparams.num_atoms != 0:
+            # `train` reports exploitability every chunk via
+            # `sample_mixture_actions`, which is meaningless with atoms. Fail
+            # here rather than at the end of the first chunk.
+            raise ValueError(
+                f"one-shot games have no discrete actions, got num_atoms={hyperparams.num_atoms}"
+            )
 
         self.game = game
         self.hyperparams = hyperparams
@@ -179,28 +157,51 @@ class MixturePPOTrainer:
 
         train_step = _build_train_step(game, self.network, opponent_action_fn, hyperparams, perspective)
         self._run_chunk = jax.jit(lambda state, keys: jax.lax.scan(train_step, state, keys))
-        self._exploitability_fn = jax.jit(game.mixture_exploitability)
-        self._strategy_fn = _build_strategy_fn(self.network)
+        self._strategy_str = _build_strategy_str(self.network)
+
+        # Constant for the whole run, so they are computed once rather than
+        # rebuilt (and re-transferred) on every chunk's log line.
+        self._obs = game.observation(perspective, _OBSERVATION_KEY)
+        self._opponent_sample = _format_vector(
+            jnp.squeeze(opponent_action_fn(_OBSERVATION_KEY, 1), axis=0)
+        )
+        self._exploitability = self._build_exploitability_fn()
 
         self.history: list[dict] = []
 
-    def _exploitability(self, params, key: jax.Array) -> jax.Array:
-        """Exploitability of `params`'s mixed strategy against the opponent's action distribution.
+    def _build_exploitability_fn(self):
+        """`(params, target_params, key) -> (live, target)` exploitabilities, jitted whole.
 
-        Samples a batch of actions from the mixture policy (rather than
+        Samples a batch of actions from each mixture policy (rather than
         collapsing it to its mode), so a genuinely multi-modal equilibrium --
         which no single action can represent -- reads as unexploitable.
-        """
-        obs = self.game.observation(self.perspective, jax.random.PRNGKey(0))
-        sample_key, opponent_key, exploit_key = jax.random.split(key, 3)
-        actions = sample_mixture_actions(
-            self.network, params, obs, self.game.action_space(self.perspective),
-            sample_key, EXPLOITABILITY_SAMPLES,
-        )
-        opponent_actions = self.opponent_action_fn(opponent_key, EXPLOITABILITY_SAMPLES)
 
-        actions_1, actions_2 = (actions, opponent_actions) if self.perspective == 0 else (opponent_actions, actions)
-        return self._exploitability_fn(actions_1, actions_2, exploit_key)
+        Both iterates go through one jitted call: the sampling used to run
+        eagerly around a jitted best-response, which dispatched the policy
+        forward pass op by op, and the two measurements then cost two
+        device-to-host syncs instead of one.
+        """
+        game, network, perspective = self.game, self.network, self.perspective
+        space = game.action_space(perspective)
+        opponent_action_fn = self.opponent_action_fn
+        obs = self._obs
+
+        def exploitability(params, key: jax.Array) -> jax.Array:
+            sample_key, opponent_key, exploit_key = jax.random.split(key, 3)
+            actions = sample_mixture_actions(
+                network, params, obs, space, sample_key, EXPLOITABILITY_SAMPLES
+            )
+            opponent_actions = opponent_action_fn(opponent_key, EXPLOITABILITY_SAMPLES)
+            if perspective == 0:
+                return game.mixture_exploitability(actions, opponent_actions, exploit_key)
+            return game.mixture_exploitability(opponent_actions, actions, exploit_key)
+
+        @jax.jit
+        def both(params, target_params, key: jax.Array):
+            live_key, target_key = jax.random.split(key)
+            return exploitability(params, live_key), exploitability(target_params, target_key)
+
+        return both
 
     def train(
         self,
@@ -224,39 +225,30 @@ class MixturePPOTrainer:
             step_keys = jax.random.split(chunk_key, epochs)
             self.state, metrics_stack = self._run_chunk(self.state, step_keys)
 
-            # One device-to-host transfer for the whole chunk. Indexing the device
-            # arrays per iteration instead costs a dispatch and a sync *per metric
-            # per iteration*, which for a 300-iteration chunk takes several times
-            # longer than the training it is reporting on.
-            metrics_chunk = jax.device_get(metrics_stack)
-            for offset in range(epochs):
-                iteration = chunk * epochs + offset + 1
-                record = {"iteration": iteration, **{k: float(v[offset]) for k, v in metrics_chunk.items()}}
-                self.history.append(record)
-
-            exploit_key, target_exploit_key = jax.random.split(exploit_key)
-            record["exploitability"] = float(self._exploitability(self.state.params, exploit_key))
-            record["exploitability_target"] = float(
-                self._exploitability(self.state.target_params, target_exploit_key)
+            record = append_chunk_records(self.history, metrics_stack, chunk, epochs)
+            live, target = jax.device_get(
+                self._exploitability(self.state.params, self.state.target_params, exploit_key)
             )
+            record["exploitability"] = float(live)
+            record["exploitability_target"] = float(target)
 
-            message = (
-                f"iter {iteration:5d} | reward {record['mean_reward']:+.4f} "
+            print(
+                f"iter {record['iteration']:5d} | reward {record['mean_reward']:+.4f} "
                 f"| policy_loss {record['policy_loss']:+.4f} | value_loss {record['value_loss']:.4f} "
                 f"| entropy {record['entropy']:.4f} (category {record['category_entropy']:.4f}) "
                 f"| approx_kl {record['approx_kl']:.4f} "
                 f"| exploitability {record['exploitability']:.4f}"
                 f" (target {record['exploitability_target']:.4f})"
             )
-            print(message)
-            obs = self.game.observation(self.perspective, jax.random.PRNGKey(0))
-            opponent_sample = jnp.squeeze(self.opponent_action_fn(jax.random.PRNGKey(0), 1), axis=0)
-            print(f"  player {self.perspective} strategy: {_strategy_str(self.network, self._strategy_fn, self.state.params, obs)}")
+            print(
+                f"  player {self.perspective} strategy: "
+                f"{self._strategy_str(self.state.params, self._obs)}"
+            )
             print(
                 f"  player {self.perspective} target strategy: "
-                f"{_strategy_str(self.network, self._strategy_fn, self.state.target_params, obs)}"
+                f"{self._strategy_str(self.state.target_params, self._obs)}"
             )
-            print(f"  opponent sample: {tuple(round(float(x), 3) for x in opponent_sample)}")
+            print(f"  opponent sample: {self._opponent_sample}")
 
             if checkpoint_dir is not None:
                 self.save(checkpoint_dir, chunk + 1)
@@ -275,6 +267,11 @@ class MixturePPOTrainer:
         opponent_action_fn: OpponentActionFn,
         perspective: int = 0,
     ) -> "MixturePPOTrainer":
+        """Rebuild a trainer at a checkpoint's params.
+
+        Only params are stored, so the optimizer state and rng stream restart
+        from scratch: this resumes a *policy*, not a run.
+        """
         hyperparams, params = load_checkpoint_step(checkpoint_dir, step, hyperparams_cls=MixturePPOHyperparams)
         trainer = cls(game, hyperparams, opponent_action_fn, perspective=perspective)
         trainer.state = trainer.state.replace(params=params, target_params=params, magnet_params=params)
@@ -283,36 +280,24 @@ class MixturePPOTrainer:
 
 def _build_self_play_train_step(
     game: ZeroSumGame,
-    network_1: MixtureActorCritic,
-    network_2: MixtureActorCritic,
-    hyperparams_1: MixturePPOHyperparams,
-    hyperparams_2: MixturePPOHyperparams,
+    networks: tuple[MixtureActorCritic, MixtureActorCritic],
+    hyperparams: tuple[MixturePPOHyperparams, MixturePPOHyperparams],
 ):
-    loss_fn_1 = build_mixture_ppo_loss_fn(
-        0,
-        hyperparams_1.category_entropy_coef, hyperparams_1.gaussian_entropy_coef,
-        hyperparams_1.trpo_category_kl_coef, hyperparams_1.trpo_gaussian_kl_coef,
-        hyperparams_1.magnet_category_kl_coef, hyperparams_1.magnet_gaussian_kl_coef,
-        shared_obs=game.constant_observation,
-    )
-    loss_fn_2 = build_mixture_ppo_loss_fn(
-        1,
-        hyperparams_2.category_entropy_coef, hyperparams_2.gaussian_entropy_coef,
-        hyperparams_2.trpo_category_kl_coef, hyperparams_2.trpo_gaussian_kl_coef,
-        hyperparams_2.magnet_category_kl_coef, hyperparams_2.magnet_gaussian_kl_coef,
-        shared_obs=game.constant_observation,
+    loss_fns = tuple(
+        build_loss_fn(player, hyperparams[player], shared_obs=game.constant_observation)
+        for player in (0, 1)
     )
 
     def step(state_1: MixtureTrainState, state_2: MixtureTrainState, key: jax.Array):
         batch_1, batch_2 = collect_mixture_self_play_episode(
-            game, network_1, state_1.params, state_1.magnet_params,
-            network_2, state_2.params, state_2.magnet_params,
-            key, hyperparams_1.num_envs,
+            game, networks[0], state_1.params, state_1.magnet_params,
+            networks[1], state_2.params, state_2.magnet_params,
+            key, hyperparams[0].num_envs,
         )
-        state_1, metrics_1 = ppo_update(state_1, network_1, batch_1, hyperparams_1, loss_fn=loss_fn_1)
-        state_2, metrics_2 = ppo_update(state_2, network_2, batch_2, hyperparams_2, loss_fn=loss_fn_2)
-        state_1 = _update_target_and_magnet(state_1, hyperparams_1)
-        state_2 = _update_target_and_magnet(state_2, hyperparams_2)
+        state_1, metrics_1 = ppo_update(state_1, networks[0], batch_1, hyperparams[0], loss_fn=loss_fns[0])
+        state_2, metrics_2 = ppo_update(state_2, networks[1], batch_2, hyperparams[1], loss_fn=loss_fns[1])
+        state_1 = update_target_and_magnet(state_1, hyperparams[0])
+        state_2 = update_target_and_magnet(state_2, hyperparams[1])
         metrics = {
             "mean_reward_1": jnp.mean(batch_1.reward),
             **{f"{k}_1": v for k, v in metrics_1.items()},
@@ -334,8 +319,12 @@ class MixtureSelfPlayPPOTrainer:
         seed: int = 0,
     ):
         for name, hyperparams in (("hyperparams_1", hyperparams_1), ("hyperparams_2", hyperparams_2)):
-            if hyperparams.normalization == "batch_norm":
-                raise ValueError(f"{name}: batch_norm is not supported (see PPOTrainer for why).")
+            reject_batch_norm(name, hyperparams)
+            if hyperparams.num_atoms != 0:
+                raise ValueError(
+                    f"{name}: one-shot games have no discrete actions, "
+                    f"got num_atoms={hyperparams.num_atoms}"
+                )
         if hyperparams_1.num_envs != hyperparams_2.num_envs:
             raise ValueError("hyperparams_1.num_envs must equal hyperparams_2.num_envs for self-play rollouts")
 
@@ -354,7 +343,7 @@ class MixtureSelfPlayPPOTrainer:
         self.state_2 = create_mixture_train_state(self.network_2, params_2, hyperparams_2)
 
         train_step = _build_self_play_train_step(
-            game, self.network_1, self.network_2, hyperparams_1, hyperparams_2
+            game, (self.network_1, self.network_2), (hyperparams_1, hyperparams_2)
         )
 
         def scan_body(states, key):
@@ -363,29 +352,53 @@ class MixtureSelfPlayPPOTrainer:
             return (state_1, state_2), metrics
 
         self._run_chunk = jax.jit(lambda states, keys: jax.lax.scan(scan_body, states, keys))
-        self._exploitability_fn = jax.jit(game.mixture_exploitability)
-        self._strategy_fn_1 = _build_strategy_fn(self.network_1)
-        self._strategy_fn_2 = _build_strategy_fn(self.network_2)
+        self._strategy_str_1 = _build_strategy_str(self.network_1)
+        self._strategy_str_2 = _build_strategy_str(self.network_2)
+
+        # Constant for the whole run (see `_OBSERVATION_KEY`).
+        self._obs_1 = game.observation(0, _OBSERVATION_KEY)
+        self._obs_2 = game.observation(1, _OBSERVATION_KEY)
+        self._exploitability = self._build_exploitability_fn()
 
         self.history: list[dict] = []
 
-    def _exploitability(self, params_1, params_2, key: jax.Array) -> jax.Array:
-        """Exploitability of the two players' mixed strategies (0 at a Nash equilibrium).
+    @property
+    def params(self) -> tuple:
+        return (self.state_1.params, self.state_2.params)
+
+    @property
+    def target_params(self) -> tuple:
+        return (self.state_1.target_params, self.state_2.target_params)
+
+    def _build_exploitability_fn(self):
+        """`(params, target_params, key) -> (live, target)` exploitabilities, jitted whole.
 
         Each mixture is Monte-Carlo sampled rather than collapsed to its mode,
         so a multi-modal equilibrium (which no single action can represent)
-        reads as unexploitable instead of maximally exploitable.
+        reads as unexploitable instead of maximally exploitable. Both iterates
+        share one jitted call and so one device-to-host sync.
         """
-        obs_1 = self.game.observation(0, jax.random.PRNGKey(0))
-        obs_2 = self.game.observation(1, jax.random.PRNGKey(0))
-        sample_key_1, sample_key_2, exploit_key = jax.random.split(key, 3)
-        actions_1 = sample_mixture_actions(
-            self.network_1, params_1, obs_1, self.game.action_space(0), sample_key_1, EXPLOITABILITY_SAMPLES
-        )
-        actions_2 = sample_mixture_actions(
-            self.network_2, params_2, obs_2, self.game.action_space(1), sample_key_2, EXPLOITABILITY_SAMPLES
-        )
-        return self._exploitability_fn(actions_1, actions_2, exploit_key)
+        game = self.game
+        networks = (self.network_1, self.network_2)
+        spaces = (game.action_space(0), game.action_space(1))
+        observations = (self._obs_1, self._obs_2)
+
+        def exploitability(params: tuple, key: jax.Array) -> jax.Array:
+            sample_key_1, sample_key_2, exploit_key = jax.random.split(key, 3)
+            actions = tuple(
+                sample_mixture_actions(
+                    networks[i], params[i], observations[i], spaces[i], sample_key, EXPLOITABILITY_SAMPLES
+                )
+                for i, sample_key in enumerate((sample_key_1, sample_key_2))
+            )
+            return game.mixture_exploitability(actions[0], actions[1], exploit_key)
+
+        @jax.jit
+        def both(params: tuple, target_params: tuple, key: jax.Array):
+            live_key, target_key = jax.random.split(key)
+            return exploitability(params, live_key), exploitability(target_params, target_key)
+
+        return both
 
     def train(
         self,
@@ -412,26 +425,15 @@ class MixtureSelfPlayPPOTrainer:
                 (self.state_1, self.state_2), step_keys
             )
 
-            # One device-to-host transfer for the whole chunk. Indexing the device
-            # arrays per iteration instead costs a dispatch and a sync *per metric
-            # per iteration*, which for a 300-iteration chunk takes several times
-            # longer than the training it is reporting on.
-            metrics_chunk = jax.device_get(metrics_stack)
-            for offset in range(epochs):
-                iteration = chunk * epochs + offset + 1
-                record = {"iteration": iteration, **{k: float(v[offset]) for k, v in metrics_chunk.items()}}
-                self.history.append(record)
-
-            exploit_key, target_exploit_key = jax.random.split(exploit_key)
-            record["exploitability"] = float(
-                self._exploitability(self.state_1.params, self.state_2.params, exploit_key)
+            record = append_chunk_records(self.history, metrics_stack, chunk, epochs)
+            live, target = jax.device_get(
+                self._exploitability(self.params, self.target_params, exploit_key)
             )
-            record["exploitability_target"] = float(
-                self._exploitability(self.state_1.target_params, self.state_2.target_params, target_exploit_key)
-            )
+            record["exploitability"] = float(live)
+            record["exploitability_target"] = float(target)
 
-            message = (
-                f"iter {iteration:5d} | reward {record['mean_reward_1']:+.4f} "
+            print(
+                f"iter {record['iteration']:5d} | reward {record['mean_reward_1']:+.4f} "
                 f"| p1 policy_loss {record['policy_loss_1']:+.4f} value_loss {record['value_loss_1']:.4f} "
                 f"category_entropy {record['category_entropy_1']:.4f} "
                 f"| p2 policy_loss {record['policy_loss_2']:+.4f} value_loss {record['value_loss_2']:.4f} "
@@ -439,13 +441,10 @@ class MixtureSelfPlayPPOTrainer:
                 f"| exploitability {record['exploitability']:.4f}"
                 f" (target {record['exploitability_target']:.4f})"
             )
-            print(message)
-            obs_1 = self.game.observation(0, jax.random.PRNGKey(0))
-            obs_2 = self.game.observation(1, jax.random.PRNGKey(0))
-            print(f"  p1 strategy: {_strategy_str(self.network_1, self._strategy_fn_1, self.state_1.params, obs_1)}")
-            print(f"  p2 strategy: {_strategy_str(self.network_2, self._strategy_fn_2, self.state_2.params, obs_2)}")
-            print(f"  p1 target strategy: {_strategy_str(self.network_1, self._strategy_fn_1, self.state_1.target_params, obs_1)}")
-            print(f"  p2 target strategy: {_strategy_str(self.network_2, self._strategy_fn_2, self.state_2.target_params, obs_2)}")
+            print(f"  p1 strategy: {self._strategy_str_1(self.state_1.params, self._obs_1)}")
+            print(f"  p2 strategy: {self._strategy_str_2(self.state_2.params, self._obs_2)}")
+            print(f"  p1 target strategy: {self._strategy_str_1(self.state_1.target_params, self._obs_1)}")
+            print(f"  p2 target strategy: {self._strategy_str_2(self.state_2.target_params, self._obs_2)}")
 
             if checkpoint_dir is not None:
                 self.save(checkpoint_dir, chunk + 1)
@@ -464,6 +463,7 @@ class MixtureSelfPlayPPOTrainer:
 
     @classmethod
     def load(cls, checkpoint_dir: str | Path, step: int, game: ZeroSumGame) -> "MixtureSelfPlayPPOTrainer":
+        """Rebuild a trainer at a checkpoint's params (optimizer state and rng restart)."""
         entries = load_checkpoint_step_multi(checkpoint_dir, step, hyperparams_cls=MixturePPOHyperparams)
         hyperparams_1, params_1 = entries["player_1"]
         hyperparams_2, params_2 = entries["player_2"]

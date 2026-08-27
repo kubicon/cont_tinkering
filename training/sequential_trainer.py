@@ -19,33 +19,28 @@ from games.sequential import TERMINAL, SequentialZeroSumGame
 
 from .checkpoint import load_checkpoint_step_multi, save_checkpoint_step_multi
 from .config import MixturePPOHyperparams
-from .mixture import MixtureActorCritic, build_mixture_network, build_mixture_ppo_loss_fn
-from .mixture_trainer import (
-    MixtureTrainState,
-    _update_target_and_magnet,
-    create_mixture_train_state,
-)
+from .mixture import MixtureActorCritic, build_mixture_network
 from .ppo import ppo_update
 from .sequential_rollout import build_episode_sampler, collect_sequential_batch
+from .trainer_common import (
+    MixtureTrainState,
+    append_chunk_records,
+    build_loss_fn,
+    create_mixture_train_state,
+    reject_batch_norm,
+    update_target_and_magnet,
+)
 
 
 def _build_self_play_train_step(
     game: SequentialZeroSumGame,
-    network_0: MixtureActorCritic,
-    network_1: MixtureActorCritic,
-    hyperparams_0: MixturePPOHyperparams,
-    hyperparams_1: MixturePPOHyperparams,
+    networks: tuple[MixtureActorCritic, MixtureActorCritic],
+    hyperparams: tuple[MixturePPOHyperparams, MixturePPOHyperparams],
 ):
-    sample_episode = build_episode_sampler(game, network_0, network_1)
-    loss_fns = tuple(
-        build_mixture_ppo_loss_fn(
-            player,
-            hyperparams.category_entropy_coef, hyperparams.gaussian_entropy_coef,
-            hyperparams.trpo_category_kl_coef, hyperparams.trpo_gaussian_kl_coef,
-            hyperparams.magnet_category_kl_coef, hyperparams.magnet_gaussian_kl_coef,
-        )
-        for player, hyperparams in enumerate((hyperparams_0, hyperparams_1))
-    )
+    sample_episode = build_episode_sampler(game, networks[0], networks[1])
+    # `shared_obs` is never right here: a sequential game's whole point is a
+    # per-infoset observation, so the forward pass stays inside the per-sample vmap.
+    loss_fns = tuple(build_loss_fn(player, hyperparams[player]) for player in (0, 1))
 
     def step(state_0: MixtureTrainState, state_1: MixtureTrainState, key: jax.Array):
         # One batch of trajectories feeds both updates: the players' decisions are
@@ -54,12 +49,12 @@ def _build_self_play_train_step(
             sample_episode,
             state_0.params, state_0.magnet_params,
             state_1.params, state_1.magnet_params,
-            key, hyperparams_0.num_envs,
+            key, hyperparams[0].num_envs,
         )
-        state_0, metrics_0 = ppo_update(state_0, network_0, batch, hyperparams_0, loss_fn=loss_fns[0])
-        state_1, metrics_1 = ppo_update(state_1, network_1, batch, hyperparams_1, loss_fn=loss_fns[1])
-        state_0 = _update_target_and_magnet(state_0, hyperparams_0)
-        state_1 = _update_target_and_magnet(state_1, hyperparams_1)
+        state_0, metrics_0 = ppo_update(state_0, networks[0], batch, hyperparams[0], loss_fn=loss_fns[0])
+        state_1, metrics_1 = ppo_update(state_1, networks[1], batch, hyperparams[1], loss_fn=loss_fns[1])
+        state_0 = update_target_and_magnet(state_0, hyperparams[0])
+        state_1 = update_target_and_magnet(state_1, hyperparams[1])
 
         metrics = {
             "payoff": jnp.mean(payoff),
@@ -84,8 +79,7 @@ class SequentialSelfPlayPPOTrainer:
         seed: int = 0,
     ):
         for name, hyperparams in (("hyperparams_0", hyperparams_0), ("hyperparams_1", hyperparams_1)):
-            if hyperparams.normalization == "batch_norm":
-                raise ValueError(f"{name}: batch_norm is not supported (see PPOTrainer for why).")
+            reject_batch_norm(name, hyperparams)
         if hyperparams_0.num_envs != hyperparams_1.num_envs:
             raise ValueError("hyperparams_0.num_envs must equal hyperparams_1.num_envs for self-play rollouts")
 
@@ -103,9 +97,7 @@ class SequentialSelfPlayPPOTrainer:
         self.state_0 = create_mixture_train_state(self.networks[0], params[0], hyperparams_0)
         self.state_1 = create_mixture_train_state(self.networks[1], params[1], hyperparams_1)
 
-        train_step = _build_self_play_train_step(
-            game, self.networks[0], self.networks[1], hyperparams_0, hyperparams_1
-        )
+        train_step = _build_self_play_train_step(game, self.networks, self.hyperparams)
 
         def scan_body(states, key):
             state_0, state_1 = states
@@ -146,15 +138,7 @@ class SequentialSelfPlayPPOTrainer:
                 (self.state_0, self.state_1), step_keys
             )
 
-            # One device-to-host transfer for the whole chunk. Indexing the device
-            # arrays per iteration instead costs a dispatch and a sync *per metric
-            # per iteration*, which for a 300-iteration chunk takes several times
-            # longer than the training it is reporting on.
-            metrics_chunk = jax.device_get(metrics_stack)
-            for offset in range(epochs):
-                iteration = chunk * epochs + offset + 1
-                record = {"iteration": iteration, **{k: float(v[offset]) for k, v in metrics_chunk.items()}}
-                self.history.append(record)
+            record = append_chunk_records(self.history, metrics_stack, chunk, epochs)
 
             # Evaluated once per chunk, on the parameters as they now stand, so
             # it attaches to that chunk's last record rather than to every iteration.
@@ -162,7 +146,7 @@ class SequentialSelfPlayPPOTrainer:
             record.update(extra)
 
             print(
-                f"iter {iteration:5d} | payoff {record['payoff']:+.4f} "
+                f"iter {record['iteration']:5d} | payoff {record['payoff']:+.4f} "
                 f"| len {record['episode_length']:.2f} "
                 f"| p0 policy {record['policy_loss_0']:+.4f} value {record['value_loss_0']:.4f} "
                 f"cat_H {record['category_entropy_0']:.4f} atom {record['atom_frac_0']:.2f} "
@@ -193,6 +177,7 @@ class SequentialSelfPlayPPOTrainer:
     def load(
         cls, checkpoint_dir: str | Path, step: int, game: SequentialZeroSumGame
     ) -> "SequentialSelfPlayPPOTrainer":
+        """Rebuild a trainer at a checkpoint's params (optimizer state and rng restart)."""
         entries = load_checkpoint_step_multi(checkpoint_dir, step, hyperparams_cls=MixturePPOHyperparams)
         hyperparams_0, params_0 = entries["player_0"]
         hyperparams_1, params_1 = entries["player_1"]
