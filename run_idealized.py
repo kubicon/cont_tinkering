@@ -65,6 +65,7 @@ jax.config.update("jax_enable_x64", True)
 
 from games.base import ZeroSumGame
 from games.configs import GAME_CONFIGS
+from games.sequential import SequentialZeroSumGame
 from games.spaces import BoxSpace
 from idealized_mmd import (
     Params,
@@ -861,6 +862,12 @@ def main() -> None:
 
     game_config, cfg, run_config = load_config(args.config)
     game = game_config.build()
+    if isinstance(game, SequentialZeroSumGame):
+        raise ValueError(
+            f"{type(game).__name__} is a sequential game, and this solver integrates a one-shot "
+            "payoff over the action space -- there is no such integral for a game tree. "
+            "Run it with train.py instead."
+        )
     p0, p1 = build_init(game, cfg)
 
     print(f"config  : {args.config}  ({'shared with train.py' if run_config else 'legacy standalone'})")

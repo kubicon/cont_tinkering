@@ -55,6 +55,11 @@ class MixturePPOHyperparams(PPOHyperparams):
     """
 
     num_components: int = 2
+    # Parameterless discrete actions in front of the Gaussian components (fold,
+    # check, call). 0 for the one-shot games in `games.examples`; a sequential
+    # game's own `HybridSpace` dictates it, so `train.py` reads it off the
+    # action space rather than taking it from the YAML.
+    num_atoms: int = 0
     low: tuple[float, ...] = (0.0,)
     high: tuple[float, ...] = (1.0,)
     clip_means: bool = False  # constrain the mean head to `[low, high]`; see `MixtureActorCritic`

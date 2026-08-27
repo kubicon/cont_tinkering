@@ -12,6 +12,29 @@ represent no matter how it's trained.
 on that phase's own mean. Concretely: sample a component `k ~ Categorical
 (logits)`, then `action ~ Normal(means[k], std)`. Training needs its own
 rollout/loss functions because the policy now has a discrete part.
+
+**Atoms.** The categorical head is widened to `num_atoms + num_components`,
+and the first `num_atoms` entries are *point masses* -- discrete actions
+carrying no continuous parameter at all (fold, check, call in a poker-like
+game; see `games.spaces.HybridSpace`). Drawing one of those is the whole
+action: no Gaussian is consulted, so its log-prob, its KL and its entropy
+contribution are all masked out of the loss for that sample. This is what
+makes the probability of a discrete choice a *number the policy states*,
+rather than an integral of the Gaussian mixture over some region of the
+action space -- and hence what gives that choice a real categorical policy
+gradient instead of the gradient of a piecewise-constant payoff.
+
+**Legality masks.** A game may forbid some kinds at some nodes (calling with
+no bet outstanding). `action_mask` on the `Episode` records, per sample,
+which categorical logits were legal *when it was sampled*; every softmax,
+entropy and KL in the loss re-applies it. Skipping that would leave the PPO
+importance ratios comparing against a distribution that was never sampled
+from. The mask is over logits, not kinds: `expand_kind_mask` replicates the
+continuous kind's bit across all `num_components` Gaussian components.
+
+With `num_atoms == 0` and an all-`True` mask, every one of those terms
+collapses back to the plain mixture policy, which is what the one-shot games
+in `games.examples` use.
 """
 
 from __future__ import annotations
@@ -24,9 +47,16 @@ import jax
 import jax.numpy as jnp
 
 from games.base import ZeroSumGame
+from games.spaces import MASKED_LOGIT
 from nets import Activation, Normalization
 
-from .actor_critic import categorical_kl, gaussian_kl, gaussian_log_prob
+from .actor_critic import (
+    categorical_kl,
+    gaussian_kl,
+    gaussian_log_prob,
+    masked_categorical_entropy,
+    masked_log_softmax,
+)
 from .config import MixturePPOHyperparams
 
 OpponentActionFn = Callable[[chex.PRNGKey, int], chex.Array]
@@ -45,6 +75,20 @@ OpponentActionFn = Callable[[chex.PRNGKey, int], chex.Array]
 #     `mixture_marginal_log_prob`) blows up, which NaNs the loss from the other side.
 #     This mirrors the `[log 1e-3, log 1]` clip that `idealized_mmd.run` already applies.
 LOG_STD_MIN = -6.907755  # log(1e-3)
+
+# Narrowest action box the std bounds will pretend to see, per dimension. A box
+# can legitimately have zero width -- a bet whose size is fixed, say, leaving the
+# continuous action carrying no information at all -- and then `log(high - low)`
+# is `-inf`, which makes the log-std ceiling `-inf`, every clip a NaN, and the
+# whole run NaN from the first step. Flooring the width at `exp(LOG_STD_MIN)`
+# collapses that case to a spread pinned at the floor, which is the right answer
+# for an action that cannot vary.
+MIN_ACTION_WIDTH = 1e-3  # == exp(LOG_STD_MIN)
+
+
+def _action_width(low: chex.Array, high: chex.Array) -> chex.Array:
+    """`high - low`, floored so a degenerate (zero-width) box stays representable."""
+    return jnp.maximum(high - low, MIN_ACTION_WIDTH)
 
 
 def _spread_bias_init(low: chex.Array, high: chex.Array, num_components: int) -> Callable:
@@ -79,11 +123,14 @@ def _std_bias_init(low: chex.Array, high: chex.Array, num_components: int) -> Ca
     component means, so the modes are distinct from the first step. Paired
     with a zero kernel on the head, the initial log-std is exactly this
     (obs-independent), matching how `means_head` is initialized.
+
+    Floored at `MIN_ACTION_WIDTH` so a zero-width box yields `log(1e-3)` rather
+    than `-inf`.
     """
 
     def init_fn(key: chex.PRNGKey, shape: tuple[int, ...], dtype=jnp.float32) -> chex.Array:
         del key
-        std = (high - low) / (2 * num_components)
+        std = jnp.maximum(_action_width(low, high) / (2 * num_components), MIN_ACTION_WIDTH)
         log_std = jnp.log(std).astype(dtype)  # (action_dim,)
         values = jnp.broadcast_to(log_std[None, :], (num_components, log_std.shape[0]))
         return values.reshape(shape).astype(dtype)
@@ -101,12 +148,24 @@ class MixtureActorCritic(nn.Module):
     whatever features the torso learns.
 
     `__call__` returns `(logits, means, log_std, value)`:
-      - `logits`: `(num_components,)`, the categorical distribution over components
-      - `means`: `(num_components, action_dim)`, each component's Gaussian mean
+      - `logits`: `(num_atoms + num_components,)`, the categorical distribution over
+        the `num_atoms` parameterless atoms followed by the `num_components`
+        Gaussian components
+      - `means`: `(num_components, action_dim)`, each *Gaussian* component's mean
         (clipped to `[low, high]` when `clip_means` is set -- off by default, since
         clipping also zeroes the gradient of a mean that has left the box)
       - `log_std`: `(num_components, action_dim)`, each component's own spread
       - `value`: scalar state-value estimate
+
+    Note the asymmetry: only the categorical head knows about atoms. An atom
+    carries no continuous parameter, so it has no mean and no spread to learn --
+    which is exactly the point, and why `means`/`log_std` are indexed by
+    `component - num_atoms` rather than by `component`.
+
+    The logits head keeps flax's default (near-zero) initialization, so every
+    kind starts at roughly equal probability: with one atom and two components
+    a fresh policy folds about a third of the time. A game wanting a different
+    prior should bias its payoffs, not this head.
     """
 
     action_dim: int
@@ -117,6 +176,7 @@ class MixtureActorCritic(nn.Module):
     activation: str = "tanh"
     normalization: str = "none"
     clip_means: bool = False
+    num_atoms: int = 0
 
     @nn.compact
     def __call__(
@@ -128,7 +188,7 @@ class MixtureActorCritic(nn.Module):
             torso = Normalization(kind=self.normalization)(torso, use_running_average=not train)
             torso = Activation(kind=self.activation)(torso)
 
-        logits = nn.Dense(self.num_components, name="logits_head")(torso)
+        logits = nn.Dense(self.num_atoms + self.num_components, name="logits_head")(torso)
 
         means_flat = nn.Dense(
             self.num_components * self.action_dim,
@@ -157,15 +217,57 @@ class MixtureActorCritic(nn.Module):
             name="log_std_head",
         )(torso)
         log_std = log_std_flat.reshape(self.num_components, self.action_dim)
-        log_std = jnp.clip(log_std, LOG_STD_MIN, jnp.log(self.high - self.low))
+        log_std = jnp.clip(log_std, LOG_STD_MIN, jnp.log(_action_width(self.low, self.high)))
 
         value = nn.Dense(1, name="value_head")(torso)
 
         return logits, means, log_std, jnp.squeeze(value, axis=-1)
 
 
+def expand_kind_mask(kind_mask: chex.Array, num_components: int) -> chex.Array:
+    """A game's `(num_atoms + 1,)` kind mask, widened to the categorical head's logits.
+
+    A game reasons about *kinds* -- fold, call, "bet something" -- and knows
+    nothing about how many Gaussians a policy uses to cover the continuous one.
+    So the single trailing bit for the continuous kind is replicated across all
+    `num_components` components, giving `(num_atoms + num_components,)`. A
+    consequence worth relying on: the Gaussian components are always legal
+    together or illegal together.
+    """
+    num_atoms = kind_mask.shape[-1] - 1
+    return jnp.concatenate(
+        [kind_mask[..., :num_atoms], jnp.repeat(kind_mask[..., num_atoms:], num_components, axis=-1)],
+        axis=-1,
+    )
+
+
+def component_to_kind(component: chex.Array, num_atoms: int) -> chex.Array:
+    """The `HybridAction.kind` a sampled categorical index plays.
+
+    Atoms map to themselves; every Gaussian component maps to the single
+    continuous kind `num_atoms`.
+    """
+    return jnp.minimum(component, num_atoms).astype(jnp.int32)
+
+
+def gaussian_component_index(component: chex.Array, num_atoms: int) -> chex.Array:
+    """Row of `means`/`log_stds` that `component` refers to, clamped to be in range.
+
+    Meaningless (and clamped to 0) for an atom, whose Gaussian factor is masked
+    out of every term of the loss anyway -- the clamp exists only so the gather
+    stays in bounds.
+    """
+    return jnp.maximum(component - num_atoms, 0)
+
+
 def mixture_log_probs(
-    logits: chex.Array, means: chex.Array, log_stds: chex.Array, component: chex.Array, raw_action: chex.Array
+    logits: chex.Array,
+    means: chex.Array,
+    log_stds: chex.Array,
+    mask: chex.Array,
+    component: chex.Array,
+    raw_action: chex.Array,
+    num_atoms: int,
 ) -> tuple[chex.Array, chex.Array]:
     """`(category_log_prob, gaussian_log_prob)` for one sample -- kept as separate factors.
 
@@ -177,26 +279,42 @@ def mixture_log_probs(
     separately (rather than summed into one joint log-prob) lets each head
     get its own PPO ratio and clip in `mixture_ppo_loss`, instead of only
     the product of the two being bounded.
+
+    When `component` is an atom the sampling path stopped at the categorical
+    draw, so the Gaussian factor is returned as exactly `0.0` -- an importance
+    ratio of 1, contributing nothing. `mask` is the per-logit legality mask
+    recorded at sampling time; the categorical factor is conditioned on it.
     """
-    category_log_prob = jax.nn.log_softmax(logits)[component]
-    mean = means[component]
-    log_std = log_stds[component]
-    return category_log_prob, gaussian_log_prob(raw_action, mean, log_std)
-
-
-def _categorical_entropy(logits: chex.Array) -> chex.Array:
-    log_p = jax.nn.log_softmax(logits)
-    return -jnp.sum(jnp.exp(log_p) * log_p)
+    category_log_prob = masked_log_softmax(logits, mask)[component]
+    index = gaussian_component_index(component, num_atoms)
+    log_prob = gaussian_log_prob(raw_action, means[index], log_stds[index])
+    return category_log_prob, jnp.where(component >= num_atoms, log_prob, 0.0)
 
 
 def mixture_marginal_log_prob(
-    logits: chex.Array, means: chex.Array, log_stds: chex.Array, raw_action: chex.Array
+    logits: chex.Array,
+    means: chex.Array,
+    log_stds: chex.Array,
+    mask: chex.Array,
+    raw_action: chex.Array,
+    num_atoms: int,
 ) -> chex.Array:
-    """`log p(a)` of the marginal mixture density at a single `raw_action`.
+    """`log p(a | a is continuous)` of the marginal mixture density at a single `raw_action`.
 
     Marginalizes the component out: `log sum_k softmax(logits)_k * N(a;
     means_k, std_k)`, computed stably with `logsumexp`. Used to estimate the
     action policy's entropy as `-log p(a)` (single-sample Monte Carlo).
+
+    **Conditional on the continuous branch**, and deliberately so. With atoms
+    present the policy is a mixture of a discrete measure and a continuous one,
+    which have no common dominating measure -- discrete entropy is in nats over
+    counting measure, differential entropy is over Lebesgue, and adding them is
+    incoherent. So the weights here are renormalized over the *Gaussian*
+    components alone (`log_softmax` of `logits[num_atoms:]`), leaving the
+    discrete part entirely to the categorical entropy term. Leaving them
+    unnormalized instead would silently make this term a function of the atoms'
+    probability, so an entropy bonus meant to keep the bet-size modes apart
+    would also be quietly pushing on how often the policy folds.
 
     Unlike the average of the per-component Gaussian entropies (`E_k[H(a |
     component=k)]`), this depends on how far apart the component means are:
@@ -208,7 +326,7 @@ def mixture_marginal_log_prob(
     (and, with permutation symmetry, would tend to) collapse together while
     the entropy metric still looked healthy.
     """
-    log_weights = jax.nn.log_softmax(logits)  # (num_components,)
+    log_weights = masked_log_softmax(logits[num_atoms:], mask[num_atoms:])  # (num_components,)
     per_component = jax.vmap(gaussian_log_prob, in_axes=(None, 0, 0))(raw_action, means, log_stds)
     return jax.nn.logsumexp(log_weights + per_component)
 
@@ -228,17 +346,44 @@ class Episode:
     """
 
     obs: chex.Array
-    logits: chex.Array  # (num_components,) categorical logits at sample time
-    means: chex.Array  # (num_components, action_dim) each component's mean at sample time
+    action_mask: chex.Array  # (num_atoms + num_components,) bool, which logits were legal here
+    logits: chex.Array  # (num_atoms + num_components,) categorical logits at sample time
+    means: chex.Array  # (num_components, action_dim) each Gaussian component's mean at sample time
     log_stds: chex.Array  # (num_components, action_dim) each component's log-std at sample time
-    magnet_logits: chex.Array  # (num_components,) categorical logits under `magnet_params`, same obs
+    magnet_logits: chex.Array  # (num_atoms + num_components,) logits under `magnet_params`, same obs
     magnet_means: chex.Array  # (num_components, action_dim) under `magnet_params`
     magnet_log_stds: chex.Array  # (num_components, action_dim) under `magnet_params`
-    component: chex.Array  # which categorical component was sampled
-    raw_action: chex.Array  # unclipped Gaussian sample from that component
-    action: chex.Array  # `raw_action` clipped to the action space; used to play the game
+    component: chex.Array  # which categorical entry was sampled: an atom, or a Gaussian component
+    raw_action: chex.Array  # unclipped Gaussian sample; meaningless (but finite) when an atom was drawn
+    action_kind: chex.Array  # `HybridAction.kind` actually played -- `component_to_kind(component)`
+    action_value: chex.Array  # `raw_action` clipped to the action space; read by the game only on the continuous kind
     value: chex.Array
     reward: chex.Array
+
+
+def sample_mixture_component(
+    logits: chex.Array,
+    means: chex.Array,
+    log_stds: chex.Array,
+    mask: chex.Array,
+    num_atoms: int,
+    key: chex.PRNGKey,
+) -> tuple[chex.Array, chex.Array]:
+    """Draw one `(component, raw_action)` from a masked hybrid mixture policy.
+
+    The Gaussian is drawn unconditionally, even when `component` turns out to be
+    an atom -- it costs one `normal` and keeps the returned pytree a fixed shape,
+    where branching would not. The draw is taken from
+    `gaussian_component_index(component)`, which clamps to component 0 for an
+    atom, so the stored value is always finite and inside the usual range; the
+    game ignores it and every loss term masks it out.
+    """
+    component_key, noise_key = jax.random.split(key)
+    component = jax.random.categorical(component_key, jnp.where(mask, logits, MASKED_LOGIT))
+    index = gaussian_component_index(component, num_atoms)
+    mean = means[index]
+    raw_action = mean + jnp.exp(log_stds[index]) * jax.random.normal(noise_key, mean.shape)
+    return component, raw_action
 
 
 def _sample_mixture_one(
@@ -249,21 +394,26 @@ def _sample_mixture_one(
     passed in -- `vmap` this over `num_envs` keys to draw a whole batch (see
     `collect_mixture_episode`/`collect_mixture_self_play_episode`).
     """
-    obs_key, component_key, noise_key = jax.random.split(key, 3)
+    obs_key, sample_key = jax.random.split(key)
     space = game.action_space(player)
     obs = game.observation(player, obs_key)
 
     logits, means, log_stds, value = network.apply(params, obs)
     magnet_logits, magnet_means, magnet_log_stds, _ = network.apply(magnet_params, obs)
 
-    component = jax.random.categorical(component_key, logits)
-    mean = means[component]
-    log_std = log_stds[component]
-    raw_action = mean + jnp.exp(log_std) * jax.random.normal(noise_key, mean.shape)
-    action = space.clip(raw_action)
+    # A one-shot `ZeroSumGame` has a single unconstrained continuous action: no
+    # atoms, nothing illegal, so the mask is all-`True` and every masked term in
+    # the loss reduces to its unmasked form.
+    action_mask = jnp.ones_like(logits, dtype=bool)
+    component, raw_action = sample_mixture_component(
+        logits, means, log_stds, action_mask, network.num_atoms, sample_key
+    )
+    action_kind = component_to_kind(component, network.num_atoms)
+    action_value = space.clip(raw_action)
 
     return (
-        obs, logits, means, log_stds, magnet_logits, magnet_means, magnet_log_stds, component, raw_action, action, value,
+        obs, action_mask, logits, means, log_stds, magnet_logits, magnet_means, magnet_log_stds,
+        component, raw_action, action_kind, action_value, value,
     )
 
 
@@ -281,13 +431,17 @@ def sample_mixture_actions(
     then Gaussian, clipped to the space), used to estimate the mixture's
     exploitability -- see `ZeroSumGame.mixture_exploitability`.
     """
+    if network.num_atoms != 0:
+        raise ValueError(
+            "sample_mixture_actions returns plain continuous actions and so is only "
+            f"meaningful for an atom-free policy, got num_atoms={network.num_atoms}. "
+            "A game with atoms needs a tree-aware exploitability instead."
+        )
     logits, means, log_stds, _ = network.apply(params, obs)
+    action_mask = jnp.ones_like(logits, dtype=bool)
 
     def one(k: chex.PRNGKey) -> chex.Array:
-        component_key, noise_key = jax.random.split(k)
-        component = jax.random.categorical(component_key, logits)
-        mean = means[component]
-        raw_action = mean + jnp.exp(log_stds[component]) * jax.random.normal(noise_key, mean.shape)
+        _, raw_action = sample_mixture_component(logits, means, log_stds, action_mask, 0, k)
         return space.clip(raw_action)
 
     return jax.vmap(one)(jax.random.split(key, num_samples))
@@ -316,21 +470,23 @@ def collect_mixture_episode(
     own_key, opponent_key = jax.random.split(key)
     keys = jax.random.split(own_key, num_envs)
     (
-        obs, logits, means, log_stds, magnet_logits, magnet_means, magnet_log_stds, component, raw_action, action, value,
+        obs, action_mask, logits, means, log_stds, magnet_logits, magnet_means, magnet_log_stds,
+        component, raw_action, action_kind, action_value, value,
     ) = jax.vmap(_sample_mixture_one, in_axes=(None, None, None, None, None, 0))(
         game, perspective, network, params, magnet_params, keys
     )
 
     opponent_action = opponent_action_fn(opponent_key, num_envs)
     if perspective == 0:
-        reward = game.payoff_batch(action, opponent_action)
+        reward = game.payoff_batch(action_value, opponent_action)
     else:
-        reward = -game.payoff_batch(opponent_action, action)
+        reward = -game.payoff_batch(opponent_action, action_value)
 
     return Episode(
-        obs=obs, logits=logits, means=means, log_stds=log_stds,
+        obs=obs, action_mask=action_mask, logits=logits, means=means, log_stds=log_stds,
         magnet_logits=magnet_logits, magnet_means=magnet_means, magnet_log_stds=magnet_log_stds,
-        component=component, raw_action=raw_action, action=action, value=value, reward=reward,
+        component=component, raw_action=raw_action, action_kind=action_kind,
+        action_value=action_value, value=value, reward=reward,
     )
 
 
@@ -349,25 +505,29 @@ def _sample_self_play_episode_one(
     """
     key_1, key_2 = jax.random.split(key)
     (
-        obs_1, logits_1, means_1, log_stds_1, magnet_logits_1, magnet_means_1, magnet_log_stds_1,
-        component_1, raw_action_1, action_1, value_1,
+        obs_1, action_mask_1, logits_1, means_1, log_stds_1,
+        magnet_logits_1, magnet_means_1, magnet_log_stds_1,
+        component_1, raw_action_1, action_kind_1, action_value_1, value_1,
     ) = _sample_mixture_one(game, 0, network_1, params_1, magnet_params_1, key_1)
     (
-        obs_2, logits_2, means_2, log_stds_2, magnet_logits_2, magnet_means_2, magnet_log_stds_2,
-        component_2, raw_action_2, action_2, value_2,
+        obs_2, action_mask_2, logits_2, means_2, log_stds_2,
+        magnet_logits_2, magnet_means_2, magnet_log_stds_2,
+        component_2, raw_action_2, action_kind_2, action_value_2, value_2,
     ) = _sample_mixture_one(game, 1, network_2, params_2, magnet_params_2, key_2)
 
-    reward = game.payoff(action_1, action_2)
+    reward = game.payoff(action_value_1, action_value_2)
 
     episode_1 = Episode(
-        obs=obs_1, logits=logits_1, means=means_1, log_stds=log_stds_1,
+        obs=obs_1, action_mask=action_mask_1, logits=logits_1, means=means_1, log_stds=log_stds_1,
         magnet_logits=magnet_logits_1, magnet_means=magnet_means_1, magnet_log_stds=magnet_log_stds_1,
-        component=component_1, raw_action=raw_action_1, action=action_1, value=value_1, reward=reward,
+        component=component_1, raw_action=raw_action_1, action_kind=action_kind_1,
+        action_value=action_value_1, value=value_1, reward=reward,
     )
     episode_2 = Episode(
-        obs=obs_2, logits=logits_2, means=means_2, log_stds=log_stds_2,
+        obs=obs_2, action_mask=action_mask_2, logits=logits_2, means=means_2, log_stds=log_stds_2,
         magnet_logits=magnet_logits_2, magnet_means=magnet_means_2, magnet_log_stds=magnet_log_stds_2,
-        component=component_2, raw_action=raw_action_2, action=action_2, value=value_2, reward=-reward,
+        component=component_2, raw_action=raw_action_2, action_kind=action_kind_2,
+        action_value=action_value_2, value=value_2, reward=-reward,
     )
     return episode_1, episode_2
 
@@ -429,6 +589,15 @@ def mixture_ppo_loss(
     normalization is a batch-wide statistic and so has to happen before
     vmapping.
 
+    Atoms and legality masks both act by *zeroing* terms rather than by
+    branching. For a sample that drew an atom, the Gaussian ratio, its clipped
+    surrogate, both Gaussian KLs and the marginal-density entropy are all forced
+    to `0.0`: an atom has no mean and no spread, so there is nothing there for
+    those terms to say. Illegal categorical entries are handled inside
+    `masked_log_softmax`/`categorical_kl` via `episode.action_mask`, the mask
+    recorded at sampling time -- re-applying exactly that mask is what keeps the
+    PPO ratio a ratio of two densities over the same support.
+
     `params` is the *only* parameter set this function forward-passes
     through -- `episode.logits`/`means`/`log_stds` (the sampling-time
     distribution) and `episode.magnet_logits`/`magnet_means`/`magnet_log_stds`
@@ -440,13 +609,19 @@ def mixture_ppo_loss(
     `magnet_*_kl_coef * KL(current || magnet)` pulls towards the
     periodically-snapshotted magnet policy.
     """
+    num_atoms = network.num_atoms
+    mask = episode.action_mask
     logits, means, log_stds, value_pred = network.apply(params, episode.obs)
 
+    # An atom is the whole action: it has no Gaussian factor to weigh in on.
+    is_gaussian = (episode.component >= num_atoms).astype(jnp.float32)
+
     old_category_log_prob, old_gaussian_log_prob = mixture_log_probs(
-        episode.logits, episode.means, episode.log_stds, episode.component, episode.raw_action
+        episode.logits, episode.means, episode.log_stds, mask,
+        episode.component, episode.raw_action, num_atoms,
     )
     new_category_log_prob, new_gaussian_log_prob = mixture_log_probs(
-        logits, means, log_stds, episode.component, episode.raw_action
+        logits, means, log_stds, mask, episode.component, episode.raw_action, num_atoms
     )
     category_ratio = jnp.exp(new_category_log_prob - old_category_log_prob)
     gaussian_ratio = jnp.exp(new_gaussian_log_prob - old_gaussian_log_prob)
@@ -457,27 +632,30 @@ def mixture_ppo_loss(
         return jnp.minimum(unclipped, clipped)
 
     category_policy_loss = -clipped_surrogate(category_ratio)
-    gaussian_policy_loss = -clipped_surrogate(gaussian_ratio)
+    gaussian_policy_loss = -is_gaussian * clipped_surrogate(gaussian_ratio)
     policy_loss = category_policy_loss + gaussian_policy_loss
 
     value_loss = jnp.square(value_pred - episode.reward)
 
-    category_entropy = _categorical_entropy(logits)
-    action_entropy = -mixture_marginal_log_prob(logits, means, log_stds, episode.raw_action)
+    category_entropy = masked_categorical_entropy(logits, mask)
+    action_entropy = -is_gaussian * mixture_marginal_log_prob(
+        logits, means, log_stds, mask, episode.raw_action, num_atoms
+    )
     entropy = category_entropy + action_entropy
 
-    mean = means[episode.component]
-    log_std = log_stds[episode.component]
+    index = gaussian_component_index(episode.component, num_atoms)
+    mean = means[index]
+    log_std = log_stds[index]
 
-    old_mean = episode.means[episode.component]
-    old_log_std = episode.log_stds[episode.component]
-    trpo_category_kl = categorical_kl(episode.logits, logits)
-    trpo_gaussian_kl = gaussian_kl(old_mean, old_log_std, mean, log_std)
+    old_mean = episode.means[index]
+    old_log_std = episode.log_stds[index]
+    trpo_category_kl = categorical_kl(episode.logits, logits, mask)
+    trpo_gaussian_kl = is_gaussian * gaussian_kl(old_mean, old_log_std, mean, log_std)
 
-    magnet_mean = episode.magnet_means[episode.component]
-    magnet_log_std = episode.magnet_log_stds[episode.component]
-    magnet_category_kl = categorical_kl(logits, episode.magnet_logits)
-    magnet_gaussian_kl = gaussian_kl(mean, log_std, magnet_mean, magnet_log_std)
+    magnet_mean = episode.magnet_means[index]
+    magnet_log_std = episode.magnet_log_stds[index]
+    magnet_category_kl = categorical_kl(logits, episode.magnet_logits, mask)
+    magnet_gaussian_kl = is_gaussian * gaussian_kl(mean, log_std, magnet_mean, magnet_log_std)
 
     loss = (
         policy_loss
@@ -491,9 +669,9 @@ def mixture_ppo_loss(
     )
 
     category_approx_kl = old_category_log_prob - new_category_log_prob
-    gaussian_approx_kl = old_gaussian_log_prob - new_gaussian_log_prob
+    gaussian_approx_kl = is_gaussian * (old_gaussian_log_prob - new_gaussian_log_prob)
     category_clip_frac = (jnp.abs(category_ratio - 1.0) > clip_eps).astype(jnp.float32)
-    gaussian_clip_frac = (jnp.abs(gaussian_ratio - 1.0) > clip_eps).astype(jnp.float32)
+    gaussian_clip_frac = is_gaussian * (jnp.abs(gaussian_ratio - 1.0) > clip_eps).astype(jnp.float32)
 
     metrics = {
         "loss": loss,
@@ -504,6 +682,7 @@ def mixture_ppo_loss(
         "entropy": entropy,
         "category_entropy": category_entropy,
         "gaussian_entropy": action_entropy,  # marginal mixture entropy estimate (weighted by gaussian_entropy_coef)
+        "atom_frac": 1.0 - is_gaussian,  # share of samples that drew a discrete atom
         "approx_kl": category_approx_kl + gaussian_approx_kl,
         "category_approx_kl": category_approx_kl,
         "gaussian_approx_kl": gaussian_approx_kl,
@@ -578,4 +757,5 @@ def build_mixture_network(hyperparams: MixturePPOHyperparams) -> MixtureActorCri
         activation=hyperparams.activation,
         normalization=hyperparams.normalization,
         clip_means=hyperparams.clip_means,
+        num_atoms=hyperparams.num_atoms,
     )

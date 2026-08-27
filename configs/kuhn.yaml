@@ -1,0 +1,55 @@
+# python train.py configs/kuhn.yaml
+#
+# Continuous-bet Kuhn poker. Unlike every other config here the game is
+# *sequential*, so `train.py` runs `SequentialSelfPlayPPOTrainer` -- the schema
+# below is otherwise identical to the one-shot configs.
+#
+# `exploitability` in the log is exact given the bet grid (a lower bound; see
+# `games/kuhn_best_response.py`). Validate against `configs/kuhn_classic.yaml`,
+# whose equilibrium and value (-1/18) are known in closed form, before reading
+# anything into a continuous-bet run.
+
+game:
+  name: kuhn
+  num_cards: 3
+  min_bet: 0.25
+  max_bet: 2.0
+  exploitability_grid_points: 1025
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 2
+  clip_means: true    # the action *is* the bet size, so keep the means in the betting range
+
+optimizer:
+  learning_rate: 0.003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 300
+
+  # The categorical head now carries the fold/check/call decision, so its
+  # entropy is what keeps the policy from collapsing to pure play.
+  category_entropy_coef: 0.04
+  gaussian_entropy_coef: 0.04
+
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  mode: self_play     # the only mode a sequential game supports
+  steps: 40
+  epochs: 400
+  checkpoint_dir: data/kuhn
+  seed: 0

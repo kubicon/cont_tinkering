@@ -13,6 +13,7 @@ import optax
 
 from games.base import ZeroSumGame
 
+from .actor_critic import masked_log_softmax
 from .checkpoint import (
     load_checkpoint_step,
     load_checkpoint_step_multi,
@@ -35,16 +36,30 @@ from .ppo import TrainState, create_train_state, ppo_update
 EXPLOITABILITY_SAMPLES = 512
 
 
-def _strategy_str(network: MixtureActorCritic, params, obs: chex.Array) -> str:
-    """The full mixture strategy: each component's weight, mean action, and action std."""
+def _strategy_str(
+    network: MixtureActorCritic, params, obs: chex.Array, mask: chex.Array | None = None
+) -> str:
+    """The full behavioral strategy at `obs`.
+
+    Atoms print as a bare probability (`atom0 0.31`) since they carry no mean or
+    spread; Gaussian components print as `weight x mean ± std`. `mask` is the
+    per-logit legality mask -- illegal entries are dropped from the listing
+    rather than shown at probability ~0.
+    """
     logits, means, log_stds, _ = network.apply(params, obs)
-    probs = jax.nn.softmax(logits)
+    if mask is None:
+        mask = jnp.ones_like(logits, dtype=bool)
+    probs = jnp.exp(masked_log_softmax(logits, mask))
     stds = jnp.exp(log_stds)
-    components = ", ".join(
-        f"{float(p):.2f}x{tuple(round(float(x), 3) for x in mean)}±{tuple(round(float(s), 3) for s in std)}"
-        for p, mean, std in zip(probs, means, stds)
-    )
-    return components
+
+    parts = [f"atom{i} {float(probs[i]):.2f}" for i in range(network.num_atoms) if bool(mask[i])]
+    parts += [
+        f"{float(probs[network.num_atoms + k]):.2f}x"
+        f"{tuple(round(float(x), 3) for x in means[k])}±{tuple(round(float(s), 3) for s in stds[k])}"
+        for k in range(network.num_components)
+        if bool(mask[network.num_atoms + k])
+    ]
+    return ", ".join(parts)
 
 
 class MixtureTrainState(TrainState):

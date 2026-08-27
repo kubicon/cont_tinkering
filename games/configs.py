@@ -1,8 +1,13 @@
-"""Per-game YAML config dataclasses: each mirrors one `ZeroSumGame` subclass's
-constructor, so a run config only needs to list arguments for the chosen game.
+"""Per-game YAML config dataclasses: each mirrors one game subclass's constructor,
+so a run config only needs to list arguments for the chosen game.
 
 `GAME_CONFIGS` maps a `game.name` string (as it appears in the YAML config) to
 its dataclass; see `training.run_config.load_run_config` for how it's used.
+
+Both kinds of game live in this one registry -- the one-shot `ZeroSumGame`s and
+the sequential `SequentialZeroSumGame`s -- and `train.py` picks the matching
+trainer from the type of whatever `build()` returns. A config file therefore
+looks the same either way; only `game.name` decides which machinery runs.
 """
 
 from __future__ import annotations
@@ -24,6 +29,8 @@ from .examples import (
     MultiPointGame,
     QuadraticZeroSumGame,
 )
+from .sequential import SequentialZeroSumGame
+from .sequential_examples import ContinuousKuhnPoker
 
 
 @dataclasses.dataclass
@@ -152,6 +159,29 @@ class MultiDimDecoyWellConfig:
         )
 
 
+@dataclasses.dataclass
+class KuhnConfig:
+    """Continuous-bet Kuhn poker -- a *sequential* game, unlike everything above it.
+
+    `min_bet == max_bet` fixes the size and recovers textbook Kuhn, whose
+    equilibria and value (`-1/18`) are known in closed form; that is the setting
+    to validate a run against before trusting the continuous one.
+    """
+
+    num_cards: int = 3
+    min_bet: float = 0.5
+    max_bet: float = 2.0
+    # Bet sizes the exact best response may choose between when measuring
+    # exploitability (see `games.kuhn_best_response`). Finer is a tighter lower
+    # bound; the cost is one batched forward pass either way.
+    exploitability_grid_points: int = 1025
+
+    def build(self) -> SequentialZeroSumGame:
+        return ContinuousKuhnPoker(
+            num_cards=self.num_cards, min_bet=self.min_bet, max_bet=self.max_bet
+        )
+
+
 GAME_CONFIGS: dict[str, type] = {
     "matching_pennies": MatchingPenniesConfig,
     "matching_pennies_shifted": MatchingPenniesShiftedConfig,
@@ -163,4 +193,5 @@ GAME_CONFIGS: dict[str, type] = {
     "forsaken": ForsakenConfig,
     "decoy_well": DecoyWellConfig,
     "multidim_decoy_well": MultiDimDecoyWellConfig,
+    "kuhn": KuhnConfig,
 }

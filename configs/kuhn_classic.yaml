@@ -1,0 +1,58 @@
+# python train.py configs/kuhn_classic.yaml
+#
+# Textbook three-card Kuhn poker: `min_bet == max_bet` fixes the bet size, so the
+# bet grid holds a single point and the reported exploitability carries *no*
+# approximation at all.
+#
+# This is the validation run. Kuhn's equilibria are known in closed form and all
+# have value -1/18 = -0.05556 to player 0, so `exploitability_target` should fall
+# towards 0 and `value_target` towards -0.0556. A continuous-bet run is only
+# worth interpreting once this one behaves.
+#
+# One Gaussian component suffices here -- the size never varies -- so all the
+# work falls on the categorical head and its two atoms (fold/check and call).
+
+game:
+  name: kuhn
+  num_cards: 3
+  min_bet: 1.0
+  max_bet: 1.0
+  exploitability_grid_points: 1025
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 1
+  clip_means: true    # the action *is* the bet size, so keep the means in the betting range
+
+optimizer:
+  learning_rate: 0.003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 2
+  target_tau: 0.001
+  magnet_interval: 300
+
+  # The categorical head now carries the fold/check/call decision, so its
+  # entropy is what keeps the policy from collapsing to pure play.
+  category_entropy_coef: 0.01
+  gaussian_entropy_coef: 0.0
+
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.0
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.0
+
+train:
+  mode: self_play     # the only mode a sequential game supports
+  steps: 40
+  epochs: 400
+  checkpoint_dir: data/kuhn_classic
+  seed: 0

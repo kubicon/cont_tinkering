@@ -1,4 +1,12 @@
-from .actor_critic import ActorCritic, categorical_kl, gaussian_entropy, gaussian_kl, gaussian_log_prob
+from .actor_critic import (
+    ActorCritic,
+    categorical_kl,
+    gaussian_entropy,
+    gaussian_kl,
+    gaussian_log_prob,
+    masked_categorical_entropy,
+    masked_log_softmax,
+)
 from .checkpoint import load_checkpoint, save_checkpoint
 from .config import MixturePPOHyperparams, PPOHyperparams
 from .mixture import (
@@ -8,14 +16,36 @@ from .mixture import (
     build_mixture_ppo_loss_fn,
     collect_mixture_episode,
     collect_mixture_self_play_episode,
+    component_to_kind,
+    expand_kind_mask,
+    gaussian_component_index,
     mixture_log_probs,
+    mixture_marginal_log_prob,
     mixture_ppo_loss,
+    sample_mixture_actions,
+    sample_mixture_component,
+)
+from .kuhn_evaluation import (
+    build_kuhn_metric_fn,
+    clipped_mixture_grid_probs,
+    evaluate_networks,
+    strategy_from_network,
 )
 from .mixture_trainer import MixturePPOTrainer, MixtureSelfPlayPPOTrainer
 from .optimizers import OPTIMIZERS, build_optimizer
 from .ppo import create_train_state, ppo_loss, ppo_update
 from .rollout import Transition, collect_episode, collect_self_play_episode
 from .self_play import SelfPlayPPOTrainer
+from .sequential_rollout import (
+    SequentialEpisode,
+    build_episode_sampler,
+    collect_sequential_batch,
+)
+from .sequential_trainer import (
+    SequentialSelfPlayPPOTrainer,
+    build_sequential_ppo_loss_fn,
+    sequential_ppo_loss,
+)
 from .trainer import PPOTrainer
 
 __all__ = [
@@ -24,6 +54,8 @@ __all__ = [
     "gaussian_entropy",
     "gaussian_kl",
     "gaussian_log_prob",
+    "masked_categorical_entropy",
+    "masked_log_softmax",
     "load_checkpoint",
     "save_checkpoint",
     "PPOHyperparams",
@@ -44,8 +76,24 @@ __all__ = [
     "build_mixture_ppo_loss_fn",
     "collect_mixture_episode",
     "collect_mixture_self_play_episode",
-    "mixture_log_prob",
+    "component_to_kind",
+    "expand_kind_mask",
+    "gaussian_component_index",
+    "mixture_log_probs",
+    "mixture_marginal_log_prob",
     "mixture_ppo_loss",
+    "sample_mixture_actions",
+    "sample_mixture_component",
     "MixturePPOTrainer",
     "MixtureSelfPlayPPOTrainer",
+    "SequentialEpisode",
+    "build_episode_sampler",
+    "collect_sequential_batch",
+    "sequential_ppo_loss",
+    "build_sequential_ppo_loss_fn",
+    "SequentialSelfPlayPPOTrainer",
+    "build_kuhn_metric_fn",
+    "clipped_mixture_grid_probs",
+    "evaluate_networks",
+    "strategy_from_network",
 ]
