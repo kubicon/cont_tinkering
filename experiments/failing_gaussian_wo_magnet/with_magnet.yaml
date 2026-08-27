@@ -9,9 +9,14 @@ network:
   activation: gelu
   normalization: rms_norm
   num_components: 1
+  clip_means: true      # project the mean head onto the action box, as run_idealized.py
+                        #   does after every step. Without it train.py's means diffuse to
+                        #   |mu| ~ 1e3: past the box every sample clips to the same corner,
+                        #   so the payoff stops depending on this player's action and
+                        #   advantage normalization + Adam keep the step at ~lr anyway.
 
 optimizer:
-  learning_rate: 0.05   # big enough that the bilinear rotation is visible in 20k iters
+  learning_rate: 0.001   # big enough that the bilinear rotation is visible in 20k iters
   max_grad_norm: 0.5
   optimizer: adam
   weight_decay: 0.0
@@ -34,7 +39,7 @@ train:
   mode: self_play
   perspective: 0
   opponent: random
-  steps: 100
+  steps: 50
   epochs: 200
   checkpoint_dir: data/matching_pennies
   seed: 123
