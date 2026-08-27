@@ -89,7 +89,9 @@ class IdealizedSection:
 
     # --- payoff backend ---
     backend: str = "auto"                  # "auto" | "closed_form" | "quadrature"
-    grid_points: int = 801                 # quadrature only
+    grid_points: int = 801                 # quadrature backend; also the grid the
+                                           #   closed-form backend integrates its
+                                           #   `gaussian_entropy: marginal` term on
     normalize_density: bool = True         # renormalize each mixture on the grid, so a
                                            #   component narrower than `dx` keeps its mass
 
@@ -351,14 +353,48 @@ def load_config(path: str | Path) -> tuple[Any, SolverConfig, RunConfig | None]:
 # mass) be plugged in for `train.mode: fixed_opponent`.
 
 
+def _density_grid(lo: float, hi: float, n: int, std_max: float):
+    """The padded integration grid both backends integrate densities on.
+
+    Padded by `4 * std_max` on each side so a wide component's tails are not
+    truncated; the payoff is only ever evaluated (and best responses only ever
+    taken) on the `in_box` part.
+    """
+    grid = jnp.linspace(lo - 4.0 * std_max, hi + 4.0 * std_max, n, dtype=jnp.float64)
+    return grid, float(grid[1] - grid[0])
+
+
+def _component_densities(p: Params, grid, dx: float, normalize: bool):
+    """Per-component density on `grid`, each renormalized to unit mass if `normalize`
+    -- otherwise a component narrower than `dx` silently loses its mass between grid
+    points."""
+    s = jnp.exp(p.log_std)
+    comp = jnp.exp(-((grid[None, :] - p.means[:, None]) ** 2) / (2 * s[:, None] ** 2))
+    comp = comp / (jnp.sqrt(2 * jnp.pi) * s[:, None])
+    if normalize:
+        comp = comp / (jnp.sum(comp, axis=-1, keepdims=True) * dx + 1e-300)
+    return comp  # (K, n)
+
+
+def _marginal_entropy(p: Params, grid, dx: float, normalize: bool):
+    """Exact differential entropy of the mixture, `-int p log p` on `grid` -- what
+    `mixture_ppo_loss` estimates with `-mixture_marginal_log_prob(...)`."""
+    w = jax.nn.softmax(p.logits)
+    d = jnp.sum(w[:, None] * _component_densities(p, grid, dx, normalize), axis=0)
+    return -jnp.sum(d * jnp.log(d + 1e-300)) * dx
+
+
 class ClosedFormBackend:
     """Exact Gaussian convolutions -- only for the `MultiPointGame` family."""
 
     name = "closed_form"
     supports_fixed_opponent = False
 
-    def __init__(self, game: ZeroSumGame):
+    def __init__(self, game: ZeroSumGame, grid, dx: float, normalize: bool):
         self.game = game
+        # payoffs are closed-form, but a mixture's differential entropy is not, so
+        # `entropy` still needs a grid -- see the note on `entropy` below.
+        self._grid, self._dx, self._normalize = grid, dx, normalize
 
     def handle(self, p: Params) -> Params:
         return p
@@ -373,9 +409,18 @@ class ClosedFormBackend:
         return closed_form_exploitability(h0, h1, self.game)
 
     def entropy(self, p: Params):
-        """No closed form for a mixture's differential entropy; the per-component
-        Gaussian entropy `sum(log_std)` (up to a constant) is used instead."""
-        return jnp.sum(p.log_std)
+        """Exact differential entropy of the mixture, integrated on a grid.
+
+        There is no closed form for it, but the per-component surrogate
+        `sum(log_std)` is NOT a stand-in: it grows without bound in every
+        component's std at full weight (gradient `1` per component, regardless of
+        that component's probability, and with no reward for separating the
+        components), so with a nonzero `gaussian_entropy_coef` it pins every std at
+        `std_max` and the mixture can never localize onto narrow payoff peaks.
+        Integrating costs one `(K, grid_points)` array per call, which is cheap
+        next to the closed-form payoff this backend exists for.
+        """
+        return _marginal_entropy(p, self._grid, self._dx, self._normalize)
 
 
 class QuadratureBackend:
@@ -399,9 +444,7 @@ class QuadratureBackend:
                 "set the game's `dim: 1`, or use `idealized.backend: closed_form`."
             )
         self.lo, self.hi = float(space.low[0]), float(space.high[0])
-        pad = 4.0 * std_max
-        self.grid = jnp.linspace(self.lo - pad, self.hi + pad, n, dtype=jnp.float64)
-        self.dx = float(self.grid[1] - self.grid[0])
+        self.grid, self.dx = _density_grid(self.lo, self.hi, n, std_max)
         self.in_box = (self.grid >= self.lo) & (self.grid <= self.hi)
         self.normalize = normalize
 
@@ -415,15 +458,7 @@ class QuadratureBackend:
         return jnp.sum(w[:, None] * self.component_densities(p), axis=0)  # (n,)
 
     def component_densities(self, p: Params):
-        """Per-component density on the grid, each renormalized to unit mass if
-        `normalize_density` is set -- otherwise a component narrower than `dx`
-        silently loses its mass between grid points."""
-        s = jnp.exp(p.log_std)
-        comp = jnp.exp(-((self.grid[None, :] - p.means[:, None]) ** 2) / (2 * s[:, None] ** 2))
-        comp = comp / (jnp.sqrt(2 * jnp.pi) * s[:, None])
-        if self.normalize:
-            comp = comp / (jnp.sum(comp, axis=-1, keepdims=True) * self.dx + 1e-300)
-        return comp  # (K, n)
+        return _component_densities(p, self.grid, self.dx, self.normalize)  # (K, n)
 
     def uniform_handle(self):
         d = jnp.where(self.in_box, 1.0, 0.0)
@@ -453,8 +488,7 @@ class QuadratureBackend:
     def entropy(self, p: Params):
         """Exact differential entropy of the mixture -- what `mixture_ppo_loss`
         estimates with `-mixture_marginal_log_prob(...)` at the sampled action."""
-        d = self.handle(p)
-        return -jnp.sum(d * jnp.log(d + 1e-300)) * self.dx
+        return _marginal_entropy(p, self.grid, self.dx, self.normalize)
 
 
 def build_backend(game: ZeroSumGame, cfg: SolverConfig):
@@ -468,7 +502,9 @@ def build_backend(game: ZeroSumGame, cfg: SolverConfig):
                 f"{type(game).__name__} has no `.peaks`/`._target_moments`, so the closed-form "
                 "backend does not apply. Use `idealized.backend: quadrature`."
             )
-        return ClosedFormBackend(game)
+        lo, hi = _bounds(game)
+        grid, dx = _density_grid(lo, hi, cfg.idealized.grid_points, _std_max(game, cfg))
+        return ClosedFormBackend(game, grid, dx, cfg.idealized.normalize_density)
     if choice == "quadrature":
         return QuadratureBackend(game, cfg.idealized.grid_points, _std_max(game, cfg),
                                  cfg.idealized.normalize_density)
