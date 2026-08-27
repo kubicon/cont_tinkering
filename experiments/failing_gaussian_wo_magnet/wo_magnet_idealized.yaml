@@ -1,5 +1,8 @@
-# python train.py         configs/matching_pennies.yaml
-# python run_idealized.py configs/matching_pennies.yaml
+# python run_idealized.py experiments/failing_gaussian_wo_magnet/wo_magnet_idealized.yaml
+#
+# Idealized (run_idealized.py) counterpart of wo_magnet_ppo.yaml -- same game/init/
+# magnet setting, but `optimizer.learning_rate` is the exact solver's `eta`, not the
+# PPO network's; see plot_dynamics.py's `--engine idealized` path.
 
 game:
   name: matching_pennies
@@ -16,7 +19,8 @@ network:
                         #   advantage normalization + Adam keep the step at ~lr anyway.
 
 optimizer:
-  learning_rate: 0.05   # big enough that the bilinear rotation is visible in 20k iters
+  learning_rate: 0.05   # big enough that the bilinear rotation is visible in 20k iters;
+                        #   the PPO copy uses 0.001
   max_grad_norm: 0.5
   optimizer: adam
   weight_decay: 0.0

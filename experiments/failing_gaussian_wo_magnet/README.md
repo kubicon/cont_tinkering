@@ -6,12 +6,17 @@ The game is `matching_pennies` = `ContinuousMatchingPennies`, `payoff(a0, a1) = 
 on `[-1, 1]`. It is bilinear, so only the *mean* of each policy matters, every best response sits at a box corner, and the unique Nash has both players' mean at the box
 midpoint `0`.
 
-* `wo_magnet.yaml` -- `magnet_gaussian_kl_coef: 0.0`. Fails: the pair of means spirals
-  *away* from the Nash (the classic bilinear rotation, which gradient ascent-descent
-  turns into an outward spiral) until both means clip at the box boundary, then orbits
-  there forever. Exploitability flat at ~1.0-1.2.
-* `with_magnet.yaml` -- identical except `magnet_gaussian_kl_coef: 0.2`. The orbit
-  becomes an inward spiral; exploitability decays geometrically to ~1e-8.
+* `wo_magnet_{idealized,ppo}.yaml` -- `magnet_gaussian_kl_coef: 0.0`. Fails: the pair of
+  means spirals *away* from the Nash (the classic bilinear rotation, which gradient
+  ascent-descent turns into an outward spiral) until both means clip at the box
+  boundary, then orbits there forever. Exploitability flat at ~1.0-1.2.
+* `with_magnet_{idealized,ppo}.yaml` -- identical except `magnet_gaussian_kl_coef: 0.2`.
+  The orbit becomes an inward spiral; exploitability decays geometrically to ~1e-8.
+
+Each setting is split into an `_idealized.yaml` and a `_ppo.yaml` file, identical except
+`optimizer.learning_rate` (0.05 vs 0.001) -- that one field feeds both the idealized
+solver's step size and the PPO network's Adam learning rate, and the two engines need
+different values (see `plot_dynamics.py`'s docstring).
 
 In *average* strategies (the `target_tau` EMA, dashed in the plot) the no-magnet run
 improves and then plateaus around 1e-1. That plateau is EMA ripple, not a second
@@ -23,8 +28,8 @@ the current strategies fail to converge.
 Run:
 
 ```
-python run_idealized.py experiments/failing_gaussian_wo_magnet/wo_magnet.yaml
-python train.py         experiments/failing_gaussian_wo_magnet/wo_magnet.yaml
+python run_idealized.py experiments/failing_gaussian_wo_magnet/wo_magnet_idealized.yaml
+python train.py         experiments/failing_gaussian_wo_magnet/wo_magnet_ppo.yaml
 ```
 
 ## Plot
@@ -66,7 +71,7 @@ the Nash together with the policy std.
 ### What the PPO engine does
 
 Same networks, hyperparameters and self-play train step as `train.py` -- it builds a
-`MixtureSelfPlayPPOTrainer` from the same YAML -- but instead of `trainer.train()`'s
+`MixtureSelfPlayPPOTrainer` from the config's `_ppo.yaml` -- but instead of `trainer.train()`'s
 chunked loop it scans the train step itself, reading the policy head out at the game's
 (constant) observation every iteration. Two deliberate differences from a bare
 `python train.py`:
@@ -161,7 +166,7 @@ Everything in `stats` is derived from `params`, so questions the plot does not a
 ```python
 import pickle
 runs = pickle.load(open("experiments/failing_gaussian_wo_magnet/dynamics_runs_both.pkl", "rb"))
-r = runs["ppo:wo_magnet.yaml"]
+r = runs["ppo:wo_magnet_ppo.yaml"]
 r["hyperparameters"]["run_config"]["ppo"]["magnet_gaussian_kl_coef"]  # 0.0
 r["stats"]["x"][-1]                                                   # final E[a] of player 0
 ```
@@ -170,9 +175,9 @@ r["stats"]["x"][-1]                                                   # final E[
 
 | file | what |
 |-|-|
-| `wo_magnet.yaml` | no magnet on the Gaussian head; starts at mean +1.0 |
-| `with_magnet.yaml` | same, `magnet_gaussian_kl_coef: 0.2`; starts at mean +0.2 |
-| `plot_dynamics.py` | runs both configs under either engine, writes the figure and a trace cache |
+| `wo_magnet_idealized.yaml` / `wo_magnet_ppo.yaml` | no magnet on the Gaussian head; starts at mean +1.0; `lr` 0.05 / 0.001 |
+| `with_magnet_idealized.yaml` / `with_magnet_ppo.yaml` | same, `magnet_gaussian_kl_coef: 0.2`; starts at mean +0.2; `lr` 0.05 / 0.001 |
+| `plot_dynamics.py` | runs the matching engine's pair of configs, writes the figure and a trace cache |
 | `dynamics.png` | idealized engine, configs as written (inits differ, see below) |
 | `dynamics_matched_init.png` | idealized, `--init 0.2`: the clean ablation, magnet is the only difference |
 | `dynamics_ppo.png` | `train.py`'s PPO on the same two configs |

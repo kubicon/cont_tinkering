@@ -11,10 +11,14 @@ Two engines can drive the same YAML (`--engine`):
   both      -- both, overlaid; the PPO curves are dashed.
 
 The game is bilinear matching pennies, `payoff(a0, a1) = a0 * a1` on `[-1, 1]`, so
-only the mean of each policy matters and the Nash is at the midpoint of the box. The
-only *intended* difference between the two configs is `ppo.magnet_gaussian_kl_coef`;
-pass `--init` to also equalize the starting means, which the two files as written do
-not share.
+only the mean of each policy matters and the Nash is at the midpoint of the box. Each
+of the two settings (with/without magnet) has its own pair of config files --
+`*_idealized.yaml` and `*_ppo.yaml` -- identical except `optimizer.learning_rate`
+(0.05 for the idealized solver, 0.001 for the PPO network -- the same field feeds
+both `cfg.lr` and the network's Adam step size, so each engine gets its own value).
+The only *intended* difference between with-magnet and without-magnet is
+`ppo.magnet_gaussian_kl_coef`; pass `--init` to also equalize the starting means,
+which the two settings as written do not share.
 
 The figure has three panels:
 
@@ -74,11 +78,16 @@ from training import mixture_trainer as mt
 from training.run_config import load_run_config
 
 RUNS = [
-    ("wo_magnet.yaml", "no magnet", "Reds"),
-    ("with_magnet.yaml", "magnet", "Blues"),
+    ("wo_magnet", "no magnet", "Reds"),
+    ("with_magnet", "magnet", "Blues"),
 ]
 ENGINES = ("idealized", "ppo")
 STYLE = {"idealized": "-", "ppo": "--"}
+
+
+def config_name(base: str, engine: str) -> str:
+    """Each (base, engine) pair has its own config file -- see module docstring."""
+    return f"{base}_{engine}.yaml"
 
 
 def _asdict(obj):
@@ -416,12 +425,13 @@ def main() -> None:
 
     if args.reuse:
         cached = load_cache(cache_path)
-        results = [(tag(e, label), cached[f"{e}:{name}"], cmap, STYLE[e])
-                   for e in engines for name, label, cmap in RUNS]
+        results = [(tag(e, label), cached[f"{e}:{config_name(base, e)}"], cmap, STYLE[e])
+                   for e in engines for base, label, cmap in RUNS]
     else:
         results, cache = [], {}
         for engine in engines:
-            for name, label, cmap in RUNS:
+            for base, label, cmap in RUNS:
+                name = config_name(base, engine)
                 print(f"running {name} [{engine}] ...", flush=True)
                 r = simulate(HERE / name, engine, args.init, args.expl_points,
                              seed_init=not args.network_init)
