@@ -1,0 +1,52 @@
+\documentclass{article}
+\usepackage{amsmath, amssymb, amsthm}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{assumption}{Assumption}
+
+\begin{document}
+
+\section*{Convergence Proof for Regularized Continuous Games}
+
+\begin{assumption}[Bounded Non-Monotonicity]
+The unregularized game vector field $V(\boldsymbol{\theta}) = \big(\nabla_{\theta_1} U(\boldsymbol{\theta}), -\nabla_{\theta_2} U(\boldsymbol{\theta})\big)^T$ is $L$-Lipschitz continuous, satisfying:
+\begin{equation}
+\langle V(\boldsymbol{\theta}) - V(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle \ge -L \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2, \quad \forall \boldsymbol{\theta}, \boldsymbol{\theta}' \in \mathbb{R}^d.
+\end{equation}
+\end{assumption}
+
+\begin{assumption}[Strong Convexity of KL Penalty]
+The magnet regularization vector field $R(\boldsymbol{\theta}) = \big(\nabla_{\theta_1} D_{\text{KL}}(\pi_{\theta_1} \parallel \pi_{1,m}), \nabla_{\theta_2} D_{\text{KL}}(\pi_{\theta_2} \parallel \pi_{2,m})\big)^T$ is $\mu_{\text{KL}}$-strongly monotone:
+\begin{equation}
+\langle R(\boldsymbol{\theta}) - R(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle \ge \mu_{\text{KL}} \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2, \quad \forall \boldsymbol{\theta}, \boldsymbol{\theta}' \in \mathbb{R}^d.
+\end{equation}
+\end{assumption}
+
+\begin{theorem}
+If $\lambda > \frac{L}{\mu_{\text{KL}}}$, the regularized gradient flow $\dot{\boldsymbol{\theta}}(t) = -F(\boldsymbol{\theta}(t))$ with $F(\boldsymbol{\theta}) = V(\boldsymbol{\theta}) + \lambda R(\boldsymbol{\theta})$ converges globally exponentially to a unique regularized equilibrium $\boldsymbol{\theta}^*$.
+\end{theorem}
+
+\begin{proof}
+Evaluating the inner product of the operator $F(\boldsymbol{\theta})$ over any two points $\boldsymbol{\theta}, \boldsymbol{\theta}' \in \mathbb{R}^d$:
+\begin{align*}
+\langle F(\boldsymbol{\theta}) - F(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle &= \langle V(\boldsymbol{\theta}) - V(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle + \lambda \langle R(\boldsymbol{\theta}) - R(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle \\
+&\ge -L \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2 + \lambda \mu_{\text{KL}} \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2 \\
+&= (\lambda \mu_{\text{KL}} - L) \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2.
+\end{align*}
+Setting $\alpha = \lambda \mu_{\text{KL}} - L > 0$, the operator $F(\boldsymbol{\theta})$ is $\alpha$-strongly monotone. By the Minty-Browder Theorem, there exists a unique equilibrium point $\boldsymbol{\theta}^*$ such that $F(\boldsymbol{\theta}^*) = \mathbf{0}$.
+
+To prove global asymptotic convergence, define the Lyapunov candidate function $W(\boldsymbol{\theta}) = \frac{1}{2} \|\boldsymbol{\theta} - \boldsymbol{\theta}^*\|^2$. Differentiating $W$ along the system trajectories $\dot{\boldsymbol{\theta}}(t) = -F(\boldsymbol{\theta}(t))$:
+\begin{align*}
+\dot{W}(\boldsymbol{\theta}(t)) &= \langle \boldsymbol{\theta}(t) - \boldsymbol{\theta}^*, \dot{\boldsymbol{\theta}}(t) \rangle \\
+&= -\langle F(\boldsymbol{\theta}(t)) - F(\boldsymbol{\theta}^*), \boldsymbol{\theta}(t) - \boldsymbol{\theta}^* \rangle \\
+&\le -\alpha \|\boldsymbol{\theta}(t) - \boldsymbol{\theta}^*\|^2 \\
+&= -2\alpha W(\boldsymbol{\theta}(t)).
+\end{align*}
+Applying Grönwall's Inequality to $\dot{W}(t) \le -2\alpha W(t)$ yields:
+\begin{equation}
+W(t) \le W(0) e^{-2\alpha t} \implies \|\boldsymbol{\theta}(t) - \boldsymbol{\theta}^*\| \le \|\boldsymbol{\theta}(0) - \boldsymbol{\theta}^*\| e^{-\alpha t}.
+\end{equation}
+Therefore, $\boldsymbol{\theta}(t)$ converges globally exponentially to $\boldsymbol{\theta}^*$ at rate $\alpha = \lambda \mu_{\text{KL}} - L$.
+\end{proof}
+
+\end{document}
