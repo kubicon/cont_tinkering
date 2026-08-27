@@ -1,5 +1,18 @@
 """Sampling trajectories from a `SequentialZeroSumGame`. Sampling only -- no losses.
 
+A trajectory is a `training.mixture.Episode` with a `(max_steps, ...)` time axis
+in front of each field: the very same record the one-shot rollouts in
+`training.mixture` produce, one row per *decision* instead of one row per
+episode. What makes that work is `Episode.actor` -- who owned the decision on
+that row, `TERMINAL` on the padding steps a finished episode is carried through
+-- which is all the loss needs to weight both players' interleaved decisions and
+the padding correctly. There is no separate trajectory record and no conversion
+step between sampling and the loss.
+
+The episode's payoff to player 0 is returned *alongside* the `Episode` rather
+than stored in it: it is one number for the whole trajectory, not a per-decision
+field, and `Episode.reward` already carries it on every row, signed for whoever
+acted there.
 """
 
 from __future__ import annotations
@@ -9,8 +22,9 @@ from typing import Callable
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 
-from games.sequential import SequentialZeroSumGame
+from games.sequential import SequentialZeroSumGame, select_by_player
 from games.spaces import HybridAction
 
 from .mixture import (
@@ -20,51 +34,6 @@ from .mixture import (
     expand_kind_mask,
     sample_mixture_component,
 )
-
-
-@chex.dataclass
-class SequentialEpisode:
-    """One trajectory. Every field carries a leading `max_steps` (time) axis -- except
-    `payoff`, which is one number for the whole episode.
-    """
-
-    player: chex.Array  # (T,) int32, who acted -- `TERMINAL` on padding steps
-    live: chex.Array  # (T,) bool, was this step a real decision
-    obs: chex.Array  # (T, obs_dim) the acting player's infoset
-    action_mask: chex.Array  # (T, num_atoms + num_components) legality, at sample time
-    logits: chex.Array  # (T, num_atoms + num_components)
-    means: chex.Array  # (T, num_components, action_dim)
-    log_stds: chex.Array  # (T, num_components, action_dim)
-    magnet_logits: chex.Array  # (T, num_atoms + num_components) under the magnet snapshot
-    magnet_means: chex.Array  # (T, num_components, action_dim)
-    magnet_log_stds: chex.Array  # (T, num_components, action_dim)
-    component: chex.Array  # (T,) int32, the categorical entry drawn
-    raw_action: chex.Array  # (T, action_dim) unclipped Gaussian draw
-    action_kind: chex.Array  # (T,) int32, the `HybridAction.kind` played
-    action_value: chex.Array  # (T, action_dim) the clipped continuous value played
-    value: chex.Array  # (T,) the acting player's state-value estimate
-    reward: chex.Array  # (T,) terminal payoff, signed for the acting player
-    payoff: chex.Array  # () the episode's terminal payoff to *player 0* -- no time axis
-
-    def to_transitions(self) -> Episode:
-        """The same rows as a plain `Episode`, ready for `mixture_ppo_loss`.
-        """
-        return Episode(
-            obs=self.obs,
-            action_mask=self.action_mask,
-            logits=self.logits,
-            means=self.means,
-            log_stds=self.log_stds,
-            magnet_logits=self.magnet_logits,
-            magnet_means=self.magnet_means,
-            magnet_log_stds=self.magnet_log_stds,
-            component=self.component,
-            raw_action=self.raw_action,
-            action_kind=self.action_kind,
-            action_value=self.action_value,
-            value=self.value,
-            reward=self.reward,
-        )
 
 
 def _validate_players_match(game: SequentialZeroSumGame, networks: tuple[MixtureActorCritic, ...]) -> None:
@@ -97,13 +66,24 @@ def _validate_players_match(game: SequentialZeroSumGame, networks: tuple[Mixture
         )
 
 
+def _same_box(space_0, space_1) -> bool:
+    """Do both players bet into the identical continuous range? (A build-time check.)"""
+    return bool(
+        np.array_equal(np.asarray(space_0.box.low), np.asarray(space_1.box.low))
+        and np.array_equal(np.asarray(space_0.box.high), np.asarray(space_1.box.high))
+    )
+
+
 def build_episode_sampler(
     game: SequentialZeroSumGame,
     network_0: MixtureActorCritic,
     network_1: MixtureActorCritic,
-) -> Callable[..., SequentialEpisode]:
+) -> Callable[..., tuple[Episode, chex.Array]]:
     """Bind the (static) game and networks; return a sampler for **one** episode.
 
+    The returned function is `(params_0, magnet_params_0, params_1,
+    magnet_params_1, key) -> (Episode, payoff)`, with a `(max_steps, ...)` time
+    axis on every `Episode` field and a scalar `payoff` to player 0.
     """
     _validate_players_match(game, (network_0, network_1))
 
@@ -111,6 +91,7 @@ def build_episode_sampler(
     spaces = (game.action_space(0), game.action_space(1))
     num_atoms = network_0.num_atoms
     num_components = network_0.num_components
+    shared_box = _same_box(*spaces)
 
     def sample_episode(params_0, magnet_params_0, params_1, magnet_params_1, key: chex.PRNGKey):
         params = (params_0, params_1)
@@ -118,9 +99,7 @@ def build_episode_sampler(
 
         def step(state, step_key: chex.PRNGKey):
             sample_key, transition_key = jax.random.split(step_key)
-            player = game.current_player(state)
-            live = ~game.is_terminal(state)
-            is_first = player == 0
+            actor = game.current_player(state)  # `TERMINAL` once the episode is over
 
             def evaluate(index: int):
                 obs = game.observation(index, state)
@@ -129,12 +108,11 @@ def build_episode_sampler(
                 magnet = networks[index].apply(magnet_params[index], obs)
                 return obs, mask, logits, means, log_stds, value, magnet[:3]
 
-            evaluated = (evaluate(0), evaluate(1))
-            # Select the acting player's view. `player` is traced, so this is a
+            # Select the acting player's view. `actor` is traced, so this is a
             # select rather than a branch: both networks have already run.
-            pick = lambda a, b: jnp.where(is_first, a, b)
-            obs, mask, logits, means, log_stds, value, magnet = jax.tree_util.tree_map(
-                pick, evaluated[0], evaluated[1]
+            is_first = actor == 0
+            obs, mask, logits, means, log_stds, value, magnet = select_by_player(
+                is_first, evaluate(0), evaluate(1)
             )
             magnet_logits, magnet_means, magnet_log_stds = magnet
 
@@ -144,14 +122,19 @@ def build_episode_sampler(
             action_kind = component_to_kind(component, num_atoms)
             # Only the continuous part is clipped here (the kind comes from the
             # masked categorical and is legal by construction). Each player's box
-            # may differ, so clip under both and select.
-            action_value = pick(spaces[0].box.clip(raw_action), spaces[1].box.clip(raw_action))
+            # may differ, so unless they coincide, clip under both and select.
+            if shared_box:
+                action_value = spaces[0].box.clip(raw_action)
+            else:
+                action_value = select_by_player(
+                    is_first, spaces[0].box.clip(raw_action), spaces[1].box.clip(raw_action)
+                )
 
             next_state = game.step(
                 state, HybridAction(kind=action_kind, value=action_value), transition_key
             )
             record = dict(
-                player=player, live=live, obs=obs, action_mask=mask,
+                actor=actor, obs=obs, action_mask=mask,
                 logits=logits, means=means, log_stds=log_stds,
                 magnet_logits=magnet_logits, magnet_means=magnet_means,
                 magnet_log_stds=magnet_log_stds, component=component,
@@ -167,22 +150,25 @@ def build_episode_sampler(
         # Terminal-only payoff, so every decision in the episode shares one
         # return: the leaf value, signed for whoever made that decision.
         payoff = game.payoff(final_state)
-        reward = jnp.where(record["player"] == 0, payoff, -payoff)
-        return SequentialEpisode(**record, reward=reward, payoff=payoff)
+        reward = jnp.where(record["actor"] == 0, payoff, -payoff)
+        return Episode(**record, reward=reward), payoff
 
     return sample_episode
 
 
 def collect_sequential_batch(
-    sample_episode: Callable[..., SequentialEpisode],
+    sample_episode: Callable[..., tuple[Episode, chex.Array]],
     params_0,
     magnet_params_0,
     params_1,
     magnet_params_1,
     key: chex.PRNGKey,
     num_envs: int,
-) -> SequentialEpisode:
+) -> tuple[Episode, chex.Array]:
     """`num_envs` independent episodes: `sample_episode` `vmap`ed over rng keys.
+
+    The env axis lands in front of the time axis, so the returned `Episode`'s
+    fields are `(num_envs, max_steps, ...)` and `payoff` is `(num_envs,)`.
     """
     keys = jax.random.split(key, num_envs)
     return jax.vmap(sample_episode, in_axes=(None, None, None, None, 0))(

@@ -67,6 +67,7 @@ def _episode(network, params, kind_mask, batch: int = 64, seed: int = 0) -> Epis
             logits, means, log_stds, mask, num_atoms, sample_key
         )
         return Episode(
+            actor=jnp.int32(0),
             obs=obs,
             action_mask=mask,
             logits=logits,
@@ -88,6 +89,7 @@ def _episode(network, params, kind_mask, batch: int = 64, seed: int = 0) -> Epis
 
 def _loss(network, params, episode, **coefs):
     defaults = dict(
+        player=0,
         category_entropy_coef=0.1,
         gaussian_entropy_coef=0.1,
         trpo_category_kl_coef=0.05,

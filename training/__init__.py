@@ -11,6 +11,10 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .config import MixturePPOHyperparams, PPOHyperparams
 from .mixture import (
     Episode,
+    flatten_batch_axes,
+    masked_mean,
+    normalized_advantage,
+    player_weight,
     MixtureActorCritic,
     build_mixture_network,
     build_mixture_ppo_loss_fn,
@@ -37,16 +41,8 @@ from .optimizers import OPTIMIZERS, build_optimizer
 from .ppo import create_train_state, ppo_loss, ppo_update
 from .rollout import Transition, collect_episode, collect_self_play_episode
 from .self_play import SelfPlayPPOTrainer
-from .sequential_rollout import (
-    SequentialEpisode,
-    build_episode_sampler,
-    collect_sequential_batch,
-)
-from .sequential_trainer import (
-    SequentialSelfPlayPPOTrainer,
-    build_sequential_ppo_loss_fn,
-    sequential_ppo_loss,
-)
+from .sequential_rollout import build_episode_sampler, collect_sequential_batch
+from .sequential_trainer import SequentialSelfPlayPPOTrainer
 from .trainer import PPOTrainer
 
 __all__ = [
@@ -88,11 +84,12 @@ __all__ = [
     "sample_mixture_component",
     "MixturePPOTrainer",
     "MixtureSelfPlayPPOTrainer",
-    "SequentialEpisode",
+    "flatten_batch_axes",
+    "masked_mean",
+    "normalized_advantage",
+    "player_weight",
     "build_episode_sampler",
     "collect_sequential_batch",
-    "sequential_ppo_loss",
-    "build_sequential_ppo_loss_fn",
     "SequentialSelfPlayPPOTrainer",
     "build_kuhn_metric_fn",
     "clipped_mixture_grid_probs",

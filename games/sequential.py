@@ -67,6 +67,17 @@ State = chex.ArrayTree
 ActionFn = Callable[[chex.Array, chex.Array, chex.PRNGKey], HybridAction]
 
 
+def select_by_player(is_first: chex.Array, first: chex.ArrayTree, second: chex.ArrayTree) -> chex.ArrayTree:
+    """`first` where player 0 acts, `second` where player 1 does -- leafwise, as a select.
+
+    Whose turn it is is a *traced* value inside a `jit`ed rollout, so it cannot
+    branch: a step evaluates both players' observations, masks and networks and
+    then keeps the acting one. Both arguments must be pytrees of the same
+    structure with broadcast-compatible leaves.
+    """
+    return jax.tree_util.tree_map(lambda a, b: jnp.where(is_first, a, b), first, second)
+
+
 def _validate_player(player: int) -> None:
     if player not in (0, 1):
         raise ValueError(f"player must be 0 or 1, got {player}")
@@ -225,9 +236,7 @@ class SequentialZeroSumGame(abc.ABC):
             action_1 = action_fns[1](
                 self.observation(1, state), self.action_mask(1, state), key_1
             )
-            action = jax.tree_util.tree_map(
-                lambda a0, a1: jnp.where(player == 0, a0, a1), action_0, action_1
-            )
+            action = select_by_player(player == 0, action_0, action_1)
             return self.step(state, action, transition_key), None
 
         init_key, scan_key = jax.random.split(key)

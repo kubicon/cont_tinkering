@@ -1,4 +1,10 @@
-"""PPO on a `SequentialZeroSumGame`: the per-episode loss, and the self-play trainer.
+"""Self-play PPO on a `SequentialZeroSumGame`.
+
+The loss itself lives in `training.mixture`: a trajectory batch is an `Episode`
+like any other, and `build_mixture_ppo_loss_fn(player, ...)` already weights
+every reduction by `Episode.actor == player`, which is exactly what selects one
+player's decisions out of an interleaved, padded trajectory. All that is left
+here is the trainer.
 """
 
 from __future__ import annotations
@@ -6,121 +12,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-import chex
 import jax
 import jax.numpy as jnp
 
-from games.sequential import SequentialZeroSumGame
+from games.sequential import TERMINAL, SequentialZeroSumGame
 
 from .checkpoint import load_checkpoint_step_multi, save_checkpoint_step_multi
 from .config import MixturePPOHyperparams
-from .mixture import MixtureActorCritic, build_mixture_network, mixture_ppo_loss
+from .mixture import MixtureActorCritic, build_mixture_network, build_mixture_ppo_loss_fn
 from .mixture_trainer import (
     MixtureTrainState,
     _update_target_and_magnet,
     create_mixture_train_state,
 )
 from .ppo import ppo_update
-from .sequential_rollout import (
-    SequentialEpisode,
-    build_episode_sampler,
-    collect_sequential_batch,
-)
-
-
-def masked_mean(values: chex.Array, weight: chex.Array) -> chex.Array:
-    """`sum(weight * values) / sum(weight)`, safe when nothing is selected."""
-    return jnp.sum(weight * values) / jnp.maximum(jnp.sum(weight), 1.0)
-
-
-def normalized_advantage(raw: chex.Array, weight: chex.Array) -> chex.Array:
-    """Standardize `raw` using only the entries `weight` selects.
-    """
-    mean = masked_mean(raw, weight)
-    variance = masked_mean(jnp.square(raw - mean), weight)
-    return (raw - mean) / (jnp.sqrt(variance) + 1e-8)
-
-
-def player_weight(episode: SequentialEpisode, player: int) -> chex.Array:
-    """`1.0` on the steps where `player` really acted, `0.0` on everything else."""
-    return (episode.live & (episode.player == player)).astype(jnp.float32)
-
-
-def sequential_ppo_loss(
-    params,
-    network: MixtureActorCritic,
-    episode: SequentialEpisode,
-    advantage: chex.Array,
-    player: int,
-    clip_eps: float,
-    value_coef: float,
-    category_entropy_coef: float,
-    gaussian_entropy_coef: float,
-    trpo_category_kl_coef: float,
-    trpo_gaussian_kl_coef: float,
-    magnet_category_kl_coef: float,
-    magnet_gaussian_kl_coef: float,
-) -> tuple[chex.Array, dict[str, chex.Array], chex.Array]:
-    """`player`'s PPO loss over a **single** episode, summed over their live steps.
-    """
-    weight = player_weight(episode, player)
-
-    per_step_loss, per_step_metrics = jax.vmap(
-        mixture_ppo_loss, in_axes=(None, None, 0, 0, None, None, None, None, None, None, None, None)
-    )(
-        params, network, episode.to_transitions(), advantage, clip_eps, value_coef,
-        category_entropy_coef, gaussian_entropy_coef,
-        trpo_category_kl_coef, trpo_gaussian_kl_coef,
-        magnet_category_kl_coef, magnet_gaussian_kl_coef,
-    )
-
-    loss_sum = jnp.sum(weight * per_step_loss)
-    metric_sums = jax.tree_util.tree_map(lambda m: jnp.sum(weight * m), per_step_metrics)
-    return loss_sum, metric_sums, jnp.sum(weight)
-
-
-def build_sequential_ppo_loss_fn(
-    player: int,
-    category_entropy_coef: float,
-    gaussian_entropy_coef: float,
-    trpo_category_kl_coef: float,
-    trpo_gaussian_kl_coef: float,
-    magnet_category_kl_coef: float,
-    magnet_gaussian_kl_coef: float,
-):
-    """Batch `sequential_ppo_loss` over a `SequentialEpisode`'s leading (env) axis.
-
-    """
-
-    def loss_fn(
-        params,
-        network: MixtureActorCritic,
-        batch: SequentialEpisode,
-        clip_eps: float,
-        value_coef: float,
-        entropy_coef: float,
-    ) -> tuple[chex.Array, dict[str, chex.Array]]:
-        del entropy_coef
-
-        weight = player_weight(batch, player)
-        advantage = normalized_advantage(batch.reward - batch.value, weight)
-
-        loss_sums, metric_sums, counts = jax.vmap(
-            sequential_ppo_loss,
-            in_axes=(None, None, 0, 0, None, None, None, None, None, None, None, None, None),
-        )(
-            params, network, batch, advantage, player, clip_eps, value_coef,
-            category_entropy_coef, gaussian_entropy_coef,
-            trpo_category_kl_coef, trpo_gaussian_kl_coef,
-            magnet_category_kl_coef, magnet_gaussian_kl_coef,
-        )
-
-        total = jnp.maximum(jnp.sum(counts), 1.0)
-        metrics = jax.tree_util.tree_map(lambda m: jnp.sum(m) / total, metric_sums)
-        metrics["decisions_per_episode"] = jnp.mean(counts)
-        return jnp.sum(loss_sums) / total, metrics
-
-    return loss_fn
+from .sequential_rollout import build_episode_sampler, collect_sequential_batch
 
 
 def _build_self_play_train_step(
@@ -132,7 +38,7 @@ def _build_self_play_train_step(
 ):
     sample_episode = build_episode_sampler(game, network_0, network_1)
     loss_fns = tuple(
-        build_sequential_ppo_loss_fn(
+        build_mixture_ppo_loss_fn(
             player,
             hyperparams.category_entropy_coef, hyperparams.gaussian_entropy_coef,
             hyperparams.trpo_category_kl_coef, hyperparams.trpo_gaussian_kl_coef,
@@ -144,7 +50,7 @@ def _build_self_play_train_step(
     def step(state_0: MixtureTrainState, state_1: MixtureTrainState, key: jax.Array):
         # One batch of trajectories feeds both updates: the players' decisions are
         # interleaved in the same episodes, so each simply masks to its own.
-        batch = collect_sequential_batch(
+        batch, payoff = collect_sequential_batch(
             sample_episode,
             state_0.params, state_0.magnet_params,
             state_1.params, state_1.magnet_params,
@@ -156,8 +62,8 @@ def _build_self_play_train_step(
         state_1 = _update_target_and_magnet(state_1, hyperparams_1)
 
         metrics = {
-            "payoff": jnp.mean(batch.payoff),
-            "episode_length": jnp.mean(jnp.sum(batch.live.astype(jnp.float32), axis=-1)),
+            "payoff": jnp.mean(payoff),
+            "episode_length": jnp.mean(jnp.sum((batch.actor != TERMINAL).astype(jnp.float32), axis=-1)),
             **{f"{k}_0": v for k, v in metrics_0.items()},
             **{f"{k}_1": v for k, v in metrics_1.items()},
         }

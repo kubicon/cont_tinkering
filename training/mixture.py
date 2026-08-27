@@ -204,10 +204,28 @@ def mixture_marginal_log_prob(
 
 @chex.dataclass
 class Episode:
-    """Everything recorded while sampling one batch of transitions from a `MixtureActorCritic`.
- 
+    """Everything recorded while sampling transitions from a `MixtureActorCritic`.
+
+    One dataclass covers both game shapes. A field's *trailing* axes are the
+    per-decision ones documented below; whatever leading axes sit in front of
+    them are batch axes, and there can be any number of them:
+
+      * one-shot (`ZeroSumGame`): `(num_envs, ...)` -- one decision per episode,
+        so the env axis is the only one.
+      * sequential (`SequentialZeroSumGame`): `(num_envs, max_steps, ...)` --
+        a trajectory is padded out to the static horizon, so most rows of a
+        batch are *not* decisions of the player being trained.
+
+    `actor` is what makes the second case work and costs the first case one
+    `int32` per sample: it names who owned each decision, and is `TERMINAL`
+    (`-1`) on the padding steps of a finished episode. Every reduction in the
+    loss weights by `actor == player` (see `player_weight`), so padding and the
+    opponent's interleaved decisions contribute exactly zero rather than
+    approximately zero. In a one-shot batch every row is the same player's, the
+    weight is all-ones, and every masked reduction collapses to a plain mean.
     """
 
+    actor: chex.Array  # () int32, who made this decision -- `TERMINAL` on a padding step
     obs: chex.Array
     action_mask: chex.Array  # (num_atoms + num_components,) bool, which logits were legal here
     logits: chex.Array  # (num_atoms + num_components,) categorical logits at sample time
@@ -222,6 +240,45 @@ class Episode:
     action_value: chex.Array  # `raw_action` clipped to the action space; read by the game only on the continuous kind
     value: chex.Array
     reward: chex.Array
+
+
+
+def player_weight(episode: Episode, player: int) -> chex.Array:
+    """`1.0` on the rows where `player` really decided something, `0.0` on everything else.
+
+    The one weight every reduction in the loss goes through: it is what makes an
+    opponent's step and a padding step contribute exactly nothing. All-ones for a
+    one-shot batch, where every row is `player`'s.
+    """
+    return (episode.actor == player).astype(jnp.float32)
+
+
+def masked_mean(values: chex.Array, weight: chex.Array) -> chex.Array:
+    """`sum(weight * values) / sum(weight)`, safe when nothing is selected."""
+    return jnp.sum(weight * values) / jnp.maximum(jnp.sum(weight), 1.0)
+
+
+def normalized_advantage(raw: chex.Array, weight: chex.Array) -> chex.Array:
+    """Standardize `raw` using only the entries `weight` selects.
+
+    With an all-ones `weight` this is exactly `(raw - mean) / (std + 1e-8)`.
+    """
+    mean = masked_mean(raw, weight)
+    variance = masked_mean(jnp.square(raw - mean), weight)
+    return (raw - mean) / (jnp.sqrt(variance) + 1e-8)
+
+
+def flatten_batch_axes(episode: Episode) -> Episode:
+    """Collapse an `Episode`'s leading batch axes into one, leaving per-sample shapes alone.
+
+    `actor` carries exactly the batch axes and nothing else, so its rank says how
+    many there are. A one-shot batch already has one, and this is then a no-op; a
+    trajectory batch has `(num_envs, max_steps)`, and flattening lets the loss
+    `vmap` once over every decision rather than nesting a `vmap` per axis.
+    """
+    lead = episode.actor.ndim
+    return jax.tree_util.tree_map(lambda x: x.reshape((-1,) + x.shape[lead:]), episode)
+
 
 
 def sample_mixture_component(
@@ -244,11 +301,12 @@ def sample_mixture_component(
 
 def _sample_mixture_one(
     game: ZeroSumGame, player: int, network: MixtureActorCritic, params, magnet_params, key: chex.PRNGKey
-):
-    """One (unbatched) sample: draws `obs`, samples a component/action, and evaluates both
-    `params` and `magnet_params` at that `obs`. Everything is keyed off the single `key`
-    passed in -- `vmap` this over `num_envs` keys to draw a whole batch (see
-    `collect_mixture_episode`/`collect_mixture_self_play_episode`).
+) -> Episode:
+    """One (unbatched) sample as an `Episode` with `reward` still zero -- the caller fills
+    it in once it knows the opponent's action. Draws `obs`, samples a component/action,
+    and evaluates both `params` and `magnet_params` at that `obs`. Everything is keyed off
+    the single `key` passed in -- `vmap` this over `num_envs` keys to draw a whole batch
+    (see `collect_mixture_episode`/`collect_mixture_self_play_episode`).
     """
     obs_key, sample_key = jax.random.split(key)
     space = game.action_space(player)
@@ -264,12 +322,16 @@ def _sample_mixture_one(
     component, raw_action = sample_mixture_component(
         logits, means, log_stds, action_mask, network.num_atoms, sample_key
     )
-    action_kind = component_to_kind(component, network.num_atoms)
-    action_value = space.clip(raw_action)
 
-    return (
-        obs, action_mask, logits, means, log_stds, magnet_logits, magnet_means, magnet_log_stds,
-        component, raw_action, action_kind, action_value, value,
+    return Episode(
+        # Every row of a one-shot batch is the same player's single decision, so
+        # `actor` is constant and `player_weight` comes out all-ones.
+        actor=jnp.int32(player),
+        obs=obs, action_mask=action_mask, logits=logits, means=means, log_stds=log_stds,
+        magnet_logits=magnet_logits, magnet_means=magnet_means, magnet_log_stds=magnet_log_stds,
+        component=component, raw_action=raw_action,
+        action_kind=component_to_kind(component, network.num_atoms),
+        action_value=space.clip(raw_action), value=value, reward=jnp.zeros(()),
     )
 
 
@@ -321,25 +383,16 @@ def collect_mixture_episode(
 
     own_key, opponent_key = jax.random.split(key)
     keys = jax.random.split(own_key, num_envs)
-    (
-        obs, action_mask, logits, means, log_stds, magnet_logits, magnet_means, magnet_log_stds,
-        component, raw_action, action_kind, action_value, value,
-    ) = jax.vmap(_sample_mixture_one, in_axes=(None, None, None, None, None, 0))(
+    episode = jax.vmap(_sample_mixture_one, in_axes=(None, None, None, None, None, 0))(
         game, perspective, network, params, magnet_params, keys
     )
 
     opponent_action = opponent_action_fn(opponent_key, num_envs)
     if perspective == 0:
-        reward = game.payoff_batch(action_value, opponent_action)
+        reward = game.payoff_batch(episode.action_value, opponent_action)
     else:
-        reward = -game.payoff_batch(opponent_action, action_value)
-
-    return Episode(
-        obs=obs, action_mask=action_mask, logits=logits, means=means, log_stds=log_stds,
-        magnet_logits=magnet_logits, magnet_means=magnet_means, magnet_log_stds=magnet_log_stds,
-        component=component, raw_action=raw_action, action_kind=action_kind,
-        action_value=action_value, value=value, reward=reward,
-    )
+        reward = -game.payoff_batch(opponent_action, episode.action_value)
+    return episode.replace(reward=reward)
 
 
 def _sample_self_play_episode_one(
@@ -356,32 +409,11 @@ def _sample_self_play_episode_one(
     reward, all keyed off the single `key` passed in.
     """
     key_1, key_2 = jax.random.split(key)
-    (
-        obs_1, action_mask_1, logits_1, means_1, log_stds_1,
-        magnet_logits_1, magnet_means_1, magnet_log_stds_1,
-        component_1, raw_action_1, action_kind_1, action_value_1, value_1,
-    ) = _sample_mixture_one(game, 0, network_1, params_1, magnet_params_1, key_1)
-    (
-        obs_2, action_mask_2, logits_2, means_2, log_stds_2,
-        magnet_logits_2, magnet_means_2, magnet_log_stds_2,
-        component_2, raw_action_2, action_kind_2, action_value_2, value_2,
-    ) = _sample_mixture_one(game, 1, network_2, params_2, magnet_params_2, key_2)
+    episode_1 = _sample_mixture_one(game, 0, network_1, params_1, magnet_params_1, key_1)
+    episode_2 = _sample_mixture_one(game, 1, network_2, params_2, magnet_params_2, key_2)
 
-    reward = game.payoff(action_value_1, action_value_2)
-
-    episode_1 = Episode(
-        obs=obs_1, action_mask=action_mask_1, logits=logits_1, means=means_1, log_stds=log_stds_1,
-        magnet_logits=magnet_logits_1, magnet_means=magnet_means_1, magnet_log_stds=magnet_log_stds_1,
-        component=component_1, raw_action=raw_action_1, action_kind=action_kind_1,
-        action_value=action_value_1, value=value_1, reward=reward,
-    )
-    episode_2 = Episode(
-        obs=obs_2, action_mask=action_mask_2, logits=logits_2, means=means_2, log_stds=log_stds_2,
-        magnet_logits=magnet_logits_2, magnet_means=magnet_means_2, magnet_log_stds=magnet_log_stds_2,
-        component=component_2, raw_action=raw_action_2, action_kind=action_kind_2,
-        action_value=action_value_2, value=value_2, reward=-reward,
-    )
-    return episode_1, episode_2
+    reward = game.payoff(episode_1.action_value, episode_2.action_value)
+    return episode_1.replace(reward=reward), episode_2.replace(reward=-reward)
 
 
 def collect_mixture_self_play_episode(
@@ -583,6 +615,7 @@ def mixture_ppo_loss(
 
 
 def build_mixture_ppo_loss_fn(
+    player: int,
     category_entropy_coef: float,
     gaussian_entropy_coef: float,
     trpo_category_kl_coef: float,
@@ -591,7 +624,7 @@ def build_mixture_ppo_loss_fn(
     magnet_gaussian_kl_coef: float,
     shared_obs: bool = False,
 ):
-    """Batches `mixture_ppo_loss` over an `Episode`'s leading (env) axis.
+    """`player`'s PPO loss over a whole `Episode` batch, one-shot or sequential alike.
 
     Binds the six per-head entropy/KL coefficients (constant for one
     `ppo_update` call) and returns a function matching `ppo_update`'s
@@ -599,10 +632,15 @@ def build_mixture_ppo_loss_fn(
     entropy_coef) -> (scalar_loss, dict_of_scalar_metrics)`. `entropy_coef`
     (the generic `PPOHyperparams` field `ppo_update` always passes) is
     accepted but unused -- the mixture loss is weighted by the two bound
-    per-head coefficients instead. The batch-wide advantage normalization
-    happens here, before the per-sample `vmap`; `batch` (an `Episode` whose
-    fields all carry the leading env axis) is `vmap`ed as a single pytree
-    argument rather than unpacked field by field.
+    per-head coefficients instead.
+
+    The batch's leading axes are flattened to one and `mixture_ppo_loss` is
+    `vmap`ed over that, then every reduction -- the advantage normalization
+    included -- is weighted by `player_weight`. A one-shot batch is all
+    `player`'s, so the weight is all-ones and each reduction is a plain mean; a
+    trajectory batch holds both players' interleaved decisions plus the padding
+    of finished episodes, and the same weighted reductions drop those to zero.
+    `decisions_per_episode` is reported only when there *is* a time axis.
 
     `shared_obs` says every sample in the batch carries the *same*
     observation -- true of the one-shot games in `games.examples`, whose
@@ -614,8 +652,17 @@ def build_mixture_ppo_loss_fn(
     log-prob/KL arithmetic stays batched. Mathematically identical -- the
     lifted outputs are exactly what the per-sample apply would have returned
     -- so it is purely a saving, but it is silently *wrong* if the
-    observations actually differ, hence off by default.
+    observations actually differ, hence off by default (and never right for a
+    sequential game, whose whole point is a per-infoset observation).
     """
+    if player not in (0, 1):
+        raise ValueError(f"player must be 0 or 1, got {player}")
+
+    coefs = (
+        category_entropy_coef, gaussian_entropy_coef,
+        trpo_category_kl_coef, trpo_gaussian_kl_coef,
+        magnet_category_kl_coef, magnet_gaussian_kl_coef,
+    )
 
     def loss_fn(
         params,
@@ -627,28 +674,33 @@ def build_mixture_ppo_loss_fn(
     ) -> tuple[chex.Array, dict[str, chex.Array]]:
         del entropy_coef
 
-        advantage = batch.reward - batch.value
-        advantage = (advantage - jnp.mean(advantage)) / (jnp.std(advantage) + 1e-8)
+        weight = player_weight(batch, player)
+        # Normalized over the player's own decisions, across the whole batch:
+        # a batch statistic, so it has to be computed before the per-sample vmap.
+        advantage = normalized_advantage(batch.reward - batch.value, weight)
 
-        coefs = (
-            category_entropy_coef, gaussian_entropy_coef,
-            trpo_category_kl_coef, trpo_gaussian_kl_coef,
-            magnet_category_kl_coef, magnet_gaussian_kl_coef,
-        )
+        flat = flatten_batch_axes(batch)
+        flat_weight, flat_advantage = weight.reshape(-1), advantage.reshape(-1)
+
         if shared_obs:
-            logits, means, log_stds, value_pred = network.apply(params, batch.obs[0])
+            logits, means, log_stds, value_pred = network.apply(params, flat.obs[0])
             per_sample_loss, metrics = jax.vmap(
                 mixture_ppo_loss_from_outputs,
                 in_axes=(None, None, None, None, None, 0, 0, None, None, None, None, None, None, None, None),
             )(
-                logits, means, log_stds, value_pred, network.num_atoms, batch, advantage,
+                logits, means, log_stds, value_pred, network.num_atoms, flat, flat_advantage,
                 clip_eps, value_coef, *coefs,
             )
         else:
             per_sample_loss, metrics = jax.vmap(
                 mixture_ppo_loss, in_axes=(None, None, 0, 0, None, None, None, None, None, None, None, None)
-            )(params, network, batch, advantage, clip_eps, value_coef, *coefs)
-        return jnp.mean(per_sample_loss), jax.tree_util.tree_map(jnp.mean, metrics)
+            )(params, network, flat, flat_advantage, clip_eps, value_coef, *coefs)
+
+        loss = masked_mean(per_sample_loss, flat_weight)
+        metrics = jax.tree_util.tree_map(lambda m: masked_mean(m, flat_weight), metrics)
+        if batch.actor.ndim > 1:
+            metrics["decisions_per_episode"] = jnp.mean(jnp.sum(weight, axis=-1))
+        return loss, metrics
 
     return loss_fn
 

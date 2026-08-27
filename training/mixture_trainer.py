@@ -126,6 +126,7 @@ def _build_train_step(
     perspective: int,
 ):
     loss_fn = build_mixture_ppo_loss_fn(
+        perspective,
         hyperparams.category_entropy_coef, hyperparams.gaussian_entropy_coef,
         hyperparams.trpo_category_kl_coef, hyperparams.trpo_gaussian_kl_coef,
         hyperparams.magnet_category_kl_coef, hyperparams.magnet_gaussian_kl_coef,
@@ -288,12 +289,14 @@ def _build_self_play_train_step(
     hyperparams_2: MixturePPOHyperparams,
 ):
     loss_fn_1 = build_mixture_ppo_loss_fn(
+        0,
         hyperparams_1.category_entropy_coef, hyperparams_1.gaussian_entropy_coef,
         hyperparams_1.trpo_category_kl_coef, hyperparams_1.trpo_gaussian_kl_coef,
         hyperparams_1.magnet_category_kl_coef, hyperparams_1.magnet_gaussian_kl_coef,
         shared_obs=game.constant_observation,
     )
     loss_fn_2 = build_mixture_ppo_loss_fn(
+        1,
         hyperparams_2.category_entropy_coef, hyperparams_2.gaussian_entropy_coef,
         hyperparams_2.trpo_category_kl_coef, hyperparams_2.trpo_gaussian_kl_coef,
         hyperparams_2.magnet_category_kl_coef, hyperparams_2.magnet_gaussian_kl_coef,

@@ -18,18 +18,18 @@ import pytest
 from games.sequential import TERMINAL
 from games.sequential_examples import ContinuousKuhnPoker
 from training.config import MixturePPOHyperparams
-from training.mixture import build_mixture_network
-from training.sequential_rollout import (
-    build_episode_sampler,
-    collect_sequential_batch,
-)
-from training.sequential_trainer import (
-    SequentialSelfPlayPPOTrainer,
-    build_sequential_ppo_loss_fn,
+from training.mixture import (
+    build_mixture_network,
+    build_mixture_ppo_loss_fn,
     masked_mean,
     normalized_advantage,
     player_weight,
 )
+from training.sequential_rollout import (
+    build_episode_sampler,
+    collect_sequential_batch,
+)
+from training.sequential_trainer import SequentialSelfPlayPPOTrainer
 
 NUM_COMPONENTS = 2
 NUM_ENVS = 96
@@ -68,14 +68,14 @@ def _setup(seed: int = 0, **game_kwargs):
         networks[1].init(init_1, game.observation(1, dummy)),
     )
     sampler = build_episode_sampler(game, *networks)
-    batch = collect_sequential_batch(
+    batch, payoff = collect_sequential_batch(
         sampler, params[0], params[0], params[1], params[1], batch_key, NUM_ENVS
     )
-    return game, networks, params, sampler, batch
+    return game, networks, params, sampler, batch, payoff
 
 
 def _loss(network, params, batch, player):
-    return build_sequential_ppo_loss_fn(player, 0.05, 0.05, 0.05, 0.05, 0.2, 0.2)(
+    return build_mixture_ppo_loss_fn(player, 0.05, 0.05, 0.05, 0.05, 0.2, 0.2)(
         params, network, batch, 0.1, 0.5, 0.0
     )
 
@@ -84,66 +84,66 @@ def _loss(network, params, batch, player):
 
 
 def test_sample_episode_returns_one_trajectory_with_a_scalar_payoff():
-    game, _, params, sampler, _ = _setup()
-    episode = sampler(params[0], params[0], params[1], params[1], jax.random.PRNGKey(3))
+    game, _, params, sampler, _, _ = _setup()
+    episode, payoff = sampler(params[0], params[0], params[1], params[1], jax.random.PRNGKey(3))
 
     steps = game.max_steps
-    assert episode.player.shape == episode.live.shape == (steps,)
+    assert episode.actor.shape == (steps,)
     assert episode.obs.shape == (steps, game.obs_dim(0))
     assert episode.means.shape == (steps, NUM_COMPONENTS, 1)
     assert episode.action_mask.shape == (steps, game.action_space(0).num_atoms + NUM_COMPONENTS)
-    assert episode.payoff.shape == ()  # the one field with no time axis
+    assert payoff.shape == ()  # episode-level, so it is not a field of the `Episode`
 
 
 def test_collect_puts_the_batch_axis_in_front_of_the_time_axis():
-    game, _, _, _, batch = _setup()
+    game, _, _, _, batch, payoff = _setup()
     assert batch.obs.shape == (NUM_ENVS, game.max_steps, game.obs_dim(0))
-    assert batch.player.shape == (NUM_ENVS, game.max_steps)
-    assert batch.payoff.shape == (NUM_ENVS,)
+    assert batch.actor.shape == (NUM_ENVS, game.max_steps)
+    assert payoff.shape == (NUM_ENVS,)
 
 
 def test_live_steps_are_a_contiguous_prefix_and_dead_steps_are_tagged_terminal():
     """Padding only ever happens at the tail -- a mask that is true after a false
     would mean the terminal guard leaked."""
-    _, _, _, _, batch = _setup()
-    live = np.asarray(batch.live)
-    for row, player_row in zip(live, np.asarray(batch.player)):
-        assert list(row) == sorted(row, reverse=True)
-        assert all(p in (0, 1) for p in player_row[row])
-        assert all(p == TERMINAL for p in player_row[~row])
+    _, _, _, _, batch, _ = _setup()
+    actor = np.asarray(batch.actor)
+    for actor_row in actor:
+        live = actor_row != TERMINAL
+        assert list(live) == sorted(live, reverse=True)
+        assert all(p in (0, 1) for p in actor_row[live])
 
 
 def test_recorded_players_match_an_independent_replay_of_the_tree():
     """Replays each episode's own actions through the game and checks who acted."""
-    game, _, params, sampler, _ = _setup()
+    game, _, params, sampler, _, _ = _setup()
     from games.spaces import HybridAction
 
     for seed in range(8):
-        episode = sampler(params[0], params[0], params[1], params[1], jax.random.PRNGKey(seed))
+        episode, payoff = sampler(params[0], params[0], params[1], params[1], jax.random.PRNGKey(seed))
         state = game.initial_state(jax.random.split(jax.random.PRNGKey(seed))[0])
         for t in range(game.max_steps):
-            if not bool(episode.live[t]):
+            if int(episode.actor[t]) == TERMINAL:
                 assert bool(game.is_terminal(state))
                 continue
-            assert int(episode.player[t]) == int(game.current_player(state))
+            assert int(episode.actor[t]) == int(game.current_player(state))
             state = game.step(
                 state,
                 HybridAction(kind=episode.action_kind[t], value=episode.action_value[t]),
                 jax.random.PRNGKey(0),
             )
-        assert float(episode.payoff) == pytest.approx(float(game.payoff(state)))
+        assert float(payoff) == pytest.approx(float(game.payoff(state)))
 
 
 def test_reward_is_the_terminal_payoff_signed_for_whoever_acted():
     """No bootstrapping: every decision in an episode shares the one leaf value."""
-    _, _, _, _, batch = _setup()
-    expected = jnp.where(batch.player == 0, batch.payoff[:, None], -batch.payoff[:, None])
+    _, _, _, _, batch, payoff = _setup()
+    expected = jnp.where(batch.actor == 0, payoff[:, None], -payoff[:, None])
     np.testing.assert_allclose(batch.reward, expected, rtol=1e-6)
 
 
 def test_only_legal_kinds_are_ever_played():
-    _, _, _, _, batch = _setup()
-    live = batch.live
+    _, _, _, _, batch, _ = _setup()
+    live = batch.actor != TERMINAL
     chosen_is_legal = jnp.take_along_axis(
         batch.action_mask, batch.component[..., None], axis=-1
     )[..., 0]
@@ -171,9 +171,9 @@ def test_normalized_advantage_standardizes_over_the_selected_entries_only():
 
 
 def test_player_weight_selects_exactly_that_players_live_steps():
-    _, _, _, _, batch = _setup()
+    _, _, _, _, batch, _ = _setup()
     total = player_weight(batch, 0) + player_weight(batch, 1)
-    np.testing.assert_allclose(total, batch.live.astype(jnp.float32))
+    np.testing.assert_allclose(total, (batch.actor != TERMINAL).astype(jnp.float32))
 
 
 # ---- the loss ignores everything it should ------------------------------
@@ -192,25 +192,26 @@ def _corrupt(batch, where):
 
 def test_padding_steps_cannot_move_the_loss():
     """The tail of a finished episode is real memory holding meaningless numbers."""
-    _, networks, params, _, batch = _setup()
+    _, networks, params, _, batch, _ = _setup()
     for player in (0, 1):
         before, _ = _loss(networks[player], params[player], batch, player)
-        after, _ = _loss(networks[player], params[player], _corrupt(batch, ~batch.live), player)
+        corrupted = _corrupt(batch, batch.actor == TERMINAL)
+        after, _ = _loss(networks[player], params[player], corrupted, player)
         assert float(before) == pytest.approx(float(after), rel=1e-5)
 
 
 def test_the_other_players_steps_cannot_move_the_loss():
     """Both players learn from one interleaved trajectory; each must see only its own."""
-    _, networks, params, _, batch = _setup()
+    _, networks, params, _, batch, _ = _setup()
     for player in (0, 1):
-        opponent_steps = batch.live & (batch.player == 1 - player)
+        opponent_steps = batch.actor == 1 - player
         before, _ = _loss(networks[player], params[player], batch, player)
         after, _ = _loss(networks[player], params[player], _corrupt(batch, opponent_steps), player)
         assert float(before) == pytest.approx(float(after), rel=1e-5)
 
 
 def test_loss_and_gradients_are_finite():
-    _, networks, params, _, batch = _setup()
+    _, networks, params, _, batch, _ = _setup()
     for player in (0, 1):
         (loss, metrics), grads = jax.value_and_grad(
             lambda p: _loss(networks[player], p, batch, player), has_aux=True
@@ -222,7 +223,7 @@ def test_loss_and_gradients_are_finite():
 
 def test_gradients_are_finite_on_a_degenerate_zero_width_bet_box():
     """`min_bet == max_bet` is the classic-Kuhn baseline; `log(high - low)` is `-inf` there."""
-    _, networks, params, _, batch = _setup(min_bet=1.0, max_bet=1.0)
+    _, networks, params, _, batch, _ = _setup(min_bet=1.0, max_bet=1.0)
     grads = jax.grad(lambda p: _loss(networks[0], p, batch, 0)[0])(params[0])
     assert all(bool(jnp.all(jnp.isfinite(g))) for g in jax.tree_util.tree_leaves(grads))
 
