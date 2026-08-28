@@ -164,6 +164,96 @@ class Evaluation:
         return f"{self.value:+.4f} +- {1.96 * self.stderr:.4f}"
 
 
+class PairEvaluator:
+    """A compiled `play_episode` rollout for a *fixed pair of architectures*.
+
+    Only the weights change between measurements -- the networks, the game and
+    the greedy/sampled choice do not -- so the weights are passed to the
+    compiled function as **arguments**. Closing over them instead bakes them
+    into the executable as constants, which throws the compilation away every
+    time the params move: a per-chunk progress evaluation then spends more time
+    in XLA than the training chunk it is reporting on.
+
+    Hold one of these across a run. `evaluate_pair` is the one-off wrapper.
+    """
+
+    def __init__(
+        self,
+        game: SequentialZeroSumGame,
+        networks: tuple[MixtureActorCritic, MixtureActorCritic],
+    ):
+        self.game = game
+        self.networks = networks
+        self._spaces = (game.action_space(0), game.action_space(1))
+        # One entry per `(greedy_0, greedy_1)`: those four are different
+        # programs, but each is compiled once for the life of the evaluator.
+        self._batch_sums: dict[tuple[bool, bool], Callable] = {}
+
+    def _build_batch_sums(self, greedy: tuple[bool, bool]) -> Callable:
+        """`(params_0, params_1, keys) -> (sum payoff, sum payoff^2)` over the batch.
+
+        The two sums are reduced on device, so a batch returns two scalars
+        rather than one payoff per episode.
+        """
+        def batch_sums(params_0, params_1, keys: chex.PRNGKey):
+            params = (params_0, params_1)
+            action_fns = tuple(
+                policy_action_fn(self.networks[p], params[p], self._spaces[p], greedy[p])
+                for p in (0, 1)
+            )
+            payoff = jax.vmap(lambda k: self.game.play_episode(action_fns, k)[1])(keys)
+            return jnp.sum(payoff), jnp.sum(payoff ** 2)
+
+        return jax.jit(batch_sums)
+
+    def evaluate(
+        self,
+        params: tuple,
+        player: int,
+        key: chex.PRNGKey,
+        num_episodes: int = 100_000,
+        greedy: tuple[bool, bool] = (False, False),
+        batch_size: int = 20_000,
+    ) -> Evaluation:
+        """Play `params` against each other and report the payoff to `player`."""
+        if player not in (0, 1):
+            raise ValueError(f"player must be 0 or 1, got {player}")
+        if isinstance(greedy, bool):
+            raise TypeError("greedy is per player: pass a (bool, bool), not a single bool")
+        if num_episodes < 2:
+            raise ValueError(f"num_episodes must be at least 2, got {num_episodes}")
+
+        greedy = (bool(greedy[0]), bool(greedy[1]))
+        if greedy not in self._batch_sums:
+            self._batch_sums[greedy] = self._build_batch_sums(greedy)
+        batch_sums = self._batch_sums[greedy]
+
+        # Dispatch every batch before reading any of them back: JAX is
+        # asynchronous, so blocking on each batch's sum in turn would serialize
+        # the queue against the host for no reason.
+        sums = []
+        remaining = num_episodes
+        while remaining > 0:
+            key, batch_key = jax.random.split(key)
+            size = min(batch_size, remaining)
+            sums.append(batch_sums(*params, jax.random.split(batch_key, size)))
+            remaining -= size
+
+        total, total_squares = (float(value) for value in jax.tree_util.tree_map(
+            lambda *batch: sum(batch), *jax.device_get(sums)
+        ))
+
+        # Player 0's payoff is what the game reports; the game is zero-sum.
+        sign = 1.0 if player == 0 else -1.0
+        mean = total / num_episodes
+        variance = max(total_squares / num_episodes - mean ** 2, 0.0)
+        return Evaluation(
+            value=sign * mean,
+            stderr=(variance / num_episodes) ** 0.5,
+            episodes=num_episodes,
+        )
+
+
 def evaluate_pair(
     game: SequentialZeroSumGame,
     policies: tuple[FrozenPolicy, FrozenPolicy],
@@ -174,39 +264,19 @@ def evaluate_pair(
     batch_size: int = 20_000,
 ) -> Evaluation:
     """Play `policies` against each other and report the payoff to `player`.
+
+    A one-off measurement: it compiles the rollout, uses it once and drops it.
+    Anything measuring repeatedly (a training loop's progress metric) should
+    hold a `PairEvaluator` instead and call its `evaluate`.
     """
-    if player not in (0, 1):
-        raise ValueError(f"player must be 0 or 1, got {player}")
-    if isinstance(greedy, bool):
-        raise TypeError("greedy is per player: pass a (bool, bool), not a single bool")
-    if num_episodes < 2:
-        raise ValueError(f"num_episodes must be at least 2, got {num_episodes}")
-
-    action_fns = tuple(
-        policy_action_fn(policies[p].network, policies[p].params, game.action_space(p), greedy[p])
-        for p in (0, 1)
-    )
-    play = jax.jit(jax.vmap(lambda k: game.play_episode(action_fns, k)[1]))
-
-    total = 0.0
-    total_squares = 0.0
-    remaining = num_episodes
-    while remaining > 0:
-        key, batch_key = jax.random.split(key)
-        size = min(batch_size, remaining)
-        payoff = play(jax.random.split(batch_key, size))
-        total += float(jnp.sum(payoff))
-        total_squares += float(jnp.sum(payoff ** 2))
-        remaining -= size
-
-    # Player 0's payoff is what the game reports; the game is zero-sum.
-    sign = 1.0 if player == 0 else -1.0
-    mean = total / num_episodes
-    variance = max(total_squares / num_episodes - mean ** 2, 0.0)
-    return Evaluation(
-        value=sign * mean,
-        stderr=(variance / num_episodes) ** 0.5,
-        episodes=num_episodes,
+    evaluator = PairEvaluator(game, (policies[0].network, policies[1].network))
+    return evaluator.evaluate(
+        (policies[0].params, policies[1].params),
+        player,
+        key,
+        num_episodes=num_episodes,
+        greedy=greedy,
+        batch_size=batch_size,
     )
 
 
@@ -280,6 +350,7 @@ class SequentialBestResponseTrainer:
         self.networks = (
             (network, opponent.network) if responder == 0 else (opponent.network, network)
         )
+        self._evaluator = PairEvaluator(game, self.networks)
 
         key = jax.random.PRNGKey(seed)
         init_key, state_key, self.key = jax.random.split(key, 3)
@@ -318,13 +389,16 @@ class SequentialBestResponseTrainer:
     ) -> Evaluation:
         """The responder's payoff against the frozen opponent -- one best-response bound.
         """
-        responder = self.policy(target=target)
-        policies = (
-            (responder, self.opponent) if self.responder == 0 else (self.opponent, responder)
+        responder_params = self.state.target_params if target else self.state.params
+        params = (
+            (responder_params, self.opponent.params)
+            if self.responder == 0
+            else (self.opponent.params, responder_params)
         )
-        return evaluate_pair(
-            self.game,
-            policies,
+        # `self._evaluator`, not a fresh `evaluate_pair`: this runs once per
+        # training chunk, and the rollout is only compiled the first time.
+        return self._evaluator.evaluate(
+            params,
             self.responder,
             key,
             num_episodes=num_episodes,

@@ -30,10 +30,14 @@ best_response:
   responder: both
   # That run predates target params being checkpointed, so only its last
   # iterate is recoverable; asking for "target" here would (correctly) raise.
-  opponent_iterate: live
+  opponent_iterate: target
+  # Which responder iterate the bound is read off: "live" (PPO's current
+  # iterate, normally the tighter bound), "target" (the responder's own Polyak
+  # average), or "both". The target network is tracked either way.
+  responder_iterate: live
   eval_episodes: 200000
   eval_batch_size: 20000
-  eval_seed: 12345
+  eval_seed: 32432432
   progress_episodes: 20000
 
 network:
@@ -44,7 +48,7 @@ network:
   clip_means: true
 
 optimizer:
-  learning_rate: 0.003
+  learning_rate: 0.001
   max_grad_norm: 0.5
   optimizer: adam
   weight_decay: 0.0
@@ -64,10 +68,10 @@ ppo:
   magnet_category_kl_coef: 0.0
   magnet_gaussian_kl_coef: 0.0
 
-  category_entropy_coef: 0.005
+  category_entropy_coef: 0.02
   gaussian_entropy_coef: 0.0    # the bet size never varies in the classic game
 
 train:
-  steps: 40
-  epochs: 300
+  steps: 10
+  epochs: 10000
   seed: 0

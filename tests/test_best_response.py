@@ -323,8 +323,16 @@ def test_opponent_iterates_parses_every_spelling():
     assert script.opponent_iterates("both") == ("live", "target")
     assert script.opponent_iterates("live") == ("live",)
     assert script.opponent_iterates("target") == ("target",)
-    with pytest.raises(ValueError, match="'live', 'target' or 'both'"):
+    with pytest.raises(ValueError, match="opponent_iterate must be 'live', 'target' or 'both'"):
         script.opponent_iterates("averaged")
+
+
+def test_responder_iterates_parses_every_spelling():
+    assert script.responder_iterates("both") == ("live", "target")
+    assert script.responder_iterates("live") == ("live",)
+    assert script.responder_iterates("target") == ("target",)
+    with pytest.raises(ValueError, match="responder_iterate must be 'live', 'target' or 'both'"):
+        script.responder_iterates("averaged")
 
 
 # ---- the entry point -----------------------------------------------------
@@ -353,21 +361,30 @@ def test_a_short_run_completes_through_the_entry_point(tmp_path, capsys):
         eval_episodes=2_000,
         progress_episodes=1_000,
         opponent_iterate="both",
+        responder_iterate="both",
     )
     run_config = run_config_from_dict(raw)
     settings = run_config.best_response
 
     results = {
-        (iterate, responder): script.run_one_direction(game, run_config, responder, 1, iterate)
+        (iterate, resp_iterate, responder): evaluations
         for iterate in script.opponent_iterates(settings.opponent_iterate)
         for responder in script.responder_players(settings.responder)
+        for resp_iterate, evaluations in script.run_one_direction(
+            game, run_config, responder, 1, iterate
+        ).items()
     }
     script.report(results)
 
     printed = capsys.readouterr().out
-    assert "exploitability(live) >=" in printed
-    assert "exploitability(target) >=" in printed
-    assert set(results) == {("live", 0), ("live", 1), ("target", 0), ("target", 1)}
+    assert "exploitability(opp live, resp live) >=" in printed
+    assert "exploitability(opp target, resp target) >=" in printed
+    assert set(results) == {
+        (opp, resp, player)
+        for opp in ("live", "target")
+        for resp in ("live", "target")
+        for player in (0, 1)
+    }
     assert all(set(v) == {"sampled", "greedy"} for v in results.values())
 
 

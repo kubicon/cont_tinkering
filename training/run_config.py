@@ -95,6 +95,7 @@ class BestResponseConfig:
     # Which of the checkpoint's two strategies to measure: "live" (the last
     # iterate), "target" (the Polyak average), or "both".
     opponent_iterate: str = "live"
+    responder_iterate: str = "live"
 
     # The final measurement. Sampling error scales as 1/sqrt(episodes) and the
     # per-hand variance in a poker-like game is several antes, so a number

@@ -20,9 +20,14 @@ from training.hyperparams import build_hyperparams
 from training.run_config import RunConfig, load_run_config
 
 
-def _eval_seed(settings, responder: int, iterate: str) -> int:
-    """A distinct rng stream per (responder, iterate), so no two runs share a sample."""
-    return settings.eval_seed + responder + (1000 if iterate == "target" else 0)
+def _eval_seed(settings, responder: int, iterate: str, responder_iterate: str = "live") -> int:
+    """A distinct rng stream per (responder, opponent iterate, responder iterate)."""
+    return (
+        settings.eval_seed
+        + responder
+        + (1000 if iterate == "target" else 0)
+        + (2000 if responder_iterate == "target" else 0)
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--opponent-iterate", choices=("live", "target", "both"), default=None,
         help="which of the checkpoint's strategies to measure; overrides best_response.opponent_iterate",
+    )
+    parser.add_argument(
+        "--responder-iterate", choices=("live", "target", "both"), default=None,
+        help="which responder iterate to read the bound off; overrides best_response.responder_iterate",
     )
     parser.add_argument("--checkpoint-dir", default=None, help="overrides best_response.checkpoint_dir")
     parser.add_argument(
@@ -56,6 +65,7 @@ def apply_overrides(config: RunConfig, args: argparse.Namespace) -> RunConfig:
             for key, value in (
                 ("responder", args.responder),
                 ("opponent_iterate", args.opponent_iterate),
+                ("responder_iterate", args.responder_iterate),
                 ("checkpoint_dir", args.checkpoint_dir),
                 ("checkpoint_step", args.checkpoint_step),
                 ("eval_episodes", args.eval_episodes),
@@ -83,24 +93,43 @@ def responder_players(responder: str | int) -> tuple[int, ...]:
     raise ValueError(f"best_response.responder must be 0, 1 or 'both', got {responder!r}")
 
 
-def opponent_iterates(setting: str) -> tuple[str, ...]:
-    """`best_response.opponent_iterate` as the list of strategies to measure, in order."""
+def _iterate_list(setting: str, field: str) -> tuple[str, ...]:
+    """A `live`/`target`/`both` config field as the list of iterates to measure, in order."""
     if setting == "both":
         return ("live", "target")
     if setting in ("live", "target"):
         return (setting,)
-    raise ValueError(f"best_response.opponent_iterate must be 'live', 'target' or 'both', got {setting!r}")
+    raise ValueError(f"best_response.{field} must be 'live', 'target' or 'both', got {setting!r}")
 
 
-def build_progress_metric_fn(config: RunConfig, key: jax.Array):
+def opponent_iterates(setting: str) -> tuple[str, ...]:
+    """`best_response.opponent_iterate` as the list of strategies to measure, in order."""
+    return _iterate_list(setting, "opponent_iterate")
+
+
+def responder_iterates(setting: str) -> tuple[str, ...]:
+    """`best_response.responder_iterate` as the list of responder iterates to read, in order."""
+    return _iterate_list(setting, "responder_iterate")
+
+
+def build_progress_metric_fn(config: RunConfig, key: jax.Array, resp_iterates: tuple[str, ...]):
     """A cheap per-chunk evaluation, so the log shows the bound flattening out.
+
+    Reports `br_value_eval` for the live responder and/or `br_value_eval_target`
+    for its Polyak average, whichever `resp_iterates` asks for.
     """
     episodes = config.best_response.progress_episodes
+    metric_keys = {"live": "br_value_eval", "target": "br_value_eval_target"}
 
     def metric_fn(trainer: SequentialBestResponseTrainer) -> dict[str, float]:
         nonlocal key
-        key, eval_key = jax.random.split(key)
-        return {"br_value_eval": trainer.evaluate(eval_key, num_episodes=episodes).value}
+        out = {}
+        for iterate in resp_iterates:
+            key, eval_key = jax.random.split(key)
+            out[metric_keys[iterate]] = trainer.evaluate(
+                eval_key, num_episodes=episodes, target=(iterate == "target")
+            ).value
+        return out
 
     return metric_fn
 
@@ -111,8 +140,13 @@ def run_one_direction(
     responder: int,
     step: int,
     iterate: str = "live",
-) -> dict[str, Evaluation]:
-    """Train one best response and measure it; returns the sampled and greedy bounds."""
+) -> dict[str, dict[str, Evaluation]]:
+    """Train one best response and measure it.
+
+    Returns `{responder_iterate: {"sampled": Evaluation, "greedy": Evaluation}}`
+    -- one entry per iterate in `best_response.responder_iterate`, all read off
+    the same trained responder.
+    """
     settings = config.best_response
     opponent = load_frozen_policy(
         settings.checkpoint_dir, step, 1 - responder, target=(iterate == "target")
@@ -126,6 +160,7 @@ def run_one_direction(
             "own past iterate, weakening it and so *understating* exploitability. Set them to 0."
         )
 
+    resp_iterates = responder_iterates(settings.responder_iterate)
     print(
         f"\n=== best response for player {responder} vs the checkpoint's {iterate} "
         f"player {1 - responder} ==="
@@ -136,49 +171,70 @@ def run_one_direction(
     trainer.train(
         config.train.steps,
         epochs=config.train.epochs,
-        metric_fn=build_progress_metric_fn(config, jax.random.PRNGKey(_eval_seed(settings, responder, iterate))),
+        metric_fn=build_progress_metric_fn(
+            config, jax.random.PRNGKey(_eval_seed(settings, responder, iterate)), resp_iterates
+        ),
     )
 
     # One key per readout: the two estimates are then independent, so agreement
     # between them is evidence and not an artifact of a shared sample.
-    keys = jax.random.split(jax.random.PRNGKey(_eval_seed(settings, responder, iterate) + 100), 2)
-    return {
-        mode: trainer.evaluate(
-            keys[index],
-            num_episodes=settings.eval_episodes,
-            greedy=(mode == "greedy"),
-            batch_size=settings.eval_batch_size,
+    results: dict[str, dict[str, Evaluation]] = {}
+    for resp_iterate in resp_iterates:
+        keys = jax.random.split(
+            jax.random.PRNGKey(_eval_seed(settings, responder, iterate, resp_iterate) + 100), 2
         )
-        for index, mode in enumerate(("sampled", "greedy"))
-    }
+        results[resp_iterate] = {
+            mode: trainer.evaluate(
+                keys[index],
+                num_episodes=settings.eval_episodes,
+                greedy=(mode == "greedy"),
+                target=(resp_iterate == "target"),
+                batch_size=settings.eval_batch_size,
+            )
+            for index, mode in enumerate(("sampled", "greedy"))
+        }
+    return results
 
 
-def report(results: dict[tuple[str, int], dict[str, Evaluation]]) -> None:
-    """Print each direction's bound, and the exploitability of each iterate measured."""
+def _pair_label(opp_iterate: str, resp_iterate: str) -> str:
+    """How a `(opponent iterate, responder iterate)` combination is named in the log."""
+    return f"opp {opp_iterate}, resp {resp_iterate}"
+
+
+def report(results: dict[tuple[str, str, int], dict[str, Evaluation]]) -> None:
+    """Print each direction's bound, and the exploitability of each iterate pair measured."""
     print("\n=== best-response values (the responder's own payoff; higher = more exploitable) ===")
     exploitability = {}
-    for iterate in dict.fromkeys(key[0] for key in results):
+    for pair in dict.fromkeys((key[0], key[1]) for key in results):
         bounds = {}
-        for (row_iterate, responder), evaluations in sorted(results.items()):
-            if row_iterate != iterate:
+        for (opp_iterate, resp_iterate, responder), evaluations in sorted(results.items()):
+            if (opp_iterate, resp_iterate) != pair:
                 continue
             sampled, greedy = evaluations["sampled"], evaluations["greedy"]
             # Both are valid lower bounds, so the larger is the better bound. Only
             # two candidates, so the selection bias this introduces is negligible.
             bounds[responder] = max(sampled.value, greedy.value)
             print(
-                f"  [{iterate}] BR(player {responder}) vs checkpoint player {1 - responder}: "
-                f"sampled {sampled}  greedy {greedy}  -> {bounds[responder]:+.4f}"
+                f"  [{_pair_label(*pair)}] BR(player {responder}) vs checkpoint player "
+                f"{1 - responder}: sampled {sampled}  greedy {greedy}  -> {bounds[responder]:+.4f}"
             )
         if len(bounds) == 2:
-            exploitability[iterate] = bounds[0] + bounds[1]
+            exploitability[pair] = bounds[0] + bounds[1]
 
-    for iterate, value in exploitability.items():
-        print(f"\n  exploitability({iterate}) >= {value:+.4f}   (0 exactly at a Nash equilibrium)")
-    if len(exploitability) == 2:
+    for pair, value in exploitability.items():
         print(
-            "  The two differ because they are two different strategies: self-play can converge "
-            "in the average while the live iterate still orbits."
+            f"\n  exploitability({_pair_label(*pair)}) >= {value:+.4f}   "
+            "(0 exactly at a Nash equilibrium)"
+        )
+    if len({pair[0] for pair in exploitability}) == 2:
+        print(
+            "  The opponent iterates differ because they are two different strategies: self-play "
+            "can converge in the average while the live iterate still orbits."
+        )
+    if len({pair[1] for pair in exploitability}) == 2:
+        print(
+            "  The responder iterates differ while the best response is still training; they "
+            "should agree once its curve has flattened."
         )
     print("  A bound, not a value: an under-trained responder reports too little.")
 
@@ -200,9 +256,12 @@ def main() -> None:
     print(f"responding to {settings.checkpoint_dir}/{step}.pkl")
 
     results = {
-        (iterate, responder): run_one_direction(game, config, responder, step, iterate)
+        (iterate, resp_iterate, responder): evaluations
         for iterate in opponent_iterates(settings.opponent_iterate)
         for responder in responder_players(settings.responder)
+        for resp_iterate, evaluations in run_one_direction(
+            game, config, responder, step, iterate
+        ).items()
     }
     report(results)
 
