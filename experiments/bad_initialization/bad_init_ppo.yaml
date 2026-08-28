@@ -48,11 +48,11 @@ ppo:
 
   # Target/magnet parameter tracking.
   target_tau: 0.001
-  magnet_interval: 500
+  magnet_interval: 1000
 
   # Entropy bonus, split per head.
-  category_entropy_coef: 0.1
-  gaussian_entropy_coef: 0.1
+  category_entropy_coef: 0.03
+  gaussian_entropy_coef: 0.03
 
   # KL regularization, split per head (0 disables a term).
   trpo_category_kl_coef: 0.05
@@ -64,8 +64,8 @@ train:
   mode: self_play    # "self_play" or "fixed_opponent"
   perspective: 0       # fixed_opponent: which player trains
   opponent: random      # fixed_opponent: "random" or "static"
-  steps: 150
-  epochs: 300
+  steps: 100
+  epochs: 2000
   checkpoint_dir: data/bad_initialization
   seed: 0
 
