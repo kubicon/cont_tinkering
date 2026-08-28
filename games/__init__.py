@@ -1,4 +1,5 @@
 from .base import ZeroSumGame
+from .leduc import ContinuousLeducHoldem, LeducState
 from .kuhn_best_response import (
     KuhnStrategy,
     analytic_equilibrium,
@@ -27,6 +28,7 @@ __all__ = [
     "SequentialZeroSumGame",
     "TERMINAL",
     "ContinuousKuhnPoker",
+    "ContinuousLeducHoldem",
     "KuhnStrategy",
     "analytic_equilibrium",
     "best_response_value_first",
@@ -35,6 +37,7 @@ __all__ = [
     "exploitability",
     "game_value",
     "KuhnState",
+    "LeducState",
     "ActionSpace",
     "BoxSpace",
     "HybridAction",

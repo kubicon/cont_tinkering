@@ -18,25 +18,33 @@ from training.run_config import load_run_config, run_config_from_dict
 from training.sequential_trainer import SequentialSelfPlayPPOTrainer
 
 
-def _config(**train_overrides):
-    raw = yaml.safe_load(open("configs/kuhn_classic.yaml"))
+def _config(path: str = "configs/kuhn_classic.yaml", **train_overrides):
+    raw = yaml.safe_load(open(path))
     raw["train"].update(train_overrides)
     return run_config_from_dict(raw)
 
 
-@pytest.mark.parametrize("path", ["configs/kuhn.yaml", "configs/kuhn_classic.yaml"])
-def test_the_shipped_kuhn_configs_load_and_build(path):
+@pytest.mark.parametrize(
+    "path",
+    [
+        "configs/kuhn.yaml",
+        "configs/kuhn_classic.yaml",
+        "configs/leduc.yaml",
+        "configs/leduc_classic.yaml",
+    ],
+)
+def test_the_shipped_sequential_configs_load_and_build(path):
     config = load_run_config(path)
     assert isinstance(config.game.build(), SequentialZeroSumGame)
 
 
-def test_kuhn_is_registered_alongside_the_one_shot_games():
+def test_the_trees_are_registered_alongside_the_one_shot_games():
     """One registry, two kinds of game -- `train.py` tells them apart by type."""
-    assert "kuhn" in GAME_CONFIGS
+    assert {"kuhn", "leduc"} <= set(GAME_CONFIGS)
     built = {name: cls().build() for name, cls in GAME_CONFIGS.items()}
     sequential = {n for n, g in built.items() if isinstance(g, SequentialZeroSumGame)}
     one_shot = {n for n, g in built.items() if isinstance(g, ZeroSumGame)}
-    assert sequential == {"kuhn"}
+    assert sequential == {"kuhn", "leduc"}
     assert one_shot == set(GAME_CONFIGS) - sequential
     assert not (sequential & one_shot)  # nothing is both
 
@@ -70,6 +78,12 @@ def test_kuhn_gets_exploitability_and_strategy_hooks():
     config = _config()
     hooks = train.build_sequential_hooks(config.game.build(), config)
     assert set(hooks) == {"metric_fn", "strategy_log_fn"}
+
+
+def test_leduc_trains_without_an_exploitability_hook():
+    """Its public state carries real bet sizes, so there is no tabular best response."""
+    config = _config("configs/leduc_classic.yaml")
+    assert train.build_sequential_hooks(config.game.build(), config) == {}
 
 
 class _CoinFlip(SequentialZeroSumGame):
@@ -131,6 +145,7 @@ def test_an_unfamiliar_sequential_game_still_trains():
     SequentialSelfPlayPPOTrainer(game, hyperparams, hyperparams, seed=0).train(1, epochs=2)
 
 
-def test_a_short_kuhn_run_completes_through_the_entry_point():
-    config = _config(steps=1, epochs=2, checkpoint_dir=None)
+@pytest.mark.parametrize("path", ["configs/kuhn_classic.yaml", "configs/leduc_classic.yaml"])
+def test_a_short_run_completes_through_the_entry_point(path):
+    config = _config(path, steps=1, epochs=2, checkpoint_dir=None)
     train.run_sequential(config.game.build(), config)

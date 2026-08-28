@@ -7,6 +7,17 @@ from .actor_critic import (
     masked_categorical_entropy,
     masked_log_softmax,
 )
+from .best_response import (
+    Evaluation,
+    FrozenPolicy,
+    SequentialBestResponseTrainer,
+    evaluate_pair,
+    latest_checkpoint_step,
+    load_frozen_policy,
+    policy_action_fn,
+    validate_responder,
+    warn_if_regularized,
+)
 from .checkpoint import load_checkpoint, save_checkpoint
 from .config import MixturePPOHyperparams, PPOHyperparams
 from .mixture import (
@@ -44,14 +55,28 @@ from .self_play import SelfPlayPPOTrainer
 from .sequential_rollout import build_episode_sampler, collect_sequential_batch
 from .sequential_trainer import SequentialSelfPlayPPOTrainer
 from .trainer import PPOTrainer
+from .hyperparams import action_bounds, build_hyperparams
 from .trainer_common import (
     MixtureTrainState,
     create_mixture_train_state,
+    run_training_chunks,
     update_target_and_magnet,
 )
 
 __all__ = [
     "ActorCritic",
+    "Evaluation",
+    "FrozenPolicy",
+    "SequentialBestResponseTrainer",
+    "action_bounds",
+    "build_hyperparams",
+    "evaluate_pair",
+    "latest_checkpoint_step",
+    "load_frozen_policy",
+    "policy_action_fn",
+    "run_training_chunks",
+    "validate_responder",
+    "warn_if_regularized",
     "categorical_kl",
     "gaussian_entropy",
     "gaussian_kl",

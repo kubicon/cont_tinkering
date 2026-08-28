@@ -31,6 +31,13 @@ from .config import PPOHyperparams
 HYPERPARAMS_FILENAME = "hyperparams.json"
 PARAMS_FILENAME = "params.msgpack"
 
+TARGET_ENTRY_SUFFIX = "_target"
+
+
+def target_entry(name: str) -> str:
+    """The entry name a multi-entry checkpoint files `name`'s averaged params under."""
+    return f"{name}{TARGET_ENTRY_SUFFIX}"
+
 
 def _default_build_network(hyperparams: PPOHyperparams) -> ActorCritic:
     return ActorCritic(
@@ -63,25 +70,43 @@ def load_checkpoint(
     return hyperparams, params
 
 
-def save_checkpoint_step(directory: str | Path, step: int, hyperparams: PPOHyperparams, params) -> None:
+def save_checkpoint_step(
+    directory: str | Path,
+    step: int,
+    hyperparams: PPOHyperparams,
+    params,
+    target_params=None,
+) -> None:
     """Single-file checkpoint `{step}.pkl` (hyperparams + params) inside `directory`.
-
-    Used for periodic training checkpoints, one file per step (step 0 is the
-    freshly initialized, pre-training params).
     """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    data = {"hyperparams": hyperparams.to_dict(), "params": params}
+    if target_params is not None:
+        data["target_params"] = target_params
     with (directory / f"{step}.pkl").open("wb") as f:
-        pickle.dump({"hyperparams": hyperparams.to_dict(), "params": params}, f)
+        pickle.dump(data, f)
 
 
 def load_checkpoint_step(
-    directory: str | Path, step: int, hyperparams_cls: type = PPOHyperparams
+    directory: str | Path,
+    step: int,
+    hyperparams_cls: type = PPOHyperparams,
+    target: bool = False,
 ) -> tuple[PPOHyperparams, dict]:
+    """The params in `{step}.pkl`; `target=True` asks for the averaged iterate instead.
+    """
     directory = Path(directory)
-    with (directory / f"{step}.pkl").open("rb") as f:
+    path = directory / f"{step}.pkl"
+    with path.open("rb") as f:
         data = pickle.load(f)
-    return hyperparams_cls.from_dict(data["hyperparams"]), data["params"]
+    if target and "target_params" not in data:
+        raise KeyError(
+            f"{path} holds no target params -- it predates them being checkpointed. "
+            "Re-run the training to measure its averaged iterate."
+        )
+    key = "target_params" if target else "params"
+    return hyperparams_cls.from_dict(data["hyperparams"]), data[key]
 
 
 def save_checkpoint_step_multi(

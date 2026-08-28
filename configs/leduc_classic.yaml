@@ -1,0 +1,56 @@
+# python train.py configs/leduc_classic.yaml
+#
+# Textbook Leduc Hold'em: a six-card deck (three ranks, two suits), fixed bets
+# of 2 pre-board and 4 post-board (`min_bet == max_bet == 2` with
+# `second_round_scale: 2.0`), and at most two raises per round. The size never
+# varies, so the continuous branch degenerates to a point and all the work falls
+# on the categorical head.
+#
+# This is the validation run: the game's equilibrium value is known to be about
+# -0.0856 per hand to player 0, so `value_target` should settle near that. A
+# continuous-raise run is only worth interpreting once this one behaves.
+
+game:
+  name: leduc
+  num_ranks: 3
+  num_suits: 2
+  min_bet: 2.0
+  max_bet: 2.0
+  max_raises: 2
+  second_round_scale: 2.0
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 1   # one component suffices: the raise size never varies
+  clip_means: true
+
+optimizer:
+  learning_rate: 0.001
+  max_grad_norm: 0.5
+  optimizer: adamw
+  weight_decay: 0.01
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 2000
+
+  category_entropy_coef: 0.04
+  gaussian_entropy_coef: 0.0    # nothing for the Gaussian to explore
+
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  mode: self_play
+  steps: 100
+  epochs: 2000
+  checkpoint_dir: data/leduc_classic
+  seed: 0

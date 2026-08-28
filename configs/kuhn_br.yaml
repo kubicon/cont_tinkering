@@ -1,0 +1,64 @@
+# python best_response.py configs/kuhn_br.yaml
+#
+# The validation config for the whole best-response path. Kuhn is the one game
+# here whose best response can also be computed *exactly*, by tabular traversal
+# (`games/kuhn_best_response.py`) -- which is what `train.py configs/kuhn.yaml`
+# already reports as `exploitability` while it trains.
+#
+# So: train Kuhn, then best-respond to the same checkpoint, and the two numbers
+# must agree (from below, and up to sampling error). If they do not, the trouble
+# is in this machinery, not in Leduc.
+#
+#   python train.py configs/kuhn_classic.yaml     # writes data/kuhn_classic
+#   python best_response.py configs/kuhn_br.yaml  # must match its exploitability
+
+game:
+  name: kuhn
+  num_cards: 3
+  min_bet: 1.0
+  max_bet: 1.0
+  exploitability_grid_points: 1025
+
+best_response:
+  checkpoint_dir: data/kuhn_classic
+  checkpoint_step: null
+  responder: both
+  opponent_iterate: live   # or target/both; see configs/leduc_br.yaml
+  eval_episodes: 200000
+  eval_batch_size: 20000
+  eval_seed: 12345
+  progress_episodes: 20000
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 1   # must match configs/kuhn_classic.yaml's
+  clip_means: true
+
+optimizer:
+  learning_rate: 0.003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 500
+
+  # Off, for the reasons spelled out in configs/leduc_br.yaml.
+  trpo_category_kl_coef: 0.0
+  trpo_gaussian_kl_coef: 0.0
+  magnet_category_kl_coef: 0.0
+  magnet_gaussian_kl_coef: 0.0
+  category_entropy_coef: 0.005
+  gaussian_entropy_coef: 0.0    # the bet size never varies in classic Kuhn
+
+train:
+  steps: 20
+  epochs: 300
+  seed: 0

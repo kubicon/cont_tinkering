@@ -17,17 +17,17 @@ import jax.numpy as jnp
 
 from games.sequential import TERMINAL, SequentialZeroSumGame
 
-from .checkpoint import load_checkpoint_step_multi, save_checkpoint_step_multi
+from .checkpoint import load_checkpoint_step_multi, save_checkpoint_step_multi, target_entry
 from .config import MixturePPOHyperparams
 from .mixture import MixtureActorCritic, build_mixture_network
 from .ppo import ppo_update
 from .sequential_rollout import build_episode_sampler, collect_sequential_batch
 from .trainer_common import (
     MixtureTrainState,
-    append_chunk_records,
     build_loss_fn,
     create_mixture_train_state,
     reject_batch_norm,
+    run_training_chunks,
     update_target_and_magnet,
 )
 
@@ -126,26 +126,11 @@ class SequentialSelfPlayPPOTrainer:
         """Trains for `steps` chunks of `epochs` `lax.scan`-ned iterations each,
         logging and checkpointing once per chunk (`steps * epochs` iterations total).
         """
-        if epochs < 1:
-            raise ValueError(f"epochs must be at least 1, got {epochs}")
-        if checkpoint_dir is not None:
-            self.save(checkpoint_dir, 0)
+        def commit(states) -> None:
+            self.state_0, self.state_1 = states
 
-        for chunk in range(steps):
-            self.key, chunk_key = jax.random.split(self.key)
-            step_keys = jax.random.split(chunk_key, epochs)
-            (self.state_0, self.state_1), metrics_stack = self._run_chunk(
-                (self.state_0, self.state_1), step_keys
-            )
-
-            record = append_chunk_records(self.history, metrics_stack, chunk, epochs)
-
-            # Evaluated once per chunk, on the parameters as they now stand, so
-            # it attaches to that chunk's last record rather than to every iteration.
-            extra = metric_fn(self) if metric_fn is not None else {}
-            record.update(extra)
-
-            print(
+        def format_record(record: dict) -> str:
+            return (
                 f"iter {record['iteration']:5d} | payoff {record['payoff']:+.4f} "
                 f"| len {record['episode_length']:.2f} "
                 f"| p0 policy {record['policy_loss_0']:+.4f} value {record['value_loss_0']:.4f} "
@@ -153,23 +138,37 @@ class SequentialSelfPlayPPOTrainer:
                 f"| p1 policy {record['policy_loss_1']:+.4f} value {record['value_loss_1']:.4f} "
                 f"cat_H {record['category_entropy_1']:.4f} atom {record['atom_frac_1']:.2f}"
             )
-            if extra:
-                print("  " + "  ".join(f"{k} {v:+.5f}" for k, v in extra.items()))
-            if strategy_log_fn is not None:
-                print(strategy_log_fn(self))
 
-            if checkpoint_dir is not None:
-                self.save(checkpoint_dir, chunk + 1)
-
+        self.key = run_training_chunks(
+            steps=steps,
+            epochs=epochs,
+            key=self.key,
+            states=(self.state_0, self.state_1),
+            run_chunk=self._run_chunk,
+            commit=commit,
+            history=self.history,
+            format_record=format_record,
+            metric_fn=(lambda: metric_fn(self)) if metric_fn is not None else None,
+            strategy_log_fn=(lambda: strategy_log_fn(self)) if strategy_log_fn is not None else None,
+            checkpoint_fn=(
+                (lambda step: self.save(checkpoint_dir, step)) if checkpoint_dir is not None else None
+            ),
+        )
         return self.history
 
     def save(self, checkpoint_dir: str | Path, step: int) -> None:
+        """Both players' live params, and both players' Polyak-averaged ones.
+        """
+        states = (self.state_0, self.state_1)
         save_checkpoint_step_multi(
             checkpoint_dir,
             step,
             {
-                "player_0": (self.hyperparams[0], self.state_0.params),
-                "player_1": (self.hyperparams[1], self.state_1.params),
+                **{f"player_{p}": (self.hyperparams[p], states[p].params) for p in (0, 1)},
+                **{
+                    target_entry(f"player_{p}"): (self.hyperparams[p], states[p].target_params)
+                    for p in (0, 1)
+                },
             },
         )
 
@@ -182,10 +181,16 @@ class SequentialSelfPlayPPOTrainer:
         hyperparams_0, params_0 = entries["player_0"]
         hyperparams_1, params_1 = entries["player_1"]
         trainer = cls(game, hyperparams_0, hyperparams_1)
-        trainer.state_0 = trainer.state_0.replace(
-            params=params_0, target_params=params_0, magnet_params=params_0
-        )
-        trainer.state_1 = trainer.state_1.replace(
-            params=params_1, target_params=params_1, magnet_params=params_1
-        )
+        for player, (state_name, params) in enumerate((("state_0", params_0), ("state_1", params_1))):
+            # Resuming falls back to the live params where a checkpoint predates
+            # target params being saved -- unlike a *measurement*, which must not
+            # quietly substitute one iterate for the other.
+            name = target_entry(f"player_{player}")
+            target_params = entries[name][1] if name in entries else params
+            state = getattr(trainer, state_name)
+            setattr(
+                trainer,
+                state_name,
+                state.replace(params=params, target_params=target_params, magnet_params=params),
+            )
         return trainer

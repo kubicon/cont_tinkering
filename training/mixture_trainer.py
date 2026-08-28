@@ -19,6 +19,7 @@ from .checkpoint import (
     load_checkpoint_step_multi,
     save_checkpoint_step,
     save_checkpoint_step_multi,
+    target_entry,
 )
 from .config import MixturePPOHyperparams
 from .mixture import (
@@ -256,7 +257,10 @@ class MixturePPOTrainer:
         return self.history
 
     def save(self, checkpoint_dir: str | Path, step: int) -> None:
-        save_checkpoint_step(checkpoint_dir, step, self.hyperparams, self.state.params)
+        """Live params plus the Polyak-averaged ones; see `MixtureTrainState`."""
+        save_checkpoint_step(
+            checkpoint_dir, step, self.hyperparams, self.state.params, self.state.target_params
+        )
 
     @classmethod
     def load(
@@ -273,8 +277,17 @@ class MixturePPOTrainer:
         from scratch: this resumes a *policy*, not a run.
         """
         hyperparams, params = load_checkpoint_step(checkpoint_dir, step, hyperparams_cls=MixturePPOHyperparams)
+        try:
+            _, target_params = load_checkpoint_step(
+                checkpoint_dir, step, hyperparams_cls=MixturePPOHyperparams, target=True
+            )
+        except KeyError:
+            print(f"No target params found for step {step}, using live params", flush=True)
+            target_params = params
         trainer = cls(game, hyperparams, opponent_action_fn, perspective=perspective)
-        trainer.state = trainer.state.replace(params=params, target_params=params, magnet_params=params)
+        trainer.state = trainer.state.replace(
+            params=params, target_params=target_params, magnet_params=params
+        )
         return trainer
 
 
@@ -452,12 +465,18 @@ class MixtureSelfPlayPPOTrainer:
         return self.history
 
     def save(self, checkpoint_dir: str | Path, step: int) -> None:
+        """Both players' live params, and both players' Polyak-averaged ones.
+        """
+        players = ((1, self.hyperparams_1, self.state_1), (2, self.hyperparams_2, self.state_2))
         save_checkpoint_step_multi(
             checkpoint_dir,
             step,
             {
-                "player_1": (self.hyperparams_1, self.state_1.params),
-                "player_2": (self.hyperparams_2, self.state_2.params),
+                **{f"player_{index}": (hyperparams, state.params) for index, hyperparams, state in players},
+                **{
+                    target_entry(f"player_{index}"): (hyperparams, state.target_params)
+                    for index, hyperparams, state in players
+                },
             },
         )
 
@@ -468,6 +487,15 @@ class MixtureSelfPlayPPOTrainer:
         hyperparams_1, params_1 = entries["player_1"]
         hyperparams_2, params_2 = entries["player_2"]
         trainer = cls(game, hyperparams_1, hyperparams_2)
-        trainer.state_1 = trainer.state_1.replace(params=params_1, target_params=params_1, magnet_params=params_1)
-        trainer.state_2 = trainer.state_2.replace(params=params_2, target_params=params_2, magnet_params=params_2)
+        for index, state_name, params in ((1, "state_1", params_1), (2, "state_2", params_2)):
+            # Falls back to the live params on a checkpoint written before target
+            # params were saved; resuming tolerates that, a measurement must not.
+            name = target_entry(f"player_{index}")
+            target_params = entries[name][1] if name in entries else params
+            state = getattr(trainer, state_name)
+            setattr(
+                trainer,
+                state_name,
+                state.replace(params=params, target_params=target_params, magnet_params=params),
+            )
         return trainer

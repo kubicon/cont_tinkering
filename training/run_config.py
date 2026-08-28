@@ -1,9 +1,13 @@
 """Hierarchical YAML run config: the single argument `train.py` takes.
 
-A config file has up to five top-level sections -- `game`, `network`,
-`optimizer`, `ppo`, `train` -- each optional (defaults apply if omitted). A
-sixth, `idealized`, is accepted and ignored: it carries the solver-only knobs
-`run_idealized.py` needs, so the *same* file runs under both entry points.
+A config file has up to six top-level sections -- `game`, `network`,
+`optimizer`, `ppo`, `train`, `best_response` -- each optional (defaults apply if
+omitted). `best_response` is read only by `best_response.py`, which otherwise
+runs off exactly the same schema as `train.py`: a best response is trained by
+the same PPO on the same networks, so it would be a mistake for it to have its
+own idea of what a network or an optimizer is. A seventh section, `idealized`,
+is accepted and ignored: it carries the solver-only knobs `run_idealized.py`
+needs, so the *same* file runs under every entry point.
 `game.name` selects one of `games.configs.GAME_CONFIGS`; only that game's own
 fields are needed there, not every game's arguments. See `configs/*.yaml` for
 worked examples, one per game.
@@ -74,12 +78,44 @@ class TrainConfig:
 
 
 @dataclasses.dataclass
+class BestResponseConfig:
+    """`best_response.py` only: whose strategy to respond to, and how to measure it.
+
+    """
+
+    # The `SequentialSelfPlayPPOTrainer` run to evaluate, and which of its
+    # checkpoints; `null` takes the last one written.
+    checkpoint_dir: str = "data/leduc"
+    checkpoint_step: int | None = None
+
+    # 0 or 1 to respond to that player's *opponent*, or "both" to train one of
+    # each and report their sum as an exploitability lower bound.
+    responder: str | int = "both"
+
+    # Which of the checkpoint's two strategies to measure: "live" (the last
+    # iterate), "target" (the Polyak average), or "both".
+    opponent_iterate: str = "live"
+
+    # The final measurement. Sampling error scales as 1/sqrt(episodes) and the
+    # per-hand variance in a poker-like game is several antes, so a number
+    # quoted to three decimals needs a lot of hands.
+    eval_episodes: int = 200_000
+    eval_batch_size: int = 20_000
+    eval_seed: int = 12345
+
+    # Episodes per chunk for the progress line, which exists to show the curve
+    # flattening. Cheap and noisy on purpose; the headline uses the fields above.
+    progress_episodes: int = 20_000
+
+
+@dataclasses.dataclass
 class RunConfig:
     game: Any  # one of `games.configs.GAME_CONFIGS`'s dataclasses
     network: NetworkConfig = dataclasses.field(default_factory=NetworkConfig)
     optimizer: OptimizerConfig = dataclasses.field(default_factory=OptimizerConfig)
     ppo: PPOConfig = dataclasses.field(default_factory=PPOConfig)
     train: TrainConfig = dataclasses.field(default_factory=TrainConfig)
+    best_response: BestResponseConfig = dataclasses.field(default_factory=BestResponseConfig)
 
 
 def _build_dataclass(cls: type, data: dict) -> Any:
@@ -97,7 +133,9 @@ def run_config_from_dict(raw: dict) -> RunConfig:
     # `idealized` holds solver-only knobs for `run_idealized.py` (grid resolution,
     # std bounds, custom init). It is accepted and ignored here so one config file
     # can drive both `train.py` and `run_idealized.py`.
-    unknown_sections = set(raw) - {"game", "network", "optimizer", "ppo", "train", "idealized"}
+    unknown_sections = set(raw) - {
+        "game", "network", "optimizer", "ppo", "train", "best_response", "idealized"
+    }
     if unknown_sections:
         raise ValueError(f"unknown top-level config section(s): {sorted(unknown_sections)}")
 
@@ -115,6 +153,7 @@ def run_config_from_dict(raw: dict) -> RunConfig:
         optimizer=_build_dataclass(OptimizerConfig, raw.get("optimizer", {}) or {}),
         ppo=_build_dataclass(PPOConfig, raw.get("ppo", {}) or {}),
         train=_build_dataclass(TrainConfig, raw.get("train", {}) or {}),
+        best_response=_build_dataclass(BestResponseConfig, raw.get("best_response", {}) or {}),
     )
 
 

@@ -1,0 +1,64 @@
+# python train.py configs/leduc.yaml
+#
+# Continuous-raise Leduc Hold'em: two betting rounds, a public board card
+# between them, and up to `max_raises` sized raises per round. Like `kuhn` this
+# is a *sequential* game, so `train.py` runs `SequentialSelfPlayPPOTrainer`; the
+# schema below is otherwise identical to the one-shot configs.
+#
+# Unlike `kuhn` there is **no exploitability column** in the log: the public
+# state carries real bet sizes accumulated over several raises, so there is no
+# finite infoset enumeration to best-respond over (see `games/leduc.py`). To
+# measure what this run produces, train a best response to it afterwards:
+#
+#   python train.py configs/leduc.yaml
+#   python best_response.py configs/leduc_br.yaml
+#
+# and validate the machinery on `configs/leduc_classic.yaml` (fixed 2/4 bets,
+# known equilibrium value) before reading anything into a continuous-raise run.
+
+game:
+  name: leduc
+  num_ranks: 3
+  num_suits: 2
+  min_bet: 0.25
+  max_bet: 2.0
+  max_raises: 2
+  second_round_scale: 1.0
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 2
+  clip_means: true    # the action *is* the raise size, so keep the means in the betting range
+
+optimizer:
+  learning_rate: 0.003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 300
+
+  # The categorical head carries the fold/check/call/raise decision, so its
+  # entropy is what keeps the policy from collapsing to pure play.
+  category_entropy_coef: 0.04
+  gaussian_entropy_coef: 0.04
+
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  mode: self_play     # the only mode a sequential game supports
+  steps: 60
+  epochs: 400
+  checkpoint_dir: data/leduc
+  seed: 0

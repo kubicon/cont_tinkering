@@ -1,4 +1,9 @@
-"""Concrete `SequentialZeroSumGame`s, mainly to exercise/demonstrate the base class."""
+"""Concrete `SequentialZeroSumGame`s, mainly to exercise/demonstrate the base class.
+
+The other one lives in `games.leduc`: continuous-raise Leduc Hold'em, whose two
+rounds and raise cap put it past the point where every betting history can be
+enumerated as a node the way Kuhn's are here.
+"""
 
 from __future__ import annotations
 

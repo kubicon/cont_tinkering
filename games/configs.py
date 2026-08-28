@@ -29,6 +29,7 @@ from .examples import (
     MultiPointGame,
     QuadraticZeroSumGame,
 )
+from .leduc import ContinuousLeducHoldem
 from .sequential import SequentialZeroSumGame
 from .sequential_examples import ContinuousKuhnPoker
 
@@ -182,6 +183,38 @@ class KuhnConfig:
         )
 
 
+@dataclasses.dataclass
+class LeducConfig:
+    """Continuous-raise Leduc Hold'em -- the second *sequential* game here.
+
+    `num_ranks=3, num_suits=2, min_bet=max_bet=2, second_round_scale=2.0,
+    max_raises=2` is the textbook benchmark game (fixed bets of 2 and 4), the
+    setting to validate a run against before reading anything into a
+    continuous-raise one. There is no exact best response for the continuous
+    version -- the public state contains real bet sizes -- so unlike `kuhn` this
+    trains without an exploitability metric.
+    """
+
+    num_ranks: int = 3
+    num_suits: int = 2
+    min_bet: float = 0.5
+    max_bet: float = 2.0
+    max_raises: int = 2
+    # Multiplies every raise made after the board card is turned; 2.0 reproduces
+    # the classic game's doubled second-round bet size.
+    second_round_scale: float = 1.0
+
+    def build(self) -> SequentialZeroSumGame:
+        return ContinuousLeducHoldem(
+            num_ranks=self.num_ranks,
+            num_suits=self.num_suits,
+            min_bet=self.min_bet,
+            max_bet=self.max_bet,
+            max_raises=self.max_raises,
+            second_round_scale=self.second_round_scale,
+        )
+
+
 GAME_CONFIGS: dict[str, type] = {
     "matching_pennies": MatchingPenniesConfig,
     "matching_pennies_shifted": MatchingPenniesShiftedConfig,
@@ -194,4 +227,5 @@ GAME_CONFIGS: dict[str, type] = {
     "decoy_well": DecoyWellConfig,
     "multidim_decoy_well": MultiDimDecoyWellConfig,
     "kuhn": KuhnConfig,
+    "leduc": LeducConfig,
 }

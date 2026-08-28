@@ -1,0 +1,73 @@
+# python best_response.py configs/leduc_classic_br.yaml
+#
+# Measures the strategies in `data/leduc_classic` (written by `python train.py
+# configs/leduc_classic.yaml`) by training a best response to each of them.
+#
+# The `game` section must match the run under test exactly -- a checkpoint
+# stores the networks, not the game they were trained on -- so this is
+# `configs/leduc_classic.yaml`'s game verbatim: fixed bets of 2 pre-board and 4
+# post-board, at most two raises a round. `network.num_components` must match
+# it too (1), because a batched rollout selects between the two players'
+# categorical heads and they have to be the same width.
+#
+# Classic Leduc has a published equilibrium value of about -0.0856 per hand to
+# player 0, so a converged self-play run should sit near that and this
+# exploitability should be small. It is a *lower* bound: read the `br_value`
+# column and only trust the number once it has stopped climbing.
+
+game:
+  name: leduc
+  num_ranks: 3
+  num_suits: 2
+  min_bet: 2.0
+  max_bet: 2.0
+  max_raises: 2
+  second_round_scale: 2.0
+
+best_response:
+  checkpoint_dir: data/leduc_classic
+  checkpoint_step: null   # null = the last checkpoint written
+  responder: both
+  # That run predates target params being checkpointed, so only its last
+  # iterate is recoverable; asking for "target" here would (correctly) raise.
+  opponent_iterate: live
+  eval_episodes: 200000
+  eval_batch_size: 20000
+  eval_seed: 12345
+  progress_episodes: 20000
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 1   # must match the checkpoint's
+  clip_means: true
+
+optimizer:
+  learning_rate: 0.003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 500
+
+  # Off: against a frozen opponent these only weaken the responder, which
+  # understates exploitability. See configs/leduc_br.yaml.
+  trpo_category_kl_coef: 0.0
+  trpo_gaussian_kl_coef: 0.0
+  magnet_category_kl_coef: 0.0
+  magnet_gaussian_kl_coef: 0.0
+
+  category_entropy_coef: 0.005
+  gaussian_entropy_coef: 0.0    # the bet size never varies in the classic game
+
+train:
+  steps: 40
+  epochs: 300
+  seed: 0

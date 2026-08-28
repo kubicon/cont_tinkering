@@ -5,10 +5,12 @@ only in how a batch is collected. Everything around that -- the target/magnet
 copies carried alongside the trained params, the six-coefficient loss
 construction, and the per-chunk metric bookkeeping -- was written out once per
 trainer; it lives here instead, so `sequential_trainer` no longer has to reach
-into `mixture_trainer` for private helpers.
+into `mixture_trainer` for private helpers.checkpointed.
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 import chex
 import jax
@@ -107,3 +109,45 @@ def append_chunk_records(
     ]
     history.extend(records)
     return records[-1]
+
+
+def run_training_chunks(
+    steps: int,
+    epochs: int,
+    key: chex.PRNGKey,
+    states: chex.ArrayTree,
+    run_chunk: Callable[[chex.ArrayTree, chex.Array], tuple[chex.ArrayTree, dict]],
+    commit: Callable[[chex.ArrayTree], None],
+    history: list[dict],
+    format_record: Callable[[dict], str],
+    metric_fn: Callable[[], dict[str, float]] | None = None,
+    strategy_log_fn: Callable[[], str] | None = None,
+    checkpoint_fn: Callable[[int], None] | None = None,
+) -> chex.PRNGKey:
+    """The outer loop shared by every mixture trainer: `steps` chunks of `epochs` iterations.
+    """
+    if epochs < 1:
+        raise ValueError(f"epochs must be at least 1, got {epochs}")
+    if checkpoint_fn is not None:
+        checkpoint_fn(0)
+
+    for chunk in range(steps):
+        key, chunk_key = jax.random.split(key)
+        states, metrics_stack = run_chunk(states, jax.random.split(chunk_key, epochs))
+        commit(states)
+
+        record = append_chunk_records(history, metrics_stack, chunk, epochs)
+        # Evaluated once per chunk, on the parameters as they now stand, so it
+        # attaches to that chunk's last record rather than to every iteration.
+        extra = metric_fn() if metric_fn is not None else {}
+        record.update(extra)
+
+        print(format_record(record))
+        if extra:
+            print("  " + "  ".join(f"{k} {v:+.5f}" for k, v in extra.items()))
+        if strategy_log_fn is not None:
+            print(strategy_log_fn())
+        if checkpoint_fn is not None:
+            checkpoint_fn(chunk + 1)
+
+    return key
