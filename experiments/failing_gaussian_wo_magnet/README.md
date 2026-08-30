@@ -13,10 +13,12 @@ midpoint `0`.
 * `with_magnet_{idealized,ppo}.yaml` -- identical except `magnet_gaussian_kl_coef: 0.2`.
   The orbit becomes an inward spiral; exploitability decays geometrically to ~1e-8.
 
-Each setting is split into an `_idealized.yaml` and a `_ppo.yaml` file, identical except
-`optimizer.learning_rate` (0.05 vs 0.001) -- that one field feeds both the idealized
-solver's step size and the PPO network's Adam learning rate, and the two engines need
-different values (see `plot_dynamics.py`'s docstring).
+Each setting has an `_idealized.yaml`, a `_sampled.yaml` and a `_ppo.yaml` file. The
+idealized/sampled pair differ only in `idealized.backend` (`quadrature` vs `sampled`
+plus its sample knobs); the `_ppo.yaml` differs from those in `optimizer.learning_rate`
+(0.001 vs 0.05) -- that one field feeds both the idealized/sampled solver's step size
+and the PPO network's Adam learning rate, and the engines need different values (see
+`plot_dynamics.py`'s docstring).
 
 In *average* strategies (the `target_tau` EMA, dashed in the plot) the no-magnet run
 improves and then plateaus around 1e-1. That plateau is EMA ripple, not a second
@@ -29,6 +31,7 @@ Run:
 
 ```
 python run_idealized.py experiments/failing_gaussian_wo_magnet/wo_magnet_idealized.yaml
+python run_idealized.py experiments/failing_gaussian_wo_magnet/wo_magnet_sampled.yaml
 python train.py         experiments/failing_gaussian_wo_magnet/wo_magnet_ppo.yaml
 ```
 
@@ -39,9 +42,10 @@ the running:
 
 | engine | driver | policy |
 |-|-|-|
-| `idealized` (default) | `run_idealized.py`'s solver | the mixture parameters themselves, exact gradients |
+| `idealized` | `run_idealized.py`'s solver, exact payoff integral | the mixture parameters themselves, exact gradients |
+| `sampled` | `run_idealized.py` with `idealized.backend: sampled` | same tabular mirror step, payoff from `ppo.batch_size` draws/iteration (the one PPO approximation, isolated); reads `*_sampled.yaml` |
 | `ppo` | `train.py`'s `MixtureSelfPlayPPOTrainer` | the network's policy head, sampled rollouts + critic + clipped ratios |
-| `both` | both, overlaid | PPO curves dashed |
+| `both` (default) | all three, overlaid | PPO dashed, sampled dash-dotted |
 
 ```
 # exact solver, both configs as written -> dynamics.png (~3 min)
@@ -50,7 +54,10 @@ python experiments/failing_gaussian_wo_magnet/plot_dynamics.py
 # the same configs through train.py's PPO -> dynamics_ppo.png (~4 min)
 python experiments/failing_gaussian_wo_magnet/plot_dynamics.py --engine ppo
 
-# overlay -> dynamics_both.png
+# the idealized solver with a Monte-Carlo payoff -> dynamics_sampled.png
+python experiments/failing_gaussian_wo_magnet/plot_dynamics.py --engine sampled
+
+# overlay all three -> dynamics_both.png
 python experiments/failing_gaussian_wo_magnet/plot_dynamics.py --engine both
 
 # matched inits: the clean magnet ablation
@@ -175,13 +182,15 @@ r["stats"]["x"][-1]                                                   # final E[
 
 | file | what |
 |-|-|
-| `wo_magnet_idealized.yaml` / `wo_magnet_ppo.yaml` | no magnet on the Gaussian head; starts at mean +1.0; `lr` 0.05 / 0.001 |
-| `with_magnet_idealized.yaml` / `with_magnet_ppo.yaml` | same, `magnet_gaussian_kl_coef: 0.2`; starts at mean +0.2; `lr` 0.05 / 0.001 |
+| `wo_magnet_{idealized,sampled,ppo}.yaml` | no magnet on the Gaussian head; starts at mean +1.0; `lr` 0.05 (idealized/sampled) / 0.001 (ppo) |
+| `with_magnet_{idealized,sampled,ppo}.yaml` | same, `magnet_gaussian_kl_coef: 0.2`; starts at mean +0.2 |
+| `*_sampled.yaml` | `*_idealized.yaml` + `idealized.backend: sampled` (payoff from 256 draws/iteration) |
 | `plot_dynamics.py` | runs the matching engine's pair of configs, writes the figure and a trace cache |
 | `dynamics.png` | idealized engine, configs as written (inits differ, see below) |
 | `dynamics_matched_init.png` | idealized, `--init 0.2`: the clean ablation, magnet is the only difference |
 | `dynamics_ppo.png` | `train.py`'s PPO on the same two configs |
-| `dynamics_both.png` | both engines overlaid |
+| `dynamics_sampled.png` | the idealized solver with the payoff estimated from `ppo.batch_size` draws/iteration |
+| `dynamics_both.png` | all three engines overlaid |
 | `dynamics_runs*.pkl` | pickled run records: hyperparameters + per-iteration numpy arrays |
 
 The two YAMLs do **not** share `init_means` (+1.0 vs +0.2), so `dynamics.png` is not a

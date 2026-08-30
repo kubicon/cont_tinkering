@@ -2,51 +2,368 @@
 \usepackage{amsmath, amssymb, amsthm}
 
 \newtheorem{theorem}{Theorem}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
 \newtheorem{assumption}{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
 
 \begin{document}
 
-\section*{Convergence Proof for Regularized Continuous Games}
+\section*{Discrete-Time Convergence of KL-Regularized\\ Projected GDA for Gaussian Policies}
 
-\begin{assumption}[Bounded Non-Monotonicity]
-The unregularized game vector field $V(\boldsymbol{\theta}) = \big(\nabla_{\theta_1} U(\boldsymbol{\theta}), -\nabla_{\theta_2} U(\boldsymbol{\theta})\big)^T$ is $L$-Lipschitz continuous, satisfying:
+\subsection*{1. Setup and Notation}
+
+Player 1 and Player 2 select Gaussian policies $\pi_1 = \mathcal{N}(\mu_x, \sigma_x^2)$ and
+$\pi_2 = \mathcal{N}(\mu_y, \sigma_y^2)$. Collect the parameters into
+$\boldsymbol{\theta} = (\mu_x, \sigma_x, \mu_y, \sigma_y)^{T}$ and restrict them to
 \begin{equation}
-\langle V(\boldsymbol{\theta}) - V(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle \ge -L \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2, \quad \forall \boldsymbol{\theta}, \boldsymbol{\theta}' \in \mathbb{R}^d.
+\Theta = \left\{ (\mu_x, \sigma_x, \mu_y, \sigma_y) \in \mathbb{R}^4 \;\middle|\;
+\sigma_x \ge \sigma_{\min}, \; \sigma_y \ge \sigma_{\min} \right\},
+\qquad \sigma_{\min} > 0 \text{ fixed.}
 \end{equation}
+$\Theta$ is nonempty, closed and convex (an intersection of two half-spaces).
+
+The \emph{magnet} (anchor) policy is a fixed
+$\bar{\boldsymbol{\theta}} = (\bar\mu_x, \bar\sigma_x, \bar\mu_y, \bar\sigma_y)^{T} \in \Theta$,
+inducing $\bar\pi_1 = \mathcal{N}(\bar\mu_x, \bar\sigma_x^2)$ and
+$\bar\pi_2 = \mathcal{N}(\bar\mu_y, \bar\sigma_y^2)$. Throughout, $\bar\sigma_x, \bar\sigma_y \ge \sigma_{\min}$.
+
+\paragraph{Notation.} Iterates are indexed by $k$ ($\boldsymbol{\theta}_k$); the magnet carries a bar and
+never an index. The strong-monotonicity modulus of the regularizer is written $\rho_R$ (not $\mu_{\mathrm{KL}}$)
+so that the symbol $\mu$ is reserved for policy means.
+
+\paragraph{Operators.} With
+$U(\boldsymbol{\theta}) = \mathbb{E}_{X \sim \pi_1, Y \sim \pi_2}[f(X,Y)]$ the expected payoff
+(Player 1 minimizing, Player 2 maximizing), define the game operator and the regularizer operator
+\begin{align}
+V(\boldsymbol{\theta}) &= \begin{pmatrix}
+\nabla_{\mu_x} U(\boldsymbol{\theta}) \\ \nabla_{\sigma_x} U(\boldsymbol{\theta}) \\
+-\nabla_{\mu_y} U(\boldsymbol{\theta}) \\ -\nabla_{\sigma_y} U(\boldsymbol{\theta})
+\end{pmatrix},
+&
+R(\boldsymbol{\theta}) &= \begin{pmatrix}
+\nabla_{\mu_x} D_{\mathrm{KL}}(\pi_1 \parallel \bar\pi_1) \\
+\nabla_{\sigma_x} D_{\mathrm{KL}}(\pi_1 \parallel \bar\pi_1) \\
+\nabla_{\mu_y} D_{\mathrm{KL}}(\pi_2 \parallel \bar\pi_2) \\
+\nabla_{\sigma_y} D_{\mathrm{KL}}(\pi_2 \parallel \bar\pi_2)
+\end{pmatrix},
+\end{align}
+and the regularized operator $F(\boldsymbol{\theta}) = V(\boldsymbol{\theta}) + \lambda R(\boldsymbol{\theta})$
+with penalty weight $\lambda > 0$.
+
+The sign pattern of $R$ is the crux of the argument and deserves emphasis: Player 1 minimizes
+$U + \lambda D_{\mathrm{KL}}(\pi_1 \parallel \bar\pi_1)$ while Player 2 maximizes
+$U - \lambda D_{\mathrm{KL}}(\pi_2 \parallel \bar\pi_2)$, so Player 2's block of the
+descent-ascent operator is
+\begin{equation}
+-\nabla_{(\mu_y,\sigma_y)}\!\left[U - \lambda D_{\mathrm{KL}}(\pi_2 \parallel \bar\pi_2)\right]
+= -\nabla_{(\mu_y,\sigma_y)} U + \lambda \nabla_{(\mu_y,\sigma_y)} D_{\mathrm{KL}}(\pi_2 \parallel \bar\pi_2).
+\end{equation}
+The min-max sign flip cancels against the sign of the penalty, and \emph{both} blocks of $\lambda R$ enter with a
+$+$ sign. Hence $R = \nabla \Phi$ is the gradient of the separable convex function
+\begin{equation}
+\Phi(\boldsymbol{\theta}) = D_{\mathrm{KL}}(\pi_1 \parallel \bar\pi_1)
++ D_{\mathrm{KL}}(\pi_2 \parallel \bar\pi_2),
+\end{equation}
+and is therefore monotone, whereas $V$ need not be.
+
+Updates follow projected gradient descent-ascent (PGDA) with step size $\eta > 0$:
+\begin{equation}\label{eq:pgda}
+\boldsymbol{\theta}_{k+1} = \Pi_\Theta \big( \boldsymbol{\theta}_k - \eta F(\boldsymbol{\theta}_k) \big),
+\end{equation}
+where $\Pi_\Theta$ is the Euclidean projection onto $\Theta$.
+
+\subsection*{2. Assumptions}
+
+Only two things are assumed; every property of the KL regularizer is computed in Section 3.
+
+\begin{assumption}[Regularity of the game operator]\label{as:lip}
+$V$ is $L_V$-Lipschitz continuous on $\Theta$:
+$\|V(\boldsymbol{\theta}) - V(\boldsymbol{\theta}')\| \le L_V \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|$
+for all $\boldsymbol{\theta}, \boldsymbol{\theta}' \in \Theta$.
 \end{assumption}
 
-\begin{assumption}[Strong Convexity of KL Penalty]
-The magnet regularization vector field $R(\boldsymbol{\theta}) = \big(\nabla_{\theta_1} D_{\text{KL}}(\pi_{\theta_1} \parallel \pi_{1,m}), \nabla_{\theta_2} D_{\text{KL}}(\pi_{\theta_2} \parallel \pi_{2,m})\big)^T$ is $\mu_{\text{KL}}$-strongly monotone:
+Note that no monotonicity of $V$ is assumed; the game may be arbitrarily non-monotone, subject only to the
+quantitative bound implied by Lipschitz continuity.
+
+\begin{lemma}[Bounded non-monotonicity]\label{lem:nonmono}
+Under Assumption~\ref{as:lip}, for all $\boldsymbol{\theta}, \boldsymbol{\theta}' \in \Theta$,
 \begin{equation}
-\langle R(\boldsymbol{\theta}) - R(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle \ge \mu_{\text{KL}} \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2, \quad \forall \boldsymbol{\theta}, \boldsymbol{\theta}' \in \mathbb{R}^d.
+\langle V(\boldsymbol{\theta}) - V(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle
+\ge -L_V \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2 .
 \end{equation}
+\end{lemma}
+
+\begin{proof}
+By Cauchy--Schwarz and Assumption~\ref{as:lip},
+$\langle V(\boldsymbol{\theta}) - V(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle
+\ge - \|V(\boldsymbol{\theta}) - V(\boldsymbol{\theta}')\| \, \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|
+\ge - L_V \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2$.
+\end{proof}
+
+\begin{assumption}[Sufficient regularization]\label{as:lambda}
+$\lambda > L_V / \rho_R$, where $\rho_R > 0$ is the constant computed in Lemma~\ref{lem:kl}.
 \end{assumption}
 
-\begin{theorem}
-If $\lambda > \frac{L}{\mu_{\text{KL}}}$, the regularized gradient flow $\dot{\boldsymbol{\theta}}(t) = -F(\boldsymbol{\theta}(t))$ with $F(\boldsymbol{\theta}) = V(\boldsymbol{\theta}) + \lambda R(\boldsymbol{\theta})$ converges globally exponentially to a unique regularized equilibrium $\boldsymbol{\theta}^*$.
+\subsection*{3. Properties of the Gaussian KL Regularizer}
+
+\begin{lemma}[Explicit regularizer constants]\label{lem:kl}
+On $\Theta$ the operator $R$ is continuously differentiable, and
+\begin{equation}
+R(\boldsymbol{\theta}) = \begin{pmatrix}
+\dfrac{\mu_x - \bar\mu_x}{\bar\sigma_x^{2}} \\[2ex]
+-\dfrac{1}{\sigma_x} + \dfrac{\sigma_x}{\bar\sigma_x^{2}} \\[2ex]
+\dfrac{\mu_y - \bar\mu_y}{\bar\sigma_y^{2}} \\[2ex]
+-\dfrac{1}{\sigma_y} + \dfrac{\sigma_y}{\bar\sigma_y^{2}}
+\end{pmatrix},
+\qquad
+J_R(\boldsymbol{\theta}) = \mathrm{diag}\!\left(
+\frac{1}{\bar\sigma_x^{2}},\;
+\frac{1}{\sigma_x^{2}} + \frac{1}{\bar\sigma_x^{2}},\;
+\frac{1}{\bar\sigma_y^{2}},\;
+\frac{1}{\sigma_y^{2}} + \frac{1}{\bar\sigma_y^{2}}
+\right).
+\end{equation}
+Consequently $R$ is $\rho_R$-strongly monotone and $L_R$-Lipschitz on $\Theta$ with
+\begin{equation}
+\rho_R = \min\!\left(\frac{1}{\bar\sigma_x^{2}}, \frac{1}{\bar\sigma_y^{2}}\right) > 0,
+\qquad
+L_R = \frac{1}{\sigma_{\min}^{2}} + \max\!\left(\frac{1}{\bar\sigma_x^{2}}, \frac{1}{\bar\sigma_y^{2}}\right) < \infty .
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+For univariate Gaussians,
+\begin{equation}
+D_{\mathrm{KL}}\big(\mathcal{N}(\mu,\sigma^2) \parallel \mathcal{N}(\bar\mu,\bar\sigma^2)\big)
+= \log\frac{\bar\sigma}{\sigma} + \frac{\sigma^{2} + (\mu - \bar\mu)^{2}}{2 \bar\sigma^{2}} - \frac{1}{2},
+\end{equation}
+whose partial derivatives are $(\mu - \bar\mu)/\bar\sigma^{2}$ and $-1/\sigma + \sigma/\bar\sigma^{2}$, and whose
+Hessian is $\mathrm{diag}(1/\bar\sigma^{2},\; 1/\sigma^{2} + 1/\bar\sigma^{2})$. Stacking the two players'
+blocks gives the stated $R$ and $J_R$; the Jacobian is diagonal because the two KL terms are separable and
+because $\bar{\boldsymbol{\theta}}$ is constant.
+
+All four diagonal entries are positive and finite on $\Theta$, since $\sigma_x, \sigma_y \ge \sigma_{\min} > 0$.
+As $1/\sigma^{2} + 1/\bar\sigma^{2} > 1/\bar\sigma^{2}$, the smallest entry is
+$\min(\bar\sigma_x^{-2}, \bar\sigma_y^{-2}) = \rho_R$ and the largest is at most
+$\sigma_{\min}^{-2} + \max(\bar\sigma_x^{-2}, \bar\sigma_y^{-2}) = L_R$. Hence
+$\rho_R I \preceq J_R(\boldsymbol{\theta}) \preceq L_R I$ for every $\boldsymbol{\theta} \in \Theta$.
+
+Since $\Theta$ is convex, the segment $\boldsymbol{\theta}' + t(\boldsymbol{\theta} - \boldsymbol{\theta}')$,
+$t \in [0,1]$, lies in $\Theta$, and the fundamental theorem of calculus gives
+\begin{equation}
+\langle R(\boldsymbol{\theta}) - R(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle
+= \int_0^1 (\boldsymbol{\theta} - \boldsymbol{\theta}')^{T}
+J_R\big(\boldsymbol{\theta}' + t(\boldsymbol{\theta} - \boldsymbol{\theta}')\big)
+(\boldsymbol{\theta} - \boldsymbol{\theta}') \, dt
+\ge \rho_R \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^{2},
+\end{equation}
+and likewise
+$\|R(\boldsymbol{\theta}) - R(\boldsymbol{\theta}')\|
+= \big\| \int_0^1 J_R(\cdot)(\boldsymbol{\theta} - \boldsymbol{\theta}') dt \big\|
+\le L_R \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|$.
+\end{proof}
+
+\begin{lemma}[Strong monotonicity and Lipschitz continuity of $F$]\label{lem:F}
+Under Assumptions~\ref{as:lip}--\ref{as:lambda}, $F = V + \lambda R$ is $\alpha$-strongly monotone and
+$L_F$-Lipschitz on $\Theta$, with
+\begin{equation}
+\alpha = \lambda \rho_R - L_V > 0,
+\qquad
+L_F = L_V + \lambda L_R < \infty,
+\qquad
+\alpha \le L_F .
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+Adding Lemma~\ref{lem:nonmono} to $\lambda$ times the strong monotonicity of Lemma~\ref{lem:kl} gives
+\begin{equation}
+\langle F(\boldsymbol{\theta}) - F(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle
+\ge (\lambda \rho_R - L_V) \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^{2}
+= \alpha \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^{2},
+\end{equation}
+and $\alpha > 0$ is exactly Assumption~\ref{as:lambda}. The triangle inequality applied to the Lipschitz
+bounds of $V$ and $\lambda R$ gives $L_F = L_V + \lambda L_R$. Finally, combining the two properties with
+Cauchy--Schwarz,
+$\alpha \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^{2}
+\le \langle F(\boldsymbol{\theta}) - F(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle
+\le L_F \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^{2}$, so $\alpha \le L_F$.
+\end{proof}
+
+\subsection*{4. The Equilibrium: a Variational Inequality, not a Zero of $F$}
+
+Because $\Theta$ has a boundary, the natural solution concept for \eqref{eq:pgda} is not $F(\boldsymbol{\theta}^*) = \mathbf{0}$
+but the variational inequality $\mathrm{VI}(F, \Theta)$: find $\boldsymbol{\theta}^* \in \Theta$ with
+\begin{equation}\label{eq:vi}
+\langle F(\boldsymbol{\theta}^*), \boldsymbol{\theta} - \boldsymbol{\theta}^* \rangle \ge 0
+\qquad \forall \boldsymbol{\theta} \in \Theta .
+\end{equation}
+Assuming a zero of $F$ inside $\Theta$ would be a genuine restriction: if the regularized equilibrium sits on
+the boundary $\{\sigma_x = \sigma_{\min}\}$ or $\{\sigma_y = \sigma_{\min}\}$ --- precisely the variance-collapse
+regime of interest --- no such zero exists, and a theorem premised on one would be vacuous.
+
+\begin{proposition}[Existence, uniqueness, fixed-point characterization]\label{prop:vi}
+Under Assumptions~\ref{as:lip}--\ref{as:lambda}, $\mathrm{VI}(F,\Theta)$ has exactly one solution
+$\boldsymbol{\theta}^*$, and for every $\eta > 0$
+\begin{equation}\label{eq:fixed}
+\boldsymbol{\theta}^* = \Pi_\Theta\big(\boldsymbol{\theta}^* - \eta F(\boldsymbol{\theta}^*)\big).
+\end{equation}
+If moreover $\sigma_x^* > \sigma_{\min}$ and $\sigma_y^* > \sigma_{\min}$, then $F(\boldsymbol{\theta}^*) = \mathbf{0}$.
+\end{proposition}
+
+\begin{proof}
+$\Theta$ is nonempty, closed and convex, and by Lemma~\ref{lem:F} $F$ is continuous and $\alpha$-strongly
+monotone with $\alpha > 0$; strong monotonicity implies coercivity, so a solution exists and is unique
+(standard theory of variational inequalities). For uniqueness directly: if $\boldsymbol{\theta}_1^*, \boldsymbol{\theta}_2^*$
+both solve \eqref{eq:vi}, testing each with the other and adding gives
+$\langle F(\boldsymbol{\theta}_1^*) - F(\boldsymbol{\theta}_2^*), \boldsymbol{\theta}_1^* - \boldsymbol{\theta}_2^* \rangle \le 0$,
+while strong monotonicity forces this to be $\ge \alpha \|\boldsymbol{\theta}_1^* - \boldsymbol{\theta}_2^*\|^{2}$;
+hence $\boldsymbol{\theta}_1^* = \boldsymbol{\theta}_2^*$.
+
+The characterization \eqref{eq:fixed} is the standard projection identity: for a closed convex $\Theta$,
+$z = \Pi_\Theta(w)$ iff $\langle w - z, \boldsymbol{\theta} - z\rangle \le 0$ for all $\boldsymbol{\theta} \in \Theta$.
+Applying this with $w = \boldsymbol{\theta}^* - \eta F(\boldsymbol{\theta}^*)$ and $z = \boldsymbol{\theta}^*$ turns
+\eqref{eq:fixed} into $\langle -\eta F(\boldsymbol{\theta}^*), \boldsymbol{\theta} - \boldsymbol{\theta}^*\rangle \le 0$,
+which for $\eta > 0$ is exactly \eqref{eq:vi}.
+
+If $\boldsymbol{\theta}^*$ lies in the interior of $\Theta$, then for small $\epsilon > 0$ every
+$\boldsymbol{\theta} = \boldsymbol{\theta}^* \pm \epsilon e_i$ is feasible; \eqref{eq:vi} then gives both
+$\pm \langle F(\boldsymbol{\theta}^*), e_i \rangle \ge 0$, so $F(\boldsymbol{\theta}^*) = \mathbf{0}$.
+\end{proof}
+
+\subsection*{5. Linear Convergence}
+
+\begin{theorem}\label{thm:main}
+Let Assumptions~\ref{as:lip}--\ref{as:lambda} hold, let $\boldsymbol{\theta}^*$ be the unique solution of
+$\mathrm{VI}(F,\Theta)$ from Proposition~\ref{prop:vi}, and let $\alpha, L_F$ be as in Lemma~\ref{lem:F}. If
+\begin{equation}
+0 < \eta < \frac{2\alpha}{L_F^{2}},
+\end{equation}
+then the PGDA sequence \eqref{eq:pgda} converges to $\boldsymbol{\theta}^*$ linearly from any
+$\boldsymbol{\theta}_0 \in \Theta$:
+\begin{equation}
+\|\boldsymbol{\theta}_k - \boldsymbol{\theta}^*\|^{2}
+\le r(\eta)^{k} \|\boldsymbol{\theta}_0 - \boldsymbol{\theta}^*\|^{2},
+\qquad
+r(\eta) = 1 - 2\eta\alpha + \eta^{2} L_F^{2} \in [0, 1).
+\end{equation}
 \end{theorem}
 
 \begin{proof}
-Evaluating the inner product of the operator $F(\boldsymbol{\theta})$ over any two points $\boldsymbol{\theta}, \boldsymbol{\theta}' \in \mathbb{R}^d$:
-\begin{align*}
-\langle F(\boldsymbol{\theta}) - F(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle &= \langle V(\boldsymbol{\theta}) - V(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle + \lambda \langle R(\boldsymbol{\theta}) - R(\boldsymbol{\theta}'), \boldsymbol{\theta} - \boldsymbol{\theta}' \rangle \\
-&\ge -L \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2 + \lambda \mu_{\text{KL}} \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2 \\
-&= (\lambda \mu_{\text{KL}} - L) \|\boldsymbol{\theta} - \boldsymbol{\theta}'\|^2.
-\end{align*}
-Setting $\alpha = \lambda \mu_{\text{KL}} - L > 0$, the operator $F(\boldsymbol{\theta})$ is $\alpha$-strongly monotone. By the Minty-Browder Theorem, there exists a unique equilibrium point $\boldsymbol{\theta}^*$ such that $F(\boldsymbol{\theta}^*) = \mathbf{0}$.
+Write $\boldsymbol{\delta}_k = \boldsymbol{\theta}_k - \boldsymbol{\theta}^*$.
 
-To prove global asymptotic convergence, define the Lyapunov candidate function $W(\boldsymbol{\theta}) = \frac{1}{2} \|\boldsymbol{\theta} - \boldsymbol{\theta}^*\|^2$. Differentiating $W$ along the system trajectories $\dot{\boldsymbol{\theta}}(t) = -F(\boldsymbol{\theta}(t))$:
-\begin{align*}
-\dot{W}(\boldsymbol{\theta}(t)) &= \langle \boldsymbol{\theta}(t) - \boldsymbol{\theta}^*, \dot{\boldsymbol{\theta}}(t) \rangle \\
-&= -\langle F(\boldsymbol{\theta}(t)) - F(\boldsymbol{\theta}^*), \boldsymbol{\theta}(t) - \boldsymbol{\theta}^* \rangle \\
-&\le -\alpha \|\boldsymbol{\theta}(t) - \boldsymbol{\theta}^*\|^2 \\
-&= -2\alpha W(\boldsymbol{\theta}(t)).
-\end{align*}
-Applying Grönwall's Inequality to $\dot{W}(t) \le -2\alpha W(t)$ yields:
+\paragraph{Step 1: both iterates as projections.}
+By \eqref{eq:pgda} and the fixed-point characterization \eqref{eq:fixed} --- used with the \emph{same} $\eta$ ---
 \begin{equation}
-W(t) \le W(0) e^{-2\alpha t} \implies \|\boldsymbol{\theta}(t) - \boldsymbol{\theta}^*\| \le \|\boldsymbol{\theta}(0) - \boldsymbol{\theta}^*\| e^{-\alpha t}.
+\|\boldsymbol{\theta}_{k+1} - \boldsymbol{\theta}^*\|^{2}
+= \big\| \Pi_\Theta\big(\boldsymbol{\theta}_k - \eta F(\boldsymbol{\theta}_k)\big)
+- \Pi_\Theta\big(\boldsymbol{\theta}^* - \eta F(\boldsymbol{\theta}^*)\big) \big\|^{2}.
 \end{equation}
-Therefore, $\boldsymbol{\theta}(t)$ converges globally exponentially to $\boldsymbol{\theta}^*$ at rate $\alpha = \lambda \mu_{\text{KL}} - L$.
+This step is where the earlier reliance on $F(\boldsymbol{\theta}^*) = \mathbf{0}$ is removed: no interiority of
+$\boldsymbol{\theta}^*$ is needed.
+
+\paragraph{Step 2: non-expansiveness of the projection.}
+$\Theta$ is closed and convex, so $\Pi_\Theta$ is non-expansive, giving
+\begin{equation}
+\|\boldsymbol{\theta}_{k+1} - \boldsymbol{\theta}^*\|^{2}
+\le \big\| \boldsymbol{\delta}_k - \eta \big(F(\boldsymbol{\theta}_k) - F(\boldsymbol{\theta}^*)\big) \big\|^{2}.
+\end{equation}
+
+\paragraph{Step 3: expansion.}
+\begin{equation}
+\big\| \boldsymbol{\delta}_k - \eta \big(F(\boldsymbol{\theta}_k) - F(\boldsymbol{\theta}^*)\big) \big\|^{2}
+= \|\boldsymbol{\delta}_k\|^{2}
+- 2\eta \big\langle \boldsymbol{\delta}_k, F(\boldsymbol{\theta}_k) - F(\boldsymbol{\theta}^*) \big\rangle
++ \eta^{2} \big\| F(\boldsymbol{\theta}_k) - F(\boldsymbol{\theta}^*) \big\|^{2}.
+\end{equation}
+
+\paragraph{Step 4: bounding the two terms.}
+By Lemma~\ref{lem:F} and $\eta > 0$,
+\begin{align}
+- 2\eta \big\langle \boldsymbol{\delta}_k, F(\boldsymbol{\theta}_k) - F(\boldsymbol{\theta}^*) \big\rangle
+&\le -2\eta\alpha \|\boldsymbol{\delta}_k\|^{2}
+&&\text{($\alpha$-strong monotonicity)}, \\
+\eta^{2} \big\| F(\boldsymbol{\theta}_k) - F(\boldsymbol{\theta}^*) \big\|^{2}
+&\le \eta^{2} L_F^{2} \|\boldsymbol{\delta}_k\|^{2}
+&&\text{($L_F$-Lipschitz continuity)} .
+\end{align}
+Hence $\|\boldsymbol{\delta}_{k+1}\|^{2} \le r(\eta) \|\boldsymbol{\delta}_k\|^{2}$ with
+$r(\eta) = 1 - 2\eta\alpha + \eta^{2} L_F^{2}$.
+
+\paragraph{Step 5: the contraction factor.}
+Since $\alpha \le L_F$ (Lemma~\ref{lem:F}),
+\begin{equation}
+r(\eta) = (1 - \eta \alpha)^{2} + \eta^{2}\big(L_F^{2} - \alpha^{2}\big) \ge 0,
+\end{equation}
+so $r(\eta) \in [0,1)$ as soon as $r(\eta) < 1$, i.e.\ $\eta(2\alpha - \eta L_F^{2}) > 0$, i.e.\
+$0 < \eta < 2\alpha / L_F^{2}$. Iterating the one-step bound over $k$ steps gives the claim; $r(\eta) < 1$
+also yields $\boldsymbol{\theta}_k \to \boldsymbol{\theta}^*$.
 \end{proof}
+
+\begin{corollary}[Optimal step size]
+Minimizing $r(\eta)$ over $\eta$ gives $\eta^\star = \alpha / L_F^{2}$, which lies in $(0, 2\alpha/L_F^{2})$ and
+achieves
+\begin{equation}
+r^\star = 1 - \frac{2\alpha^{2}}{L_F^{2}} + \frac{\alpha^{2}}{L_F^{2}}
+= 1 - \frac{\alpha^{2}}{L_F^{2}} \in [0, 1).
+\end{equation}
+\end{corollary}
+
+\begin{corollary}[Local version of Assumption~\ref{as:lip}]\label{cor:local}
+Theorem~\ref{thm:main} remains valid if Assumption~\ref{as:lip} holds only on the bounded convex set
+$B = \{\boldsymbol{\theta} \in \Theta : \|\boldsymbol{\theta} - \boldsymbol{\theta}^*\| \le \|\boldsymbol{\theta}_0 - \boldsymbol{\theta}^*\|\}$.
+\end{corollary}
+
+\begin{proof}
+Induction on $k$. If $\boldsymbol{\theta}_k \in B$, then $\boldsymbol{\theta}_k, \boldsymbol{\theta}^* \in B$ and,
+$B$ being convex, the segment joining them lies in $B$; all constants used in Steps 3--4 are therefore valid, so
+$\|\boldsymbol{\delta}_{k+1}\| \le \sqrt{r(\eta)} \|\boldsymbol{\delta}_k\| \le \|\boldsymbol{\delta}_k\|$ and
+$\boldsymbol{\theta}_{k+1} \in B$. The argument is not circular: each step only uses the constants on $B$, whose
+definition does not depend on the iterates beyond $\boldsymbol{\theta}_0$.
+\end{proof}
+
+\subsection*{6. Scope of the Result}
+
+\begin{remark}[The limit point is magnet-biased, and is not a Nash equilibrium]
+$\boldsymbol{\theta}^*$ depends on both $\lambda$ and $\bar{\boldsymbol{\theta}}$: it solves
+$\mathrm{VI}(V + \lambda R, \Theta)$, not $\mathrm{VI}(V, \Theta)$. The theorem therefore establishes convergence
+of a single inner loop at a fixed magnet. Concluding anything about the unregularized game requires an outer
+loop (e.g.\ periodically setting $\bar{\boldsymbol{\theta}} \leftarrow \boldsymbol{\theta}_k$, or annealing
+$\lambda \downarrow 0$), whose analysis is not contained here.
+\end{remark}
+
+\begin{remark}[Restriction to the Gaussian family]
+$\boldsymbol{\theta}^*$ is a stationary point of the regularized game \emph{within the parametric family of
+Gaussian policies}. It coincides with the quantal-response equilibrium of the underlying continuous game only
+when that equilibrium happens to be Gaussian; in general the two differ, and the result should not be stated as
+convergence to ``the QRE''.
+\end{remark}
+
+\begin{remark}[Exact operator]
+Iteration \eqref{eq:pgda} uses the exact $F(\boldsymbol{\theta}_k)$. Implementations estimate
+$\nabla U$ from samples, giving $\boldsymbol{\theta}_{k+1} = \Pi_\Theta(\boldsymbol{\theta}_k - \eta \widehat{F}_k)$
+with $\mathbb{E}[\widehat{F}_k] = F(\boldsymbol{\theta}_k)$ and variance $\varsigma^{2}$. The recursion then becomes
+$\mathbb{E}\|\boldsymbol{\delta}_{k+1}\|^{2} \le r(\eta) \mathbb{E}\|\boldsymbol{\delta}_k\|^{2} + \eta^{2}\varsigma^{2}$,
+so a constant step size yields linear convergence only to a noise ball of radius
+$O(\eta \varsigma^{2} / \alpha)$; exact convergence requires decaying steps and a separate argument.
+\end{remark}
+
+\begin{remark}[Global Lipschitz continuity of $V$ is strong]
+$\Theta$ is unbounded in $\mu_x, \mu_y$ and in the upper range of $\sigma_x, \sigma_y$. Assumption~\ref{as:lip}
+holds globally for, e.g., bilinear $f(x,y) = xy$ (where $U = \mu_x \mu_y$ and $V = (\mu_y, 0, -\mu_x, 0)^{T}$),
+but fails for generic polynomial payoffs. Corollary~\ref{cor:local} is the practical form of the assumption:
+$L_V$ need only bound $V$ on the bounded set $B$ determined by the initialization.
+\end{remark}
+
+\begin{remark}[Parametrization]
+The constants in Lemma~\ref{lem:kl} are for the direct parametrization by $\sigma$ with a hard projection onto
+$\sigma \ge \sigma_{\min}$. An implementation parametrizing $s = \log \sigma$ (thereby making $\Theta$ all of
+$\mathbb{R}^4$ and dispensing with the projection) induces a different Jacobian, and $\rho_R$, $L_R$ must be
+recomputed accordingly.
+\end{remark}
 
 \end{document}

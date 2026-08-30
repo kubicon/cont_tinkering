@@ -1,21 +1,27 @@
 """Run the with-/without-magnet configs side by side and plot the learning dynamics.
 
-Two engines can drive the same YAML (`--engine`):
+Three engines can drive the same YAML (`--engine`):
 
   idealized -- `run_idealized.py`: exact gradients, no sampling, the policy *is*
                the mixture parameters.
+  sampled   -- `run_idealized.py` with `idealized.backend: sampled` (its own
+               `*_sampled.yaml`, = `*_idealized.yaml` plus that backend block): the
+               exact tabular mirror step is kept, but the payoff integral is replaced
+               by `ppo.batch_size` Monte-Carlo action draws per iteration -- the single
+               PPO approximation isolated, nothing else changed.
   ppo       -- `train.py`: `MixtureSelfPlayPPOTrainer`, i.e. sampled rollouts, a
                learned critic, clipped ratios, Adam on network weights. The plotted
                strategy is the policy head read out at the game's (constant)
                observation.
-  both      -- both, overlaid; the PPO curves are dashed.
+  both      -- all three, overlaid; PPO dashed, sampled dash-dotted.
 
 The game is bilinear matching pennies, `payoff(a0, a1) = a0 * a1` on `[-1, 1]`, so
 only the mean of each policy matters and the Nash is at the midpoint of the box. Each
-of the two settings (with/without magnet) has its own pair of config files --
-`*_idealized.yaml` and `*_ppo.yaml` -- identical except `optimizer.learning_rate`
-(0.05 for the idealized solver, 0.001 for the PPO network -- the same field feeds
-both `cfg.lr` and the network's Adam step size, so each engine gets its own value).
+of the two settings (with/without magnet) has its own config file per engine --
+`*_idealized.yaml`, `*_sampled.yaml`, `*_ppo.yaml`. They differ only in
+`optimizer.learning_rate` (0.05 for the idealized/sampled solver, 0.001 for the PPO
+network -- the same field feeds both `cfg.lr` and the network's Adam step size) and,
+for `*_sampled.yaml`, the `idealized.backend: sampled` block.
 The only *intended* difference between with-magnet and without-magnet is
 `ppo.magnet_gaussian_kl_coef`; pass `--init` to also equalize the starting means,
 which the two settings as written do not share.
@@ -31,9 +37,10 @@ The figure has three panels:
   * bot r. -- distance of (E[a_0], E[a_1]) to the Nash point, and the policy std,
               against iteration.
 
-Both engines are traced **every iteration** (the orbit period is only a few hundred
+Every engine is traced **every iteration** (the orbit period is only a few hundred
 iterations, so logging once per outer step aliases the circle into a polygon), and
-both are scored with the same quadrature NashConv from `run_idealized.py`, so the
+all are scored with the same quadrature NashConv from `run_idealized.py` (the
+`sampled` engine on its exact `.metrics` grid, not its noisy batch), so the
 curves are directly comparable. Exploitability needs an eager best-response sweep, so
 it is evaluated on a subsample (`--expl-points`).
 
@@ -49,6 +56,7 @@ Every run is pickled to `--cache` (default `dynamics_runs[_<engine>].pkl`) as
 usage:
     python experiments/failing_gaussian_wo_magnet/plot_dynamics.py
     python experiments/failing_gaussian_wo_magnet/plot_dynamics.py --engine ppo
+    python experiments/failing_gaussian_wo_magnet/plot_dynamics.py --engine sampled
     python experiments/failing_gaussian_wo_magnet/plot_dynamics.py --engine both --init 0.2
     python experiments/failing_gaussian_wo_magnet/plot_dynamics.py --reuse   # replot cached runs
 """
@@ -81,12 +89,16 @@ RUNS = [
     ("wo_magnet", "no magnet", "Reds"),
     ("with_magnet", "magnet", "Blues"),
 ]
-ENGINES = ("idealized", "ppo")
-STYLE = {"idealized": "-", "ppo": "--"}
+ENGINES = ("idealized", "ppo", "sampled")
+STYLE = {"idealized": "-", "ppo": "--", "sampled": "-."}
 
 
 def config_name(base: str, engine: str) -> str:
-    """Each (base, engine) pair has its own config file -- see module docstring."""
+    """Each (base, engine) pair has its own config file -- see module docstring.
+
+    `<base>_sampled.yaml` is `<base>_idealized.yaml` with `idealized.backend:
+    sampled` (and the sampled-only knobs); both are `run_idealized.py` configs.
+    """
     return f"{base}_{engine}.yaml"
 
 
@@ -113,18 +125,30 @@ def load_cache(path: Path) -> dict:
 
 
 def _run_idealized(game, cfg) -> tuple[ri.Params, ...]:
+    """`run_idealized.py`'s solver, traced every iteration.
+
+    Drives whatever backend `cfg.idealized.backend` selects: the deterministic
+    `quadrature` backend (`--engine idealized`) or the Monte-Carlo `sampled` one
+    (`--engine sampled`), which replaces the exact payoff integral with
+    `ppo.batch_size` action draws per iteration -- the one PPO approximation
+    `train.py` makes that this backend isolates.
+    """
     p0, p1 = ri.build_init(game, cfg)
     backend = ri.build_backend(game, cfg)
     iteration = ri.build_iteration(game, cfg, backend)
+    stochastic = getattr(backend, "stochastic", False)
 
     def trace(carry, _):
         carry, _ = iteration(carry, None)
-        cur0, cur1, _, _, avg0, avg1, _, _ = carry
+        cur0, cur1, _, _, avg0, avg1, _, _, _ = carry
         return carry, (cur0, cur1, avg0, avg1)
 
-    # `fixed_handle` is unused in self_play, but the carry shape must still match.
-    fixed_handle = jnp.zeros_like(backend.handle(p0)) if backend.name == "quadrature" else None
-    carry = (p0, p1, p0, p1, p0, p1, fixed_handle, jnp.zeros((), dtype=jnp.int64))
+    # `fixed_handle` is unused in self_play, but the carry shape must still match;
+    # a stochastic backend scores through its `.metrics` grid, not itself.
+    metrics = backend.metrics if stochastic else backend
+    fixed_handle = jnp.zeros_like(metrics.handle(p0)) if metrics.name == "quadrature" else None
+    key = jax.random.PRNGKey(backend.seed if stochastic else 0)
+    carry = (p0, p1, p0, p1, p0, p1, fixed_handle, jnp.zeros((), dtype=jnp.int64), key)
     _, ys = jax.jit(lambda c: jax.lax.scan(trace, c, None, length=cfg.total_iters))(carry)
     return ys
 
@@ -229,8 +253,11 @@ def _summarize(game, cfg, run_config, traced, engine: str, expl_points: int, met
     cur0, cur1, avg0, avg1 = traced
     total = int(cur0.means.shape[0])
     backend = ri.build_backend(game, cfg)
-    # the idealized solver integrates the raw Gaussian, `train.py` clips its actions
-    handle = backend.handle if engine == "idealized" else lambda p: _clipped_handle(backend, p)
+    # a stochastic backend (`sampled`) scores on its exact `.metrics` grid, not the
+    # noisy batch it is meant to judge
+    backend = backend.metrics if getattr(backend, "stochastic", False) else backend
+    # the idealized/sampled solver integrates the raw Gaussian, `train.py` clips its actions
+    handle = backend.handle if engine != "ppo" else lambda p: _clipped_handle(backend, p)
 
     def arrays(p) -> dict[str, np.ndarray]:
         """One traced player's mixture as `(iterations, num_components)` arrays."""
@@ -308,7 +335,9 @@ def simulate(config_path: Path, engine: str, init: float | None,
             cfg, idealized=dataclasses.replace(
                 cfg.idealized, init_means=[init] * cfg.num_components))
 
-    if engine == "idealized":
+    if engine in ("idealized", "sampled"):
+        # the backend (`quadrature` / `sampled`) comes from the config's `idealized:`
+        # section -- `<base>_sampled.yaml` sets `backend: sampled`
         traced = _run_idealized(game, cfg)
     elif engine == "ppo":
         if run_config is None:  # a legacy `mmd:`-schema config has no train.py counterpart
@@ -396,8 +425,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=(*ENGINES, "both"), default="both",
-                    help="idealized = run_idealized.py's exact solver, ppo = train.py's "
-                         "neural-network self-play, both = overlay (default: idealized)")
+                    help="idealized = run_idealized.py's exact-integral solver, sampled = "
+                         "the same solver with the payoff estimated from ppo.batch_size "
+                         "draws/iteration, ppo = train.py's neural-network self-play, "
+                         "both = overlay all three (default)")
     ap.add_argument("--init", type=float, default=0.2,
                     help="override both configs' idealized.init_means, so the runs differ "
                          "only in the magnet coefficient (default: use each config's own)")

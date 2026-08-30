@@ -1,0 +1,92 @@
+# python run_idealized.py experiments/failing_gaussian_wo_magnet/wo_magnet_sampled.yaml
+#
+# Sampled-backend counterpart of wo_magnet_idealized.yaml -- the exact tabular mirror
+# step is kept, but the payoff integral is replaced by `ppo.batch_size` Monte-Carlo
+# action draws per iteration (the one PPO approximation, isolated). Identical to
+# wo_magnet_idealized.yaml except the `idealized:` backend block; see plot_dynamics.py's
+# `--engine sampled` path. `idealized.samples -> inf` recovers the quadrature run.
+
+game:
+  name: matching_pennies
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 1
+  clip_means: true      # project the mean head onto the action box, as run_idealized.py
+                        #   does after every step. Without it train.py's means diffuse to
+                        #   |mu| ~ 1e3: past the box every sample clips to the same corner,
+                        #   so the payoff stops depending on this player's action and
+                        #   advantage normalization + Adam keep the step at ~lr anyway.
+
+optimizer:
+  learning_rate: 0.05   # the exact solver's mirror step size, kept as-is under the
+                        #   sampled backend; the PPO copy uses 0.001
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 256       # draws per iteration for the sampled payoff (unless
+                        #   idealized.samples overrides it)
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 500
+  category_entropy_coef: 0.1
+  gaussian_entropy_coef: 0.1
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.0
+
+train:
+  mode: self_play
+  perspective: 0
+  opponent: random
+  steps: 50
+  epochs: 200
+  checkpoint_dir: data/matching_pennies
+  seed: 123
+
+idealized:
+  backend: sampled      # Monte-Carlo payoff; the mirror/natural-gradient step stays exact
+  grid_points: 2001     # kept as the *metrics* grid -- NashConv is scored exactly, not
+                        #   off the noisy batch it is meant to judge
+  normalize_density: true
+
+  samples: null         # draws per iteration; null -> ppo.batch_size (256)
+  sample_seed: null     # null -> train.seed (123)
+  q_estimator: responsibility   # self-normalized importance weights over the on-policy
+                                #   batch; costs exactly `samples` payoffs
+  grad_estimator: pathwise      # reparameterized (low variance); the payoff is
+                                #   differentiable in the action here
+  entropy_source: sampled       # -log p_mix at the sampled action, as mixture_ppo_loss adds
+
+  std_min: 0.005
+  std_max: 0.5
+
+  train_means: true
+  train_std: true
+  freeze_weights: false
+
+  gaussian_entropy: marginal
+  kl_weighting: policy
+
+  anneal_std_from: 0.0
+  repulsion_coef: 0.0
+  repulsion_ramp: 0.2
+  repulsion_hold: 0.5
+
+  init_means: [1.0]     # start OFF the Nash. `spread` puts the single component at the
+                        #   box midpoint 0.5, which IS a Nash here (payoff is bilinear, so
+                        #   only the mean matters) -- the run then sits at a fixed point
+                        #   from step 0 and "converges" without ever taking a real step.
+  init_weights: [0.3]
+  init_log_std: 0.1
+
+  log_rows: 16
+  log_out: null
+  verbose: true
