@@ -58,6 +58,7 @@ def build_hyperparams(game: ZeroSumGame, player: int, config: RunConfig) -> Mixt
         num_components=network.num_components,
         num_atoms=_num_atoms(space),
         clip_means=network.clip_means,
+        mean_box_penalty_coef=network.mean_box_penalty_coef,
         low=low,
         high=high,
         target_tau=ppo.target_tau,

@@ -97,6 +97,58 @@ def _std_bias_init(low: chex.Array, high: chex.Array, num_components: int) -> Ca
     return init_fn
 
 
+def _has_width(low: chex.Array, high: chex.Array) -> chex.Array:
+    """Per action dimension: is there room inside the box for a mean to move?"""
+    return (high - low) > 0.0
+
+
+def project_means_to_box(means: chex.Array, low: chex.Array, high: chex.Array) -> chex.Array:
+    """`clip(means, low, high)`, straight-through: the raw mean still gets a gradient.
+
+    A plain `jnp.clip` has zero derivative outside the box, so a mean that ever
+    leaves it stops being trained at all at that observation -- it can only
+    move again as a side effect of the torso shifting for *other* inputs. Here
+    the value every consumer sees is the projected mean, while the derivative
+    w.r.t. the mean head is the identity: the gradient the loss takes at the
+    boundary is the one the raw mean receives.
+
+    On its own that trades a dead gradient for an unbounded one -- see
+    `mean_box_excess` for the restoring force that goes with it.
+
+    A zero-width dimension (`configs/kuhn_classic.yaml`'s fixed bet size, where
+    `min_bet == max_bet`) is the one case a dead gradient is the right answer:
+    the mean is a constant the game leaves nothing to learn about, so passing
+    it a gradient only feeds noise through the shared torso into the heads that
+    do matter. Those dimensions stay frozen.
+    """
+    projected = jnp.clip(means, low, high)
+    return jnp.where(
+        _has_width(low, high),
+        means + jax.lax.stop_gradient(projected - means),
+        jax.lax.stop_gradient(projected),
+    )
+
+
+def mean_box_excess(means: chex.Array, low: chex.Array, high: chex.Array) -> chex.Array:
+    """Summed squared distance of `means` from `[low, high]`; `0.0` inside the box.
+
+    Weighted by `mean_box_penalty_coef` and added to the PPO loss, this is the
+    restoring force `project_means_to_box` lacks. It is needed because the
+    outward pressure is real, not hypothetical: the Gaussian factor scores
+    `Episode.raw_action`, the *unclipped* sample (only the action handed to the
+    game is clipped), so whenever the optimal action is the boundary itself the
+    good advantage sits on samples past it and `dlogp/dmu` keeps pointing out.
+    Straight-through, the raw mean would walk out arbitrarily far -- behaving
+    correctly the whole time, since the projected mean stays pinned to the
+    boundary, but owing every one of those steps back the moment the optimum
+    moves inward. The penalty parks it just outside instead, where the outward
+    policy gradient balances the inward pull.
+    """
+    excess = jnp.maximum(means - high, 0.0) + jnp.maximum(low - means, 0.0)
+    # Frozen dimensions (see `project_means_to_box`) have nothing to pull back.
+    return jnp.sum(jnp.where(_has_width(low, high), jnp.square(excess), 0.0))
+
+
 class MixtureActorCritic(nn.Module):
     """Shared torso, four linear heads: component logits, means, log-stds, value.
     """
@@ -113,8 +165,16 @@ class MixtureActorCritic(nn.Module):
 
     @nn.compact
     def __call__(
-        self, obs: chex.Array, train: bool = False
+        self, obs: chex.Array, train: bool = False, project_means: bool = True
     ) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+        """`project_means=False` returns the mean head *unprojected*.
+
+        Only the loss passes it: the projection is not invertible, so a caller
+        that needs to know how far outside the box the raw mean sits (to
+        penalize it, see `mean_box_excess`) has to do the projection itself.
+        Everything that just wants to act -- rollouts, best responses,
+        evaluation -- takes the default and sees in-box means.
+        """
         torso = obs
         for dim in self.hidden_dims:
             torso = nn.Dense(dim)(torso)
@@ -130,8 +190,8 @@ class MixtureActorCritic(nn.Module):
             name="means_head",
         )(torso)
         means = means_flat.reshape(self.num_components, self.action_dim)
-        if self.clip_means:
-            means = jnp.clip(means, self.low, self.high)
+        if self.clip_means and project_means:
+            means = project_means_to_box(means, self.low, self.high)
 
         log_std_flat = nn.Dense(
             self.num_components * self.action_dim,
@@ -455,6 +515,7 @@ def mixture_ppo_loss_from_outputs(
     trpo_gaussian_kl_coef: float,
     magnet_category_kl_coef: float,
     magnet_gaussian_kl_coef: float,
+    mean_box_penalty: chex.Array = 0.0,
 ) -> tuple[chex.Array, dict[str, chex.Array]]:
     """Clipped-surrogate PPO loss plus KL penalties, for a single (unbatched) `Episode`,
     given the current policy's already-computed forward pass at `episode.obs`.
@@ -481,6 +542,13 @@ def mixture_ppo_loss_from_outputs(
     than computed from `episode.reward`/`episode.value` here, because
     normalization is a batch-wide statistic and so has to happen before
     vmapping.
+
+    `mean_box_penalty` arrives already weighted by `mean_box_penalty_coef`
+    (see `projected_means_and_penalty`): the projection that `means` went
+    through has thrown away how far outside the box the raw mean head was, so
+    the term has to be computed by the caller that still holds the raw means.
+    It is a property of the observation, not of the sample, so it is identical
+    for every sample sharing an `obs`.
 
     Atoms and legality masks both act by *zeroing* terms rather than by
     branching. For a sample that drew an atom, the Gaussian ratio, its clipped
@@ -557,6 +625,7 @@ def mixture_ppo_loss_from_outputs(
         + trpo_gaussian_kl_coef * trpo_gaussian_kl
         + magnet_category_kl_coef * magnet_category_kl
         + magnet_gaussian_kl_coef * magnet_gaussian_kl
+        + mean_box_penalty
     )
 
     category_approx_kl = old_category_log_prob - new_category_log_prob
@@ -586,8 +655,29 @@ def mixture_ppo_loss_from_outputs(
         "magnet_kl": magnet_category_kl + magnet_gaussian_kl,
         "magnet_category_kl": magnet_category_kl,
         "magnet_gaussian_kl": magnet_gaussian_kl,
+        "mean_box_penalty": jnp.asarray(mean_box_penalty, dtype=jnp.float32),
     }
     return loss, metrics
+
+
+def projected_means_and_penalty(
+    network: MixtureActorCritic,
+    raw_means: chex.Array,
+    mean_box_penalty_coef: float,
+) -> tuple[chex.Array, chex.Array]:
+    """The means the loss should score, and the box penalty to add to that loss.
+
+    Splits what `MixtureActorCritic.__call__` does in one step when it is only
+    asked to act: the loss runs the forward pass with `project_means=False` and
+    redoes the projection here, so that the raw means are still in hand for
+    `mean_box_excess`. With `clip_means` off there is no box to speak of --
+    means pass through and the penalty is exactly zero.
+    """
+    if not network.clip_means:
+        return raw_means, jnp.zeros(())
+    means = project_means_to_box(raw_means, network.low, network.high)
+    penalty = mean_box_penalty_coef * mean_box_excess(raw_means, network.low, network.high)
+    return means, penalty
 
 
 def mixture_ppo_loss(
@@ -603,14 +693,20 @@ def mixture_ppo_loss(
     trpo_gaussian_kl_coef: float,
     magnet_category_kl_coef: float,
     magnet_gaussian_kl_coef: float,
+    mean_box_penalty_coef: float = 0.0,
 ) -> tuple[chex.Array, dict[str, chex.Array]]:
     """`mixture_ppo_loss_from_outputs`, forward-passing `params` at `episode.obs` first."""
-    logits, means, log_stds, value_pred = network.apply(params, episode.obs)
+    logits, raw_means, log_stds, value_pred = network.apply(
+        params, episode.obs, project_means=False
+    )
+    means, mean_box_penalty = projected_means_and_penalty(
+        network, raw_means, mean_box_penalty_coef
+    )
     return mixture_ppo_loss_from_outputs(
         logits, means, log_stds, value_pred, network.num_atoms, episode, advantage,
         clip_eps, value_coef, category_entropy_coef, gaussian_entropy_coef,
         trpo_category_kl_coef, trpo_gaussian_kl_coef,
-        magnet_category_kl_coef, magnet_gaussian_kl_coef,
+        magnet_category_kl_coef, magnet_gaussian_kl_coef, mean_box_penalty,
     )
 
 
@@ -622,11 +718,13 @@ def build_mixture_ppo_loss_fn(
     trpo_gaussian_kl_coef: float,
     magnet_category_kl_coef: float,
     magnet_gaussian_kl_coef: float,
+    mean_box_penalty_coef: float = 0.0,
     shared_obs: bool = False,
 ):
     """`player`'s PPO loss over a whole `Episode` batch, one-shot or sequential alike.
 
-    Binds the six per-head entropy/KL coefficients (constant for one
+    Binds the six per-head entropy/KL coefficients and the mean-box penalty
+    coefficient (all constant for one
     `ppo_update` call) and returns a function matching `ppo_update`'s
     `loss_fn` contract: `(params, network, batch, clip_eps, value_coef,
     entropy_coef) -> (scalar_loss, dict_of_scalar_metrics)`. `entropy_coef`
@@ -683,18 +781,27 @@ def build_mixture_ppo_loss_fn(
         flat_weight, flat_advantage = weight.reshape(-1), advantage.reshape(-1)
 
         if shared_obs:
-            logits, means, log_stds, value_pred = network.apply(params, flat.obs[0])
+            logits, raw_means, log_stds, value_pred = network.apply(
+                params, flat.obs[0], project_means=False
+            )
+            means, mean_box_penalty = projected_means_and_penalty(
+                network, raw_means, mean_box_penalty_coef
+            )
             per_sample_loss, metrics = jax.vmap(
                 mixture_ppo_loss_from_outputs,
-                in_axes=(None, None, None, None, None, 0, 0, None, None, None, None, None, None, None, None),
+                in_axes=(None, None, None, None, None, 0, 0, None, None, None, None, None, None, None, None, None),
             )(
                 logits, means, log_stds, value_pred, network.num_atoms, flat, flat_advantage,
-                clip_eps, value_coef, *coefs,
+                clip_eps, value_coef, *coefs, mean_box_penalty,
             )
         else:
             per_sample_loss, metrics = jax.vmap(
-                mixture_ppo_loss, in_axes=(None, None, 0, 0, None, None, None, None, None, None, None, None)
-            )(params, network, flat, flat_advantage, clip_eps, value_coef, *coefs)
+                mixture_ppo_loss,
+                in_axes=(None, None, 0, 0, None, None, None, None, None, None, None, None, None),
+            )(
+                params, network, flat, flat_advantage, clip_eps, value_coef, *coefs,
+                mean_box_penalty_coef,
+            )
 
         loss = masked_mean(per_sample_loss, flat_weight)
         metrics = jax.tree_util.tree_map(lambda m: masked_mean(m, flat_weight), metrics)

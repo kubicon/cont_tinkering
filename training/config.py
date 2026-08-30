@@ -63,6 +63,11 @@ class MixturePPOHyperparams(PPOHyperparams):
     low: tuple[float, ...] = (0.0,)
     high: tuple[float, ...] = (1.0,)
     clip_means: bool = False  # constrain the mean head to `[low, high]`; see `MixtureActorCritic`
+    # Weight on the squared distance of the *raw* mean head from `[low, high]`
+    # (see `training.mixture.mean_box_excess`). Inert unless `clip_means`, whose
+    # straight-through projection is what needs the restoring force. In squared
+    # action units, so its natural scale follows the width of the action box.
+    mean_box_penalty_coef: float = 0.0
 
     # Target/magnet parameter tracking (see `training.mixture_trainer.MixtureTrainState`).
     target_tau: float = 0.005  # Polyak-averaging coefficient for `target_params`.

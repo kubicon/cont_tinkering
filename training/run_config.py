@@ -31,6 +31,9 @@ class NetworkConfig:
     normalization: str = "rms_norm"
     num_components: int = 2
     clip_means: bool = False  # constrain the mean head to the action box; see `MixtureActorCritic`
+    # Pulls a mean that drifts out of the box back to its edge; only bites with
+    # `clip_means` on. See `training.mixture.mean_box_excess`.
+    mean_box_penalty_coef: float = 1.0
 
 
 @dataclasses.dataclass

@@ -62,7 +62,7 @@ def update_target_and_magnet(
 
 
 def build_loss_fn(player: int, hyperparams: MixturePPOHyperparams, shared_obs: bool = False):
-    """`build_mixture_ppo_loss_fn` with the six per-head coefficients read off `hyperparams`.
+    """`build_mixture_ppo_loss_fn` with every loss coefficient read off `hyperparams`.
 
     The coefficients always travel together and always come from the same
     dataclass; naming them one by one at five call sites only created five
@@ -76,6 +76,7 @@ def build_loss_fn(player: int, hyperparams: MixturePPOHyperparams, shared_obs: b
         hyperparams.trpo_gaussian_kl_coef,
         hyperparams.magnet_category_kl_coef,
         hyperparams.magnet_gaussian_kl_coef,
+        mean_box_penalty_coef=hyperparams.mean_box_penalty_coef,
         shared_obs=shared_obs,
     )
 

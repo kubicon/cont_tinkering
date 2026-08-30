@@ -33,15 +33,22 @@ The older standalone schema (`mmd:` / `init:` / `log:` -- see
 `configs/idealized_*.yaml`) is still accepted; it is selected automatically by
 the presence of an `mmd:` section.
 
-Two payoff backends, auto-selected (override with `idealized.backend`):
+Three payoff backends; the first two are auto-selected (override with
+`idealized.backend`):
 
   closed_form -- exact Gaussian convolutions. Requires the game to expose the
                  `MultiPointGame` structure (`.peaks`, `._target_moments`, ...);
                  covers `multi_point` and `decoy_well`. Self-play only.
   quadrature  -- discretizes the action interval and integrates numerically.
                  Works for ANY 1-D box game (`quadratic`, `forsaken`,
-                 `matching_pennies`, ...), at the cost of grid error, and is
-                 the only backend that supports `train.mode: fixed_opponent`.
+                 `matching_pennies`, ...), at the cost of grid error.
+  sampled     -- the middle ground with `train.py`: the tabular mirror step is
+                 kept, but the payoff integral is replaced by `ppo.batch_size`
+                 Monte-Carlo action draws per iteration, exactly as a rollout
+                 does. Never auto-selected -- ask for it with
+                 `idealized.backend: sampled`. `idealized.samples -> inf`
+                 recovers the quadrature run, which makes the sample count a
+                 dial between the two scripts with nothing else changing.
 
 Example:
   python run_idealized.py configs/quadratic.yaml
@@ -54,7 +61,7 @@ import argparse
 import dataclasses
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -95,6 +102,29 @@ class IdealizedSection:
                                            #   `gaussian_entropy: marginal` term on
     normalize_density: bool = True         # renormalize each mixture on the grid, so a
                                            #   component narrower than `dx` keeps its mass
+
+    # --- `backend: sampled` only. The payoff integral becomes an average over
+    #     `samples` joint action draws, redrawn once per iteration (and reused
+    #     across the `ppo_epochs` gradient steps, as a PPO batch is). ---
+    samples: int | None = None             # draws per iteration; None -> `ppo.batch_size`
+    sample_seed: int | None = None         # None -> `train.seed`
+    q_estimator: str = "responsibility"    # how the per-component q_k are estimated:
+                                           #   "responsibility": self-normalized importance
+                                           #     weights w_k N(a|k)/p_mix(a) over the on-policy
+                                           #     batch -- every draw informs every component,
+                                           #     and the batch costs exactly `samples` payoffs
+                                           #   "per_component": draw a separate batch from each
+                                           #     component. Unbiased and low-variance, but costs
+                                           #     K x `samples` payoffs and is off-policy.
+                                           #   "onpolicy": average over the draws that actually
+                                           #     picked k, which is what PPO's advantage sees.
+    grad_estimator: str = "pathwise"       # Gaussian-head gradient: "pathwise" reparameterizes
+                                           #   (needs a payoff differentiable in the action, and
+                                           #   is far lower variance); "score" is REINFORCE with
+                                           #   a batch-mean baseline, as PPO's surrogate is.
+    entropy_source: str = "sampled"        # "sampled": -log p_mix at the sampled action, exactly
+                                           #   what `mixture_ppo_loss` adds. "exact": the grid
+                                           #   integral. See `SampledBackend.entropy`.
 
     # --- std bounds. `std_max: null` mirrors `MixtureActorCritic`'s own ceiling,
     #     `log(high - low)`; `std_min` mirrors its `LOG_STD_MIN` floor. ---
@@ -151,6 +181,8 @@ class SolverConfig:
     # --- core MMD ---
     lr: float = 1e-3               # eta (`optimizer.learning_rate`)
     num_components: int = 2        # K  (`network.num_components`)
+    batch_size: int = 256          # sampled backend only (`ppo.batch_size`)
+    seed: int = 0                  # sampled backend only (`train.seed`)
     magnet_interval: int = 500
     target_tau: float = 0.001      # EMA of the mixture params, reported alongside
 
@@ -189,13 +221,23 @@ _UNUSED_SHARED_FIELDS = {
     ("network", "activation"): "no network",
     ("network", "normalization"): "no network",
     ("network", "clip_means"): "the solver always projects means onto the box (`player_step`)",
+    ("network", "mean_box_penalty_coef"): "nothing to pull back -- the solver's projection is exact, "
+                                          "not a straight-through one",
     ("optimizer", "max_grad_norm"): "clips gradients w.r.t. network weights, which do not exist here",
     ("optimizer", "optimizer"): "the update is mirror/natural-gradient, not Adam",
     ("optimizer", "weight_decay"): "no network weights to decay",
-    ("ppo", "clip_eps"): "no importance ratios without sampling",
-    ("ppo", "value_coef"): "no critic -- the payoff integral is exact",
+    ("ppo", "clip_eps"): "the update is a mirror step at the current policy, not a "
+                         "ratio-clipped surrogate",
+    ("ppo", "value_coef"): "no critic -- the baseline is the exact payoff, or (sampled "
+                           "backend) the batch mean",
     ("ppo", "batch_size"): "the payoff integral is exact (this is the noise knob PPO needs)",
     ("train", "seed"): "the dynamics are deterministic",
+}
+
+# ... except under `backend: sampled`, which is exactly the backend that needs them.
+_SAMPLED_SHARED_FIELDS = {
+    ("ppo", "batch_size"): "action draws per iteration (unless `idealized.samples` overrides it)",
+    ("train", "seed"): "seeds those draws (unless `idealized.sample_seed` overrides it)",
 }
 
 
@@ -219,6 +261,8 @@ def _shared_to_solver(cfg: RunConfig, idealized: IdealizedSection) -> SolverConf
         inner_steps=cfg.ppo.ppo_epochs,
         lr=cfg.optimizer.learning_rate,
         num_components=cfg.network.num_components,
+        batch_size=cfg.ppo.batch_size,
+        seed=cfg.train.seed,
         magnet_interval=cfg.ppo.magnet_interval,
         target_tau=cfg.ppo.target_tau,
         category_entropy_coef=cfg.ppo.category_entropy_coef,
@@ -352,6 +396,13 @@ def load_config(path: str | Path) -> tuple[Any, SolverConfig, RunConfig | None]:
 # per-component q-values, and exploitability. The quadrature backend's handle is a
 # density on a grid, which is what lets a non-mixture opponent (uniform, or a point
 # mass) be plugged in for `train.mode: fixed_opponent`.
+#
+# Every method also takes the iteration's `noise` and the acting `player`, which only
+# a stochastic backend (`SampledBackend`, whose handle is a batch of sampled actions)
+# reads: the deterministic ones ignore both. `stochastic` says which kind it is, and
+# a stochastic backend carries a deterministic `.metrics` backend that the reported
+# exploitability is computed with -- a metric as noisy as the thing it measures would
+# say nothing.
 
 
 def _density_grid(lo: float, hi: float, n: int, std_max: float):
@@ -390,6 +441,7 @@ class ClosedFormBackend:
 
     name = "closed_form"
     supports_fixed_opponent = False
+    stochastic = False
 
     def __init__(self, game: ZeroSumGame, grid, dx: float, normalize: bool):
         self.game = game
@@ -397,19 +449,19 @@ class ClosedFormBackend:
         # `entropy` still needs a grid -- see the note on `entropy` below.
         self._grid, self._dx, self._normalize = grid, dx, normalize
 
-    def handle(self, p: Params) -> Params:
+    def handle(self, p: Params, noise=None, player: int = 0) -> Params:
         return p
 
     def expected_payoff(self, h0, h1):
         return closed_form_expected_payoff(h0, h1, self.game)
 
-    def component_q(self, p: Params, h_opp, sign: float):
+    def component_q(self, p: Params, h_opp, sign: float, noise=None):
         return closed_form_component_q(p, h_opp, self.game, sign)
 
     def exploitability(self, h0, h1):
         return closed_form_exploitability(h0, h1, self.game)
 
-    def entropy(self, p: Params):
+    def entropy(self, p: Params, noise=None, player: int = 0):
         """Exact differential entropy of the mixture, integrated on a grid.
 
         There is no closed form for it, but the per-component surrogate
@@ -435,6 +487,7 @@ class QuadratureBackend:
 
     name = "quadrature"
     supports_fixed_opponent = True
+    stochastic = False
 
     def __init__(self, game: ZeroSumGame, n: int, std_max: float, normalize: bool):
         space = game.action_space(0)
@@ -454,7 +507,7 @@ class QuadratureBackend:
         self.R = jnp.asarray(pay, dtype=jnp.float64)  # (n, n)
 
     # -- handles -----------------------------------------------------------
-    def handle(self, p: Params):
+    def handle(self, p: Params, noise=None, player: int = 0):
         w = jax.nn.softmax(p.logits)
         return jnp.sum(w[:, None] * self.component_densities(p), axis=0)  # (n,)
 
@@ -473,9 +526,17 @@ class QuadratureBackend:
     def expected_payoff(self, h0, h1):
         return (h0 @ self.R @ h1) * self.dx**2
 
-    def component_q(self, p: Params, h_opp, sign: float):
-        """Per-component expected utility `q_k = E_{a~N(mu_k, s_k)}[ this player's utility ]`."""
-        u = sign * (self.R @ h_opp) * self.dx           # utility of a *pure* action a
+    def component_q(self, p: Params, h_opp, sign: float, noise=None):
+        """Per-component expected utility `q_k = E_{a~N(mu_k, s_k)}[ this player's utility ]`.
+
+        `R` is indexed `[player 0's action, player 1's action]`, so which side of it the
+        opponent's density is contracted against depends on who is asking: player 0 gets
+        `R @ d1`, player 1 gets `-(d0 @ R)`. The two agree only for a payoff that is
+        antisymmetric under swapping the players (`multi_point`, `matching_pennies`);
+        for `quadratic` with a nonzero coupling, or any other game whose two players do
+        not share one landscape, they do not.
+        """
+        u = (self.R @ h_opp if sign > 0 else -(h_opp @ self.R)) * self.dx  # utility of a *pure* action
         return (self.component_densities(p) @ u) * self.dx
 
     def exploitability(self, h0, h1):
@@ -486,10 +547,228 @@ class QuadratureBackend:
         br1 = jnp.min(jnp.where(self.in_box, v1, jnp.inf))
         return (br0 - U) + (U - br1)
 
-    def entropy(self, p: Params):
+    def entropy(self, p: Params, noise=None, player: int = 0):
         """Exact differential entropy of the mixture -- what `mixture_ppo_loss`
         estimates with `-mixture_marginal_log_prob(...)` at the sampled action."""
         return _marginal_entropy(p, self.grid, self.dx, self.normalize)
+
+
+class SampledNoise(NamedTuple):
+    """One iteration's rollout randomness, drawn once and reused by every gradient step.
+
+    Reused, not redrawn, because that is what `train.py` does: a rollout is collected
+    once and `ppo.ppo_epochs` gradient steps are taken against it. Freezing `eps` and
+    `comp` (rather than the actions themselves) is what lets the same batch stay
+    differentiable as the means and stds move within the iteration -- common random
+    numbers, the sampled analogue of the exact solver re-integrating at every step.
+    """
+
+    eps: jnp.ndarray = None      # (2, N) standard normals, one row per player
+    comp: jnp.ndarray = None     # (2, N) component indices drawn from the rollout policy
+    unif: jnp.ndarray = None     # (N,)   uniform draws in the box, for a `random` fixed opponent
+
+
+class SampledHandle(NamedTuple):
+    """A batch of actions a player is playing, plus their log-probs for `score`."""
+
+    actions: jnp.ndarray = None   # (N, 1)
+    log_prob: jnp.ndarray = None  # (N,), differentiable w.r.t. this player's params
+
+
+def _gaussian_log_prob(a, mean, log_std):
+    """`log N(a | mean, exp(log_std))`, broadcasting."""
+    z = (a - mean) / jnp.exp(log_std)
+    return -0.5 * z**2 - log_std - 0.5 * float(np.log(2 * np.pi))
+
+
+class SampledBackend:
+    """Monte-Carlo payoffs: the middle ground between this solver and `train.py`.
+
+    The policy, the mirror step on the simplex and the natural-gradient step on the
+    Gaussians are the exact ones -- only the two quantities that touch the game are
+    estimated from `samples` joint action draws per iteration:
+
+      q_k = E_{a~N(mu_k,s_k)}[u(a, b)]     -> `component_q`, see `q_estimator`
+      grad_(mu, log_std) E[u]              -> `expected_payoff`, see `grad_estimator`
+
+    Everything else in the objective (the magnet KL, the trust-region KL, the
+    repulsion term) is closed-form *in the parameters*, so it stays exact and the
+    noise enters at exactly one place. That is the point of the backend: `train.py`
+    differs from the exact solver in four ways at once (sampling, a learned critic
+    baseline, PPO's clipped ratios, and an MLP trained with Adam), and this isolates
+    the first.
+
+    The batch costs `samples` payoff evaluations per iteration, the same budget a
+    `ppo.batch_size` rollout spends -- except under `q_estimator: per_component`,
+    which spends K times that.
+    """
+
+    name = "sampled"
+    supports_fixed_opponent = True
+    stochastic = True
+
+    _Q_ESTIMATORS = ("responsibility", "per_component", "onpolicy")
+    _GRAD_ESTIMATORS = ("pathwise", "score")
+    _ENTROPY_SOURCES = ("sampled", "exact")
+
+    def __init__(self, game: ZeroSumGame, cfg: "SolverConfig", metrics: QuadratureBackend):
+        i = cfg.idealized
+        self.game = game
+        self.metrics = metrics          # exact grid; only the reported metrics use it
+        self.lo, self.hi = metrics.lo, metrics.hi
+        self.n = int(i.samples) if i.samples is not None else int(cfg.batch_size)
+        if self.n < 1:
+            raise ValueError(f"idealized.samples must be >= 1, got {self.n}")
+        self.seed = int(i.sample_seed) if i.sample_seed is not None else int(cfg.seed)
+        for value, allowed, field in ((i.q_estimator, self._Q_ESTIMATORS, "q_estimator"),
+                                      (i.grad_estimator, self._GRAD_ESTIMATORS, "grad_estimator"),
+                                      (i.entropy_source, self._ENTROPY_SOURCES, "entropy_source")):
+            if value not in allowed:
+                raise ValueError(f"unknown idealized.{field} {value!r}, choices: {list(allowed)}")
+        self.q_estimator, self.grad_estimator = i.q_estimator, i.grad_estimator
+        self.entropy_source = i.entropy_source
+        self._payoff = jax.vmap(game.payoff)     # (N, 1), (N, 1) -> (N,)
+        self.detail = (f"{self.n} draws/iteration, seed {self.seed}, q={self.q_estimator}, "
+                       f"grad={self.grad_estimator}, entropy={self.entropy_source}")
+
+    # -- the batch ---------------------------------------------------------
+    def draw_noise(self, key: jnp.ndarray, p0: Params, p1: Params) -> SampledNoise:
+        """The iteration's rollout draws. Components come from the policy at the *start*
+        of the iteration, which is the policy `train.py` would have rolled out."""
+        k_eps, k_c0, k_c1, k_u = jax.random.split(key, 4)
+        return SampledNoise(
+            eps=jax.random.normal(k_eps, (2, self.n), dtype=jnp.float64),
+            comp=jnp.stack([jax.random.categorical(k_c0, p0.logits, shape=(self.n,)),
+                            jax.random.categorical(k_c1, p1.logits, shape=(self.n,))]),
+            unif=jax.random.uniform(k_u, (self.n,), dtype=jnp.float64,
+                                    minval=self.lo, maxval=self.hi),
+        )
+
+    def _actions(self, p: Params, noise: SampledNoise, player: int):
+        """Reparameterized draws `a_n = mu_{k_n} + s_{k_n} * eps_n`, and their log-probs."""
+        eps, comp = noise.eps[player], noise.comp[player]
+        mean, log_std = p.means[comp], p.log_std[comp]
+        return mean + jnp.exp(log_std) * eps, mean, log_std
+
+    def handle(self, p: Params, noise: SampledNoise = None, player: int = 0) -> SampledHandle:
+        actions, mean, log_std = self._actions(p, noise, player)
+        if self.grad_estimator == "score":
+            # REINFORCE differentiates the log-prob, not the action, so the action is
+            # cut off the graph exactly as a PPO rollout's stored `raw_action` is.
+            actions = jax.lax.stop_gradient(actions)
+            log_prob = _gaussian_log_prob(actions, mean, log_std)
+        else:
+            log_prob = jnp.zeros_like(actions)
+        return SampledHandle(actions=actions[:, None], log_prob=log_prob)
+
+    def fixed_handle(self, kind: str, noise: SampledNoise) -> SampledHandle:
+        """The non-training opponent's batch, for `train.mode: fixed_opponent`.
+
+        `random` draws uniformly from the box each iteration, which is exactly what
+        `train.py`'s `space.sample` opponent does -- unlike the quadrature backend,
+        which integrates against the uniform *density* and so never sees that noise.
+        """
+        if kind == "random":
+            actions = noise.unif
+        elif kind == "static":
+            actions = jnp.full((self.n,), 0.5 * (self.lo + self.hi), dtype=jnp.float64)
+        else:
+            raise ValueError(f"unknown train.opponent {kind!r}")
+        return SampledHandle(actions=actions[:, None], log_prob=jnp.zeros_like(actions))
+
+    # -- questions ---------------------------------------------------------
+    def expected_payoff(self, h0, h1):
+        """MC estimate of `E[payoff]`, differentiable w.r.t. whichever side is traced.
+
+        `pathwise` differentiates the payoff through the reparameterized action:
+        `d/dmu_k E[u] = E[ 1{k_n = k} du/da ]`, which is the exact gradient in
+        expectation and has a fraction of REINFORCE's variance -- but it needs a
+        payoff that is differentiable in the action (every game in `games/` is; a
+        step-shaped payoff would silently return a zero gradient).
+
+        `score` is REINFORCE with the batch mean as its baseline, wrapped in the DiCE
+        trick so the returned *value* is still the plain MC mean while the gradient is
+        `E[(u - b) grad log pi(a)]`. That is the estimator behind PPO's surrogate,
+        minus the clipped importance ratio.
+        """
+        u = self._payoff(h0.actions, h1.actions)
+        if self.grad_estimator == "pathwise":
+            return jnp.mean(u)
+        u = jax.lax.stop_gradient(u)
+        baseline = jnp.mean(u)
+        lp = h0.log_prob + h1.log_prob                    # the untraced side contributes a constant
+        dice = jnp.exp(lp - jax.lax.stop_gradient(lp))    # == 1 in value, grad log pi in gradient
+        return jnp.mean((u - baseline) * dice) + baseline
+
+    def component_q(self, p: Params, h_opp, sign: float, noise: SampledNoise = None):
+        """Estimate `q_k = E_{a~N(mu_k,s_k)}[ this player's utility ]` for every component.
+
+        No gradient is taken through `q` -- it feeds the closed-form simplex update --
+        so the estimators are free to be non-differentiable.
+
+        `responsibility` reweights the one on-policy batch by each component's
+        responsibility `r_nk = w_k N(a_n|k) / p_mix(a_n)`: self-normalized importance
+        sampling with the mixture as its proposal. Every draw informs every component,
+        which is strictly more than `onpolicy` gets out of the same batch -- though as
+        the components separate the responsibilities go to 0/1 and the two coincide,
+        so a well-separated mixture cannot be rescued from the low-weight-component
+        starvation that `onpolicy` (and PPO) suffer.
+
+        `per_component` is the honest unbiased estimator -- a fresh batch per component,
+        sharing `eps` as common random numbers -- at K times the payoff budget.
+        """
+        player = 0 if sign > 0 else 1
+        b = h_opp.actions
+
+        def utility(a):                                   # a: (N, 1) -> (N,)
+            return self._payoff(a, b) if sign > 0 else -self._payoff(b, a)
+
+        if self.q_estimator == "per_component":
+            eps = noise.eps[player]
+            a = p.means[:, None] + jnp.exp(p.log_std)[:, None] * eps[None, :]   # (K, N)
+            return jax.vmap(lambda a_k: jnp.mean(utility(a_k[:, None])))(a)
+
+        actions, _, _ = self._actions(p, noise, player)
+        u = utility(actions[:, None])                     # (N,)
+
+        if self.q_estimator == "onpolicy":
+            onehot = jax.nn.one_hot(noise.comp[player], p.means.shape[0], dtype=jnp.float64)
+            count = jnp.sum(onehot, axis=0)               # (K,)
+            total = onehot.T @ u
+            # a component nobody sampled gets the batch mean: no information means no
+            # relative advantage, and a constant drops out of the softmax update.
+            return jnp.where(count > 0, total / jnp.maximum(count, 1.0), jnp.mean(u))
+
+        log_r = (jax.nn.log_softmax(p.logits)[None, :]
+                 + _gaussian_log_prob(actions[:, None], p.means[None, :], p.log_std[None, :]))
+        r = jax.nn.softmax(log_r, axis=-1)                # (N, K), rows sum to 1
+        return (r.T @ u) / jnp.maximum(jnp.sum(r, axis=0), 1e-300)
+
+    def entropy(self, p: Params, noise: SampledNoise = None, player: int = 0):
+        """`entropy_source: sampled` is `-log p_mix(a_n)` at the sampled action, averaged
+        -- character for character what `mixture_ppo_loss` adds to its loss.
+
+        Worth knowing what that term does here: the action is detached, so the estimate
+        differentiates only the density, and `E_{a~p}[grad -log p(a)]` is `-grad int p`,
+        which is *zero*. The sampled entropy bonus is therefore a mean-zero gradient --
+        variance with no drift -- while the exact solver's is a real force pushing the
+        stds up. Set `entropy_source: exact` to compare against that force; the gap
+        between the two runs is how much `gaussian_entropy_coef` is actually buying
+        `train.py`.
+        """
+        if self.entropy_source == "exact":
+            return self.metrics.entropy(p)
+        actions, _, _ = self._actions(p, noise, player)
+        actions = jax.lax.stop_gradient(actions)
+        log_p = jax.nn.logsumexp(
+            jax.nn.log_softmax(p.logits)[None, :]
+            + _gaussian_log_prob(actions[:, None], p.means[None, :], p.log_std[None, :]),
+            axis=-1,
+        )
+        return -jnp.mean(log_p)
+
+    def exploitability(self, h0, h1):
+        raise AssertionError("the sampled backend reports metrics through `.metrics`")
 
 
 def build_backend(game: ZeroSumGame, cfg: SolverConfig):
@@ -506,9 +785,14 @@ def build_backend(game: ZeroSumGame, cfg: SolverConfig):
         lo, hi = _bounds(game)
         grid, dx = _density_grid(lo, hi, cfg.idealized.grid_points, _std_max(game, cfg))
         return ClosedFormBackend(game, grid, dx, cfg.idealized.normalize_density)
-    if choice == "quadrature":
-        return QuadratureBackend(game, cfg.idealized.grid_points, _std_max(game, cfg),
-                                 cfg.idealized.normalize_density)
+    if choice in ("quadrature", "sampled"):
+        quadrature = QuadratureBackend(game, cfg.idealized.grid_points, _std_max(game, cfg),
+                                       cfg.idealized.normalize_density)
+        if choice == "quadrature":
+            return quadrature
+        # the grid is kept as the *metrics* backend: exploitability estimated off the
+        # same noisy batch it is meant to judge would be uninformative.
+        return SampledBackend(game, cfg, quadrature)
     raise ValueError(f"unknown idealized.backend {cfg.idealized.backend!r}")
 
 
@@ -674,18 +958,21 @@ def build_iteration(game: ZeroSumGame, cfg: SolverConfig, backend):
         trains[1 - cfg.perspective] = False
 
     if i.gaussian_entropy == "marginal":
-        entropy_term = backend.entropy           # exact mixture differential entropy
+        entropy_term = backend.entropy           # mixture differential entropy
     elif i.gaussian_entropy == "component":
-        entropy_term = lambda pp: jnp.sum(pp.log_std)  # noqa: E731 -- legacy per-component term
+        # noqa: E731 -- legacy per-component term
+        entropy_term = lambda pp, noise=None, player=0: jnp.sum(pp.log_std)
     else:
         raise ValueError(f"unknown idealized.gaussian_entropy {i.gaussian_entropy!r}")
 
-    def player_step(p: Params, h_opp, old: Params, magnet: Params, sign: float, lam, floor):
+    def player_step(p: Params, h_opp, old: Params, magnet: Params, sign: float, lam, floor,
+                    noise=None):
+        player = 0 if sign > 0 else 1
         # --- categorical head: exact mirror step on the simplex ---
         if i.freeze_weights:
             logits = p.logits
         else:
-            q = backend.component_q(p, h_opp, sign)
+            q = backend.component_q(p, h_opp, sign, noise)
             logits = categorical_mirror_update(
                 p.logits, q, magnet.logits, old.logits,
                 cfg.lr, cfg.magnet_category_kl_coef,
@@ -702,10 +989,10 @@ def build_iteration(game: ZeroSumGame, cfg: SolverConfig, backend):
             raise ValueError(f"unknown idealized.kl_weighting {i.kl_weighting!r}")
 
         def obj(pp: Params):
-            h = backend.handle(pp)
+            h = backend.handle(pp, noise, player)
             pay = (backend.expected_payoff(h, h_opp) if sign > 0
                    else -backend.expected_payoff(h_opp, h))
-            ent = cfg.gaussian_entropy_coef * entropy_term(pp)
+            ent = cfg.gaussian_entropy_coef * entropy_term(pp, noise, player)
             mag = cfg.magnet_gaussian_kl_coef * jnp.sum(
                 kl_w * gaussian_kl_per_component(pp.means, pp.log_std, magnet.means, magnet.log_std)
             )
@@ -726,19 +1013,27 @@ def build_iteration(game: ZeroSumGame, cfg: SolverConfig, backend):
                       log_std=jnp.clip(log_std, floor, log_std_hi))
 
     def iteration(carry, _):
-        p0, p1, m0, m1, e0, e1, fixed_handle, it = carry
+        p0, p1, m0, m1, e0, e1, fixed_handle, it, key = carry
         frac = it.astype(jnp.float64) / total
         lam, floor = repulsion_coef_at(cfg, frac), std_floor_at(cfg, frac)
         old0, old1 = p0, p1
 
+        # One batch per iteration, reused by every gradient step below -- a PPO rollout.
+        noise, fixed_h = None, fixed_handle
+        if backend.stochastic:
+            key, rollout_key = jax.random.split(key)
+            noise = backend.draw_noise(rollout_key, old0, old1)
+            if cfg.mode == "fixed_opponent":
+                fixed_h = backend.fixed_handle(cfg.opponent, noise)
+
         def grad_step(pair, _):
             a, b = pair
             # a non-training player is not a mixture at all (it may be uniform or a
-            # point mass), so its handle is the fixed density built in `run`.
-            h0 = backend.handle(a) if trains[0] else fixed_handle
-            h1 = backend.handle(b) if trains[1] else fixed_handle
-            na = player_step(a, h1, old0, m0, +1.0, lam, floor) if trains[0] else a
-            nb = player_step(b, h0, old1, m1, -1.0, lam, floor) if trains[1] else b
+            # point mass), so its handle is the fixed one built above / in `run`.
+            h0 = backend.handle(a, noise, 0) if trains[0] else fixed_h
+            h1 = backend.handle(b, noise, 1) if trains[1] else fixed_h
+            na = player_step(a, h1, old0, m0, +1.0, lam, floor, noise) if trains[0] else a
+            nb = player_step(b, h0, old1, m1, -1.0, lam, floor, noise) if trains[1] else b
             return (na, nb), None
 
         (p0, p1), _ = jax.lax.scan(grad_step, (p0, p1), None, length=cfg.inner_steps)
@@ -747,7 +1042,9 @@ def build_iteration(game: ZeroSumGame, cfg: SolverConfig, backend):
         snapshot = (it % cfg.magnet_interval) == 0
         m0, m1 = _tree_where(snapshot, p0, m0), _tree_where(snapshot, p1, m1)
         e0, e1 = _ema(p0, e0, cfg.target_tau), _ema(p1, e1, cfg.target_tau)
-        return (p0, p1, m0, m1, e0, e1, fixed_handle, it), None
+        # a stochastic backend redraws its fixed opponent above, from this iteration's
+        # noise, so what it carries here is the `None` `run` handed it.
+        return (p0, p1, m0, m1, e0, e1, fixed_handle, it, key), None
 
     return iteration
 
@@ -755,19 +1052,26 @@ def build_iteration(game: ZeroSumGame, cfg: SolverConfig, backend):
 def run(game: ZeroSumGame, cfg: SolverConfig, p0: Params, p1: Params):
     backend = build_backend(game, cfg)
 
-    fixed_handle = jnp.zeros_like(backend.handle(p0)) if backend.name == "quadrature" else None
+    # the exact backend the reported metrics are computed with: itself, unless it is
+    # stochastic, in which case its grid.
+    metrics = backend.metrics if backend.stochastic else backend
+
+    fixed_handle = jnp.zeros_like(metrics.handle(p0)) if metrics.name == "quadrature" else None
+    metric_fixed = fixed_handle
     if cfg.mode == "fixed_opponent":
         if not backend.supports_fixed_opponent:
             raise ValueError(
-                f"train.mode: fixed_opponent needs the quadrature backend "
+                f"train.mode: fixed_opponent needs the quadrature or sampled backend "
                 f"(the {backend.name} backend can only integrate two Gaussian mixtures)."
             )
         if cfg.opponent == "random":
-            fixed_handle = backend.uniform_handle()
+            metric_fixed = metrics.uniform_handle()
         elif cfg.opponent == "static":
-            fixed_handle = backend.point_handle(0.5 * (backend.lo + backend.hi))
+            metric_fixed = metrics.point_handle(0.5 * (metrics.lo + metrics.hi))
         else:
             raise ValueError(f"unknown train.opponent {cfg.opponent!r}")
+        # the sampled backend redraws its opponent batch every iteration instead
+        fixed_handle = None if backend.stochastic else metric_fixed
     elif cfg.mode != "self_play":
         raise ValueError(f"unknown train.mode {cfg.mode!r}")
 
@@ -775,15 +1079,15 @@ def run(game: ZeroSumGame, cfg: SolverConfig, p0: Params, p1: Params):
     chunk_fns: dict[int, Any] = {}
 
     def handles_of(a: Params, b: Params):
-        h0 = fixed_handle if (cfg.mode == "fixed_opponent" and cfg.perspective == 1) else backend.handle(a)
-        h1 = fixed_handle if (cfg.mode == "fixed_opponent" and cfg.perspective == 0) else backend.handle(b)
+        h0 = metric_fixed if (cfg.mode == "fixed_opponent" and cfg.perspective == 1) else metrics.handle(a)
+        h1 = metric_fixed if (cfg.mode == "fixed_opponent" and cfg.perspective == 0) else metrics.handle(b)
         return h0, h1
 
     # Not jitted: `idealized_mmd.exploitability` builds its best-response grid with
     # Python floats off the game object, so it cannot be traced. It runs once per
     # logged chunk, so eager execution costs nothing.
     def expl_fn(a, b):
-        return backend.exploitability(*handles_of(a, b))
+        return metrics.exploitability(*handles_of(a, b))
 
     def record(t: int, a: Params, b: Params, ea: Params, eb: Params) -> dict:
         return {
@@ -798,7 +1102,8 @@ def run(game: ZeroSumGame, cfg: SolverConfig, p0: Params, p1: Params):
             "std1": [float(x) for x in jnp.exp(b.log_std)],
         }
 
-    carry = (p0, p1, p0, p1, p0, p1, fixed_handle, jnp.zeros((), dtype=jnp.int64))
+    carry = (p0, p1, p0, p1, p0, p1, fixed_handle, jnp.zeros((), dtype=jnp.int64),
+             jax.random.PRNGKey(backend.seed if backend.stochastic else 0))
     history = [record(0, p0, p1, p0, p1)]
     done = 0
     for step, length in enumerate(cfg.chunks, start=1):
@@ -823,9 +1128,18 @@ def _fmt(w, mu, sd) -> str:
     return "[" + " ".join(f"{a:.2f}@{b:+.2f}(sd{c:.3f})" for a, b, c in zip(w, mu, sd)) + "]"
 
 
-def _report_unused(run_config: RunConfig) -> None:
+def _report_unused(run_config: RunConfig, cfg: SolverConfig) -> None:
+    sampled = cfg.idealized.backend == "sampled"
+    used = _SAMPLED_SHARED_FIELDS if sampled else {}
+    if used:
+        print("used by the sampled backend:")
+        for (section, field), why in used.items():
+            value = getattr(getattr(run_config, section), field)
+            print(f"  {section}.{field} = {value!r}  -- {why}")
     print("ignored (no idealized counterpart):")
     for (section, field), why in _UNUSED_SHARED_FIELDS.items():
+        if (section, field) in used:
+            continue
         value = getattr(getattr(run_config, section), field)
         print(f"  {section}.{field} = {value!r}  -- {why}")
     print("  ppo advantage normalization  -- PPO rescales its gradient by the batch's own "
@@ -839,6 +1153,7 @@ def _warn_grid(backend, history: list[dict]) -> None:
     components stay wide is unaffected by a coarse grid, and only the ones that
     collapse turn their payoff integral into a point mass at the nearest node.
     """
+    backend = backend.metrics if backend.stochastic else backend
     if backend.name != "quadrature":
         return
     reached = min(min(h["std0"] + h["std1"]) for h in history)
@@ -874,12 +1189,13 @@ def main() -> None:
     print(f"game    : {type(game).__name__}  {dataclasses.asdict(game_config)}")
     print(f"solver  : {dataclasses.asdict(cfg)}")
     if run_config is not None:
-        _report_unused(run_config)
+        _report_unused(run_config, cfg)
     print()
 
     p0f, p1f, history, backend = run(game, cfg, p0, p1)
     _warn_grid(backend, history)
-    print(f"\nbackend : {backend.name}  |  mode: {cfg.mode}"
+    detail = getattr(backend, "detail", None)
+    print(f"\nbackend : {backend.name}{f' ({detail})' if detail else ''}  |  mode: {cfg.mode}"
           f"{'' if cfg.mode == 'self_play' else f' (player {cfg.perspective} vs {cfg.opponent})'}"
           f"  |  {cfg.total_iters} iterations x {cfg.inner_steps} gradient step(s)\n")
 
