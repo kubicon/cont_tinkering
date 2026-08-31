@@ -35,7 +35,8 @@ import jax.numpy as jnp
 from games.base import ZeroSumGame
 from games.sequential import SequentialZeroSumGame
 from games.sequential_examples import ContinuousKuhnPoker
-from training.hyperparams import action_bounds, build_hyperparams
+from training.expfam_trainer import ExpFamilyPPOTrainer, ExpFamilySelfPlayPPOTrainer
+from training.hyperparams import action_bounds, build_expfam_hyperparams, build_hyperparams
 from training.kuhn_evaluation import build_kuhn_metric_fn, build_kuhn_strategy_log_fn
 from training.mixture import OpponentActionFn
 from training.mixture_trainer import MixturePPOTrainer, MixtureSelfPlayPPOTrainer
@@ -72,15 +73,27 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_one_shot(game: ZeroSumGame, config: RunConfig) -> None:
-    """Train on a single simultaneous move (`games.examples`)."""
+    """Train on a single simultaneous move (`games.examples`).
+
+    `network.policy` picks the parametrization: the default Gaussian mixture
+    (`training/mixture.py`) or the log-linear exponential family
+    (`training/expfam.py`). The two trainers take the same config and report the
+    same metrics, so a pair of runs differing only in that field is a controlled
+    comparison of the two policy classes.
+    """
+    expfam = config.network.policy == "exp_family"
+    build = build_expfam_hyperparams if expfam else build_hyperparams
+    self_play_cls = ExpFamilySelfPlayPPOTrainer if expfam else MixtureSelfPlayPPOTrainer
+    fixed_opponent_cls = ExpFamilyPPOTrainer if expfam else MixturePPOTrainer
+
     if config.train.mode == "self_play":
-        hyperparams_1 = build_hyperparams(game, 0, config)
-        hyperparams_2 = build_hyperparams(game, 1, config)
-        trainer = MixtureSelfPlayPPOTrainer(game, hyperparams_1, hyperparams_2, seed=config.train.seed)
+        trainer = self_play_cls(
+            game, build(game, 0, config), build(game, 1, config), seed=config.train.seed
+        )
     elif config.train.mode == "fixed_opponent":
-        hyperparams = build_hyperparams(game, config.train.perspective, config)
+        hyperparams = build(game, config.train.perspective, config)
         opponent_action_fn = build_opponent_action_fn(game, config.train.perspective, config.train.opponent)
-        trainer = MixturePPOTrainer(
+        trainer = fixed_opponent_cls(
             game, hyperparams, opponent_action_fn, perspective=config.train.perspective, seed=config.train.seed
         )
     else:
@@ -115,6 +128,12 @@ def run_sequential(game: SequentialZeroSumGame, config: RunConfig) -> None:
         raise ValueError(
             f"train.mode {config.train.mode!r} is not available for a sequential game; "
             "only 'self_play' is (there is no fixed-opponent tree rollout yet)"
+        )
+
+    if config.network.policy != "gaussian_mixture":
+        raise ValueError(
+            f"network.policy {config.network.policy!r} is one-shot only; a game tree needs the "
+            "mixture policy's atoms and legality masks (see training/expfam.py's scope note)"
         )
 
     hyperparams_0 = build_hyperparams(game, 0, config)

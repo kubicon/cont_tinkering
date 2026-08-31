@@ -24,8 +24,21 @@ import yaml
 from games.configs import GAME_CONFIGS
 
 
+POLICIES = ("gaussian_mixture", "exp_family")
+
+
 @dataclasses.dataclass
 class NetworkConfig:
+    # Which policy parametrization the one-shot trainers build.
+    #   "gaussian_mixture" -- `training.mixture.MixtureActorCritic` (the default;
+    #       a categorical over `num_components` Gaussians).
+    #   "exp_family"       -- `training.expfam.ExpFamilyActorCritic` (a log-linear
+    #       density over a fixed basis). Its entropy and KL terms are exact
+    #       rather than estimated; see that module's docstring. One-shot games
+    #       only -- a sequential run rejects it.
+    # The two read disjoint subsets of the fields below.
+    policy: str = "gaussian_mixture"
+
     hidden_dims: tuple[int, ...] = (64, 64)
     activation: str = "gelu"
     normalization: str = "rms_norm"
@@ -34,6 +47,16 @@ class NetworkConfig:
     # Pulls a mean that drifts out of the box back to its edge; only bites with
     # `clip_means` on. See `training.mixture.mean_box_excess`.
     mean_box_penalty_coef: float = 1.0
+
+    # `policy: exp_family` only -- the fixed basis; see `training.expfam.build_basis`.
+    grid_points: int = 256          # bins the piecewise-constant density lives on
+    num_basis: int = 8              # RBF bumps per action dimension
+    poly_order: int = 2             # monomials z^1..z^poly_order, z the box-normalized action
+    basis_width_scale: float = 1.0  # RBF width, in units of the RBF spacing
+    # Initial exponential tilt `p ~ exp(t*z)`. 0 starts the policy uniform on the
+    # box, which in a bilinear game is already a Nash -- set it nonzero to start
+    # off-equilibrium, as `idealized.init_means` does for the Gaussian runs.
+    init_tilt: float = 0.0
 
 
 @dataclasses.dataclass
@@ -64,6 +87,14 @@ class PPOConfig:
     trpo_gaussian_kl_coef: float = 0.05
     magnet_category_kl_coef: float = 0.2
     magnet_gaussian_kl_coef: float = 0.2
+
+    # `policy: exp_family` only. A log-linear density has one head, so it has one
+    # of each coefficient rather than the mixture's per-head pair. `null` (the
+    # default) reuses the corresponding `*_gaussian_*` value above, so an
+    # existing config runs under either policy without being rewritten.
+    density_entropy_coef: float | None = None
+    trpo_density_kl_coef: float | None = None
+    magnet_density_kl_coef: float | None = None
 
 
 @dataclasses.dataclass
@@ -151,9 +182,13 @@ def run_config_from_dict(raw: dict) -> RunConfig:
         raise ValueError(f"unknown game {game_name!r}, choices: {sorted(GAME_CONFIGS)}")
     game_config = _build_dataclass(GAME_CONFIGS[game_name], game_raw)
 
+    network = _build_dataclass(NetworkConfig, raw.get("network", {}) or {})
+    if network.policy not in POLICIES:
+        raise ValueError(f"unknown network.policy {network.policy!r}, choices: {sorted(POLICIES)}")
+
     return RunConfig(
         game=game_config,
-        network=_build_dataclass(NetworkConfig, raw.get("network", {}) or {}),
+        network=network,
         optimizer=_build_dataclass(OptimizerConfig, raw.get("optimizer", {}) or {}),
         ppo=_build_dataclass(PPOConfig, raw.get("ppo", {}) or {}),
         train=_build_dataclass(TrainConfig, raw.get("train", {}) or {}),

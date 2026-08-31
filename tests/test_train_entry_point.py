@@ -18,8 +18,10 @@ from training.run_config import load_run_config, run_config_from_dict
 from training.sequential_trainer import SequentialSelfPlayPPOTrainer
 
 
-def _config(path: str = "configs/kuhn_classic.yaml", **train_overrides):
+def _config(path: str = "configs/kuhn_classic.yaml", policy_override: str | None = None, **train_overrides):
     raw = yaml.safe_load(open(path))
+    if policy_override is not None:
+        raw.setdefault("network", {})["policy"] = policy_override
     raw["train"].update(train_overrides)
     return run_config_from_dict(raw)
 
@@ -149,3 +151,39 @@ def test_an_unfamiliar_sequential_game_still_trains():
 def test_a_short_run_completes_through_the_entry_point(path):
     config = _config(path, steps=1, epochs=2, checkpoint_dir=None)
     train.run_sequential(config.game.build(), config)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "experiments/failing_gaussian_wo_magnet/wo_magnet_expfam_ppo.yaml",
+        "experiments/failing_gaussian_wo_magnet/with_magnet_expfam_ppo.yaml",
+    ],
+)
+def test_the_expfam_experiment_configs_load_and_train(path):
+    """`network.policy: exp_family` routes to the log-linear trainer and takes a step.
+
+    Two chunks of two iterations -- enough to catch a shape or wiring mistake in
+    the new path, and nowhere near enough to say anything about convergence,
+    which is what the configs themselves are for.
+    """
+    raw = yaml.safe_load(open(path))
+    raw["train"].update(steps=2, epochs=2, checkpoint_dir=None)
+    config = run_config_from_dict(raw)
+    assert config.network.policy == "exp_family"
+
+    game = config.game.build()
+    hyperparams = train.build_expfam_hyperparams(game, 0, config)
+    assert hyperparams.low == (-1.0,) and hyperparams.high == (1.0,)
+    # `density_*_coef` is written out in these files, so it must not be the
+    # gaussian fallback that ends up in the hyperparams.
+    assert hyperparams.magnet_density_kl_coef == config.ppo.magnet_density_kl_coef
+
+    train.run_one_shot(game, config)
+
+
+def test_a_sequential_game_rejects_the_expfam_policy():
+    """The log-linear policy has no atoms, so a game tree must not silently take it."""
+    config = _config(policy_override="exp_family")
+    with pytest.raises(ValueError, match="one-shot only"):
+        train.run_sequential(config.game.build(), config)

@@ -1,0 +1,83 @@
+# python train.py experiments/failing_gaussian_wo_magnet/with_magnet_expfam_ppo.yaml
+#
+# Exponential-family counterpart of with_magnet_ppo.yaml: same game, same optimizer,
+# same PPO and magnet settings, the policy swapped from a Gaussian mixture to a
+# log-linear density over a fixed basis (`network.policy: exp_family`, see
+# training/expfam.py). Run it against with_magnet_ppo.yaml -- the pair differs in the
+# parametrization and in nothing else.
+#
+# What the swap buys, with the magnet:
+#   * the entropy bonus and both KL penalties are *exact*, not the componentwise
+#     Gaussian estimates `mixture_ppo_loss` has to settle for. With
+#     magnet_density_kl_coef = 0.2 that matters directly: the proximal term is now
+#     genuinely KL(current || magnet).
+#   * the density's support IS the action box, so there is no `clip_means`, no
+#     straight-through projection and no mean_box_penalty -- the failure mode the
+#     Gaussian configs' `clip_means` comment describes cannot arise.
+#   * a bilinear payoff makes the entropy-regularized best response an exponential
+#     tilt exp(Q/tau), which the poly_order >= 1 part of this basis represents
+#     exactly. The Gaussian family does not contain it.
+
+game:
+  name: matching_pennies
+
+network:
+  policy: exp_family
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+
+  grid_points: 256      # the density is piecewise constant on these bins; sampling
+                        #   draws a bin then jitters uniformly inside it, so log p is
+                        #   the log-density of what was actually sampled -- the PPO
+                        #   ratio is exact rather than approximate.
+  num_basis: 1          # RBF bumps: the multi-modal capacity, the analogue of
+                        #   num_components in the Gaussian configs.
+  poly_order: 1         # z, z^2 in the box-normalized coordinate. z alone already
+                        #   spans this game's exact QRE.
+  basis_width_scale: 1.0
+
+  init_tilt: 10.0       # start OFF the Nash, as idealized.init_means: [1.0] does for
+                        #   the Gaussian runs. Zero would leave the policy uniform on
+                        #   [-1, 1], whose mean is 0 -- which IS a Nash here (the payoff
+                        #   is bilinear, so only the mean matters), so the run would sit
+                        #   at a fixed point from step 0. tilt 10 puts the initial mean
+                        #   at ~+0.90, near the box edge the Gaussian run starts at.
+
+optimizer:
+  learning_rate: 0.001  # matched to with_magnet_ppo.yaml
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 256
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 500
+
+  # The Gaussian coefficients are kept so the file stays readable next to its
+  # counterpart, but a log-linear density has one head, so the density_* fields
+  # below are what actually bite. Left null they would fall back to the
+  # gaussian_* values; they are written out to make the comparison explicit.
+  category_entropy_coef: 0.1
+  gaussian_entropy_coef: 0.1
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+  density_entropy_coef: 0.1
+  trpo_density_kl_coef: 0.05
+  magnet_density_kl_coef: 0.2
+
+train:
+  mode: self_play
+  perspective: 0
+  opponent: random
+  steps: 50
+  epochs: 200
+  checkpoint_dir: data/matching_pennies_expfam_with_magnet
+  seed: 123

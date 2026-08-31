@@ -199,3 +199,41 @@ matched-init figure is the more informative one: from the *same* start, the no-m
 run spirals outward to the boundary while the magnet run spirals inward to the Nash --
 the magnet is what turns the rotation's outward drift into a contraction.
 
+
+## Exponential-family variant
+
+`{wo,with}_magnet_expfam_ppo.yaml` are the same two settings run through
+`network.policy: exp_family` -- the log-linear density of `training/expfam.py` instead
+of the Gaussian mixture. Everything else (game, optimizer, learning rate, PPO settings,
+magnet interval, seed) matches the corresponding `_ppo.yaml`, so the pair isolates the
+parametrization.
+
+```
+python train.py experiments/failing_gaussian_wo_magnet/wo_magnet_expfam_ppo.yaml
+python train.py experiments/failing_gaussian_wo_magnet/with_magnet_expfam_ppo.yaml
+```
+
+Three differences are worth watching in the logs, because they are the reasons to try
+this at all:
+
+* **The regularizers are exact.** `entropy` and `magnet_kl` are the true differential
+  entropy and the true `KL(current || magnet)`, computed on the density's grid. The
+  Gaussian runs report a marginal-density entropy *estimate* and a componentwise KL
+  *bound*. If the magnet is what makes this game converge, it is worth knowing the
+  runs were penalizing the quantity they meant to.
+* **There is no box to fall out of.** The density's support is `[-1, 1]` by
+  construction, so `clip_means`, the straight-through projection and
+  `mean_box_penalty_coef` all have no counterpart here -- and neither does the `|mu| ~
+  1e3` drift the Gaussian configs' `clip_means` comment describes.
+* **The exact QRE is in the family.** The payoff is bilinear, so the entropy-regularized
+  best response is `p ~ exp(a * opponent_mean / tau)`, an exponential tilt -- exactly
+  what `poly_order: 1` spans. No Gaussian is that distribution, so the Gaussian run is
+  chasing a target its family cannot hold, while this one can sit on it.
+
+The log line prints the density itself rather than a component list: `H` is the exact
+entropy and the bracketed row is the mass in ten equal buckets across the box, so a
+policy collapsing onto a corner or splitting into modes is visible directly.
+
+There is no `_idealized.yaml`/`_sampled.yaml` counterpart -- `run_idealized.py`'s exact
+solver is written against the Gaussian mixture's parameters. `idealized:` is simply
+absent from these files rather than present and ignored.

@@ -92,3 +92,45 @@ class MixturePPOHyperparams(PPOHyperparams):
         data["low"] = tuple(data["low"])
         data["high"] = tuple(data["high"])
         return cls(**data)
+
+
+@dataclasses.dataclass(frozen=True)
+class ExpFamilyPPOHyperparams(PPOHyperparams):
+    """`PPOHyperparams` plus what's needed to rebuild an `ExpFamilyActorCritic`.
+
+    The basis is *fixed* (only `theta` is learned), so every field describing it
+    has to be stored for a checkpoint to be reloadable: a policy is meaningless
+    without the features its natural parameters are natural for.
+
+    `low`/`high` are the action box. Unlike the mixture's, they are not merely an
+    initialization detail -- they are the support of the density itself, which is
+    why there is no `clip_means`/`mean_box_penalty_coef` counterpart here.
+    """
+
+    low: tuple[float, ...] = (0.0,)
+    high: tuple[float, ...] = (1.0,)
+
+    # The basis (see `training.expfam.build_basis`).
+    grid_points: int = 256      # bins the density is piecewise-constant on
+    num_basis: int = 8          # RBF bumps per action dimension
+    poly_order: int = 2         # monomials z^1..z^poly_order in the normalized coordinate
+    basis_width_scale: float = 1.0  # RBF width, in units of the RBF spacing
+    init_tilt: float = 0.0      # initial exponential tilt exp(t*z); 0 starts uniform
+
+    # Target/magnet parameter tracking (see `training.trainer_common`).
+    target_tau: float = 0.005
+    magnet_interval: int = 1000
+
+    # Entropy bonus and KL regularization. One density means one of each, rather
+    # than the mixture's per-head pair; `entropy_coef` (inherited) is unused.
+    density_entropy_coef: float = 0.0
+    trpo_density_kl_coef: float = 0.0    # KL(old || current)
+    magnet_density_kl_coef: float = 0.0  # KL(current || magnet_params)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ExpFamilyPPOHyperparams":
+        data = dict(data)
+        data["hidden_dims"] = tuple(data["hidden_dims"])
+        data["low"] = tuple(data["low"])
+        data["high"] = tuple(data["high"])
+        return cls(**data)
