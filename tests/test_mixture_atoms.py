@@ -61,10 +61,10 @@ def _episode(network, params, kind_mask, batch: int = 64, seed: int = 0) -> Epis
     def one(key):
         obs_key, sample_key, reward_key = jax.random.split(key, 3)
         obs = jax.random.normal(obs_key, (OBS_DIM,))
-        logits, means, log_stds, value = network.apply(params, obs)
+        logits, means, scale_trils, value = network.apply(params, obs)
         mask = expand_kind_mask(kind_mask, network.num_components)
         component, raw_action = sample_mixture_component(
-            logits, means, log_stds, mask, num_atoms, sample_key
+            logits, means, scale_trils, mask, num_atoms, sample_key
         )
         return Episode(
             actor=jnp.int32(0),
@@ -72,10 +72,10 @@ def _episode(network, params, kind_mask, batch: int = 64, seed: int = 0) -> Epis
             action_mask=mask,
             logits=logits,
             means=means,
-            log_stds=log_stds,
+            scale_trils=scale_trils,
             magnet_logits=logits,
             magnet_means=means,
-            magnet_log_stds=log_stds,
+            magnet_scale_trils=scale_trils,
             component=component,
             raw_action=raw_action,
             action_kind=component_to_kind(component, num_atoms),
@@ -129,23 +129,24 @@ def test_masked_helpers_reduce_to_their_unmasked_forms():
 
 def test_marginal_log_prob_reduces_to_the_plain_mixture_density_without_atoms():
     network, params = _network(num_atoms=0)
-    logits, means, log_stds, _ = network.apply(params, jnp.zeros(OBS_DIM))
+    logits, means, scale_trils, _ = network.apply(params, jnp.zeros(OBS_DIM))
     mask = jnp.ones_like(logits, dtype=bool)
     action = jnp.array([0.4])
 
-    per_component = jax.vmap(gaussian_log_prob, in_axes=(None, 0, 0))(action, means, log_stds)
+    per_component = jax.vmap(gaussian_log_prob, in_axes=(None, 0, 0))(action, means, scale_trils)
     expected = jax.nn.logsumexp(jax.nn.log_softmax(logits) + per_component)
 
     np.testing.assert_allclose(
-        mixture_marginal_log_prob(logits, means, log_stds, mask, action, 0), expected, rtol=1e-6
+        mixture_marginal_log_prob(logits, means, scale_trils, mask, action, 0), expected, rtol=1e-6
     )
 
 
 def test_an_atom_free_policy_keeps_the_plain_categorical_width():
     network, params = _network(num_atoms=0, num_components=3)
-    logits, means, log_stds, _ = network.apply(params, jnp.zeros(OBS_DIM))
+    logits, means, scale_trils, _ = network.apply(params, jnp.zeros(OBS_DIM))
     assert logits.shape == (3,)
-    assert means.shape == log_stds.shape == (3, ACTION_DIM)
+    assert means.shape == (3, ACTION_DIM)
+    assert scale_trils.shape == (3, ACTION_DIM, ACTION_DIM)
 
 
 # ---- indexing ------------------------------------------------------------
@@ -153,9 +154,10 @@ def test_an_atom_free_policy_keeps_the_plain_categorical_width():
 
 def test_logits_head_widens_by_the_number_of_atoms():
     network, params = _network(num_atoms=2, num_components=3)
-    logits, means, log_stds, _ = network.apply(params, jnp.zeros(OBS_DIM))
+    logits, means, scale_trils, _ = network.apply(params, jnp.zeros(OBS_DIM))
     assert logits.shape == (5,)
-    assert means.shape == log_stds.shape == (3, ACTION_DIM)  # atoms have no mean or spread
+    assert means.shape == (3, ACTION_DIM)  # atoms have no mean or spread
+    assert scale_trils.shape == (3, ACTION_DIM, ACTION_DIM)
 
 
 def test_expand_kind_mask_replicates_the_continuous_bit():
@@ -185,11 +187,11 @@ def test_component_maps_to_kind_and_gaussian_row():
 )
 def test_sampling_never_draws_a_masked_component(kind_mask):
     network, params = _network(num_atoms=2, num_components=3)
-    logits, means, log_stds, _ = network.apply(params, jnp.zeros(OBS_DIM))
+    logits, means, scale_trils, _ = network.apply(params, jnp.zeros(OBS_DIM))
     mask = expand_kind_mask(jnp.asarray(kind_mask), network.num_components)
 
     components = jax.vmap(
-        lambda k: sample_mixture_component(logits, means, log_stds, mask, 2, k)[0]
+        lambda k: sample_mixture_component(logits, means, scale_trils, mask, 2, k)[0]
     )(jax.random.split(jax.random.PRNGKey(0), 4000))
 
     assert bool(jnp.all(mask[components]))
@@ -227,14 +229,14 @@ def test_masked_entries_do_not_perturb_the_legal_distribution():
 def test_marginal_density_ignores_the_atoms_probability():
     """The Gaussian entropy term is conditional, so shifting atom mass must not move it."""
     network, params = _network(num_atoms=2, num_components=3)
-    logits, means, log_stds, _ = network.apply(params, jnp.zeros(OBS_DIM))
+    logits, means, scale_trils, _ = network.apply(params, jnp.zeros(OBS_DIM))
     mask = jnp.ones_like(logits, dtype=bool)
     action = jnp.array([0.4])
 
     shifted = logits.at[:2].add(5.0)  # make folding far more likely
     np.testing.assert_allclose(
-        mixture_marginal_log_prob(logits, means, log_stds, mask, action, 2),
-        mixture_marginal_log_prob(shifted, means, log_stds, mask, action, 2),
+        mixture_marginal_log_prob(logits, means, scale_trils, mask, action, 2),
+        mixture_marginal_log_prob(shifted, means, scale_trils, mask, action, 2),
         rtol=1e-6,
     )
 
@@ -244,18 +246,18 @@ def test_marginal_density_ignores_the_atoms_probability():
 
 def test_an_atom_sample_contributes_no_gaussian_log_prob():
     network, params = _network(num_atoms=2, num_components=3)
-    logits, means, log_stds, _ = network.apply(params, jnp.zeros(OBS_DIM))
+    logits, means, scale_trils, _ = network.apply(params, jnp.zeros(OBS_DIM))
     mask = jnp.ones_like(logits, dtype=bool)
     action = jnp.array([0.4])
 
     for component in (0, 1):
         _, gaussian = mixture_log_probs(
-            logits, means, log_stds, mask, jnp.asarray(component), action, 2
+            logits, means, scale_trils, mask, jnp.asarray(component), action, 2
         )
         assert float(gaussian) == 0.0
     for component in (2, 3, 4):
         _, gaussian = mixture_log_probs(
-            logits, means, log_stds, mask, jnp.asarray(component), action, 2
+            logits, means, scale_trils, mask, jnp.asarray(component), action, 2
         )
         assert float(gaussian) != 0.0
 

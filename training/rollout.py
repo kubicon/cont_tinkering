@@ -25,7 +25,7 @@ import jax.numpy as jnp
 
 from games.base import ZeroSumGame
 
-from .actor_critic import ActorCritic, gaussian_log_prob
+from .actor_critic import ActorCritic, gaussian_log_prob, gaussian_sample
 
 OpponentActionFn = Callable[[chex.PRNGKey, int], chex.Array]
 
@@ -44,10 +44,10 @@ def _sample_batch(
     network: ActorCritic, params, obs: chex.Array, key: chex.PRNGKey, space
 ) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
     """Sample `(raw_action, action, log_prob, value)` for a batch of `obs`, one env per row."""
-    mean, log_std, value = jax.vmap(lambda o: network.apply(params, o))(obs)
+    mean, scale_tril, value = jax.vmap(lambda o: network.apply(params, o))(obs)
     noise = jax.random.normal(key, mean.shape)
-    raw_action = mean + jnp.exp(log_std) * noise
-    log_prob = gaussian_log_prob(raw_action, mean, log_std)
+    raw_action = gaussian_sample(mean, scale_tril, noise)
+    log_prob = gaussian_log_prob(raw_action, mean, scale_tril)
     action = jax.vmap(space.clip)(raw_action)
     return raw_action, action, log_prob, value
 

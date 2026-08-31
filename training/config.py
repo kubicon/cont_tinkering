@@ -19,6 +19,13 @@ class PPOHyperparams:
     hidden_dims: tuple[int, ...]
     activation: str = "tanh"
     normalization: str = "none"
+    # Give each Gaussian a full covariance (a lower-triangular Cholesky factor)
+    # rather than a diagonal one. Off by default: a payoff that is a sum of
+    # per-coordinate terms depends only on the per-axis marginals, so its
+    # gradient w.r.t. every off-diagonal entry is exactly zero and the extra
+    # `d(d-1)/2` parameters per component only collect sampling noise. See
+    # `training.gaussian`.
+    full_covariance: bool = False
 
     # Optimization.
     learning_rate: float = 3e-4

@@ -56,6 +56,7 @@ def build_hyperparams(game: ZeroSumGame, player: int, config: RunConfig) -> Mixt
         num_envs=ppo.batch_size,
         num_epochs=ppo.ppo_epochs,
         num_components=network.num_components,
+        full_covariance=network.full_covariance,
         num_atoms=_num_atoms(space),
         clip_means=network.clip_means,
         mean_box_penalty_coef=network.mean_box_penalty_coef,

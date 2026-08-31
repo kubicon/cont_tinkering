@@ -54,15 +54,22 @@ from .actor_critic import (
     categorical_kl,
     gaussian_kl,
     gaussian_log_prob,
+    gaussian_sample,
     masked_categorical_entropy,
     masked_log_softmax,
 )
 from .config import MixturePPOHyperparams
+from .gaussian import (
+    SIGMA_MIN,
+    clamp_scale_tril,
+    diagonal_slots,
+    pack_scale_tril,
+    scale_param_size,
+)
 
 OpponentActionFn = Callable[[chex.PRNGKey, int], chex.Array]
 
-LOG_STD_MIN = -6.907755  # log(1e-3)
-MIN_ACTION_WIDTH = 1e-3  # == exp(LOG_STD_MIN)
+MIN_ACTION_WIDTH = SIGMA_MIN
 
 
 def _action_width(low: chex.Array, high: chex.Array) -> chex.Array:
@@ -83,15 +90,26 @@ def _spread_bias_init(low: chex.Array, high: chex.Array, num_components: int) ->
     return init_fn
 
 
-def _std_bias_init(low: chex.Array, high: chex.Array, num_components: int) -> Callable:
-    """Bias initializer for `log_std_head`, scaled to the action range.
+def _scale_bias_init(
+    low: chex.Array, high: chex.Array, num_components: int, full_covariance: bool
+) -> Callable:
+    """Bias initializer for `scale_head`, scaled to the action range.
+
+    Puts the same per-axis standard deviation the old `log_std` init used on
+    the *diagonal* of every component's factor and leaves every off-diagonal
+    entry at zero: the policy starts uncorrelated, and turning
+    `full_covariance` on therefore changes nothing about the initial policy --
+    only what it is free to become.
     """
+    action_dim = low.shape[0]
+    slots = diagonal_slots(action_dim, full_covariance)
+    size = scale_param_size(action_dim, full_covariance)
 
     def init_fn(key: chex.PRNGKey, shape: tuple[int, ...], dtype=jnp.float32) -> chex.Array:
         del key
         std = jnp.maximum(_action_width(low, high) / (2 * num_components), MIN_ACTION_WIDTH)
-        log_std = jnp.log(std).astype(dtype)  # (action_dim,)
-        values = jnp.broadcast_to(log_std[None, :], (num_components, log_std.shape[0]))
+        row = jnp.zeros((size,), dtype=dtype).at[slots].set(std.astype(dtype))
+        values = jnp.broadcast_to(row[None, :], (num_components, size))
         return values.reshape(shape).astype(dtype)
 
     return init_fn
@@ -150,7 +168,13 @@ def mean_box_excess(means: chex.Array, low: chex.Array, high: chex.Array) -> che
 
 
 class MixtureActorCritic(nn.Module):
-    """Shared torso, four linear heads: component logits, means, log-stds, value.
+    """Shared torso, four linear heads: component logits, means, scales, value.
+
+    Each Gaussian component carries its own Cholesky factor of the covariance
+    (see `training.gaussian`), diagonal unless `full_covariance`. The head emits
+    the `d(d+1)/2` free lower-triangular entries per component -- or just the
+    `d` diagonal ones -- and they are packed into the factor and floored here,
+    so no caller ever sees an unclamped or non-triangular scale.
     """
 
     action_dim: int
@@ -162,12 +186,16 @@ class MixtureActorCritic(nn.Module):
     normalization: str = "none"
     clip_means: bool = False
     num_atoms: int = 0
+    # Correlate the action coordinates within a component; see `training.gaussian`.
+    full_covariance: bool = False
 
     @nn.compact
     def __call__(
         self, obs: chex.Array, train: bool = False, project_means: bool = True
     ) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
-        """`project_means=False` returns the mean head *unprojected*.
+        """`(logits, means, scale_trils, value)`; `scale_trils` is `(K, d, d)`.
+
+        `project_means=False` returns the mean head *unprojected*.
 
         Only the loss passes it: the projection is not invertible, so a caller
         that needs to know how far outside the box the raw mean sits (to
@@ -193,18 +221,27 @@ class MixtureActorCritic(nn.Module):
         if self.clip_means and project_means:
             means = project_means_to_box(means, self.low, self.high)
 
-        log_std_flat = nn.Dense(
-            self.num_components * self.action_dim,
+        scale_size = scale_param_size(self.action_dim, self.full_covariance)
+        scale_flat = nn.Dense(
+            self.num_components * scale_size,
             kernel_init=nn.initializers.zeros,
-            bias_init=_std_bias_init(self.low, self.high, self.num_components),
-            name="log_std_head",
+            bias_init=_scale_bias_init(
+                self.low, self.high, self.num_components, self.full_covariance
+            ),
+            name="scale_head",
         )(torso)
-        log_std = log_std_flat.reshape(self.num_components, self.action_dim)
-        log_std = jnp.clip(log_std, LOG_STD_MIN, jnp.log(_action_width(self.low, self.high)))
+        scale_tril = pack_scale_tril(
+            scale_flat.reshape(self.num_components, scale_size),
+            self.action_dim,
+            self.full_covariance,
+        )
+        # Floor on the conditional standard deviations, ceiling at the box width:
+        # the projection onto the feasible set of factors, straight-through.
+        scale_tril = clamp_scale_tril(scale_tril, SIGMA_MIN, _action_width(self.low, self.high))
 
         value = nn.Dense(1, name="value_head")(torso)
 
-        return logits, means, log_std, jnp.squeeze(value, axis=-1)
+        return logits, means, scale_tril, jnp.squeeze(value, axis=-1)
 
 
 def expand_kind_mask(kind_mask: chex.Array, num_components: int) -> chex.Array:
@@ -224,7 +261,7 @@ def component_to_kind(component: chex.Array, num_atoms: int) -> chex.Array:
 
 
 def gaussian_component_index(component: chex.Array, num_atoms: int) -> chex.Array:
-    """Row of `means`/`log_stds` that `component` refers to, clamped to be in range.
+    """Row of `means`/`scale_trils` that `component` refers to, clamped to be in range.
     """
     return jnp.maximum(component - num_atoms, 0)
 
@@ -232,7 +269,7 @@ def gaussian_component_index(component: chex.Array, num_atoms: int) -> chex.Arra
 def mixture_log_probs(
     logits: chex.Array,
     means: chex.Array,
-    log_stds: chex.Array,
+    scale_trils: chex.Array,
     mask: chex.Array,
     component: chex.Array,
     raw_action: chex.Array,
@@ -243,14 +280,14 @@ def mixture_log_probs(
     """
     category_log_prob = masked_log_softmax(logits, mask)[component]
     index = gaussian_component_index(component, num_atoms)
-    log_prob = gaussian_log_prob(raw_action, means[index], log_stds[index])
+    log_prob = gaussian_log_prob(raw_action, means[index], scale_trils[index])
     return category_log_prob, jnp.where(component >= num_atoms, log_prob, 0.0)
 
 
 def mixture_marginal_log_prob(
     logits: chex.Array,
     means: chex.Array,
-    log_stds: chex.Array,
+    scale_trils: chex.Array,
     mask: chex.Array,
     raw_action: chex.Array,
     num_atoms: int,
@@ -258,7 +295,7 @@ def mixture_marginal_log_prob(
     """`log p(a | a is continuous)` of the marginal mixture density at a single `raw_action`.
     """
     log_weights = masked_log_softmax(logits[num_atoms:], mask[num_atoms:])  # (num_components,)
-    per_component = jax.vmap(gaussian_log_prob, in_axes=(None, 0, 0))(raw_action, means, log_stds)
+    per_component = jax.vmap(gaussian_log_prob, in_axes=(None, 0, 0))(raw_action, means, scale_trils)
     return jax.nn.logsumexp(log_weights + per_component)
 
 
@@ -290,10 +327,10 @@ class Episode:
     action_mask: chex.Array  # (num_atoms + num_components,) bool, which logits were legal here
     logits: chex.Array  # (num_atoms + num_components,) categorical logits at sample time
     means: chex.Array  # (num_components, action_dim) each Gaussian component's mean at sample time
-    log_stds: chex.Array  # (num_components, action_dim) each component's log-std at sample time
+    scale_trils: chex.Array  # (num_components, action_dim, action_dim) each component's Cholesky scale factor at sample time
     magnet_logits: chex.Array  # (num_atoms + num_components,) logits under `magnet_params`, same obs
     magnet_means: chex.Array  # (num_components, action_dim) under `magnet_params`
-    magnet_log_stds: chex.Array  # (num_components, action_dim) under `magnet_params`
+    magnet_scale_trils: chex.Array  # (num_components, action_dim, action_dim) under `magnet_params`
     component: chex.Array  # which categorical entry was sampled: an atom, or a Gaussian component
     raw_action: chex.Array  # unclipped Gaussian sample; meaningless (but finite) when an atom was drawn
     action_kind: chex.Array  # `HybridAction.kind` actually played -- `component_to_kind(component)`
@@ -344,7 +381,7 @@ def flatten_batch_axes(episode: Episode) -> Episode:
 def sample_mixture_component(
     logits: chex.Array,
     means: chex.Array,
-    log_stds: chex.Array,
+    scale_trils: chex.Array,
     mask: chex.Array,
     num_atoms: int,
     key: chex.PRNGKey,
@@ -355,7 +392,7 @@ def sample_mixture_component(
     component = jax.random.categorical(component_key, jnp.where(mask, logits, MASKED_LOGIT))
     index = gaussian_component_index(component, num_atoms)
     mean = means[index]
-    raw_action = mean + jnp.exp(log_stds[index]) * jax.random.normal(noise_key, mean.shape)
+    raw_action = gaussian_sample(mean, scale_trils[index], jax.random.normal(noise_key, mean.shape))
     return component, raw_action
 
 
@@ -372,23 +409,23 @@ def _sample_mixture_one(
     space = game.action_space(player)
     obs = game.observation(player, obs_key)
 
-    logits, means, log_stds, value = network.apply(params, obs)
-    magnet_logits, magnet_means, magnet_log_stds, _ = network.apply(magnet_params, obs)
+    logits, means, scale_trils, value = network.apply(params, obs)
+    magnet_logits, magnet_means, magnet_scale_trils, _ = network.apply(magnet_params, obs)
 
     # A one-shot `ZeroSumGame` has a single unconstrained continuous action: no
     # atoms, nothing illegal, so the mask is all-`True` and every masked term in
     # the loss reduces to its unmasked form.
     action_mask = jnp.ones_like(logits, dtype=bool)
     component, raw_action = sample_mixture_component(
-        logits, means, log_stds, action_mask, network.num_atoms, sample_key
+        logits, means, scale_trils, action_mask, network.num_atoms, sample_key
     )
 
     return Episode(
         # Every row of a one-shot batch is the same player's single decision, so
         # `actor` is constant and `player_weight` comes out all-ones.
         actor=jnp.int32(player),
-        obs=obs, action_mask=action_mask, logits=logits, means=means, log_stds=log_stds,
-        magnet_logits=magnet_logits, magnet_means=magnet_means, magnet_log_stds=magnet_log_stds,
+        obs=obs, action_mask=action_mask, logits=logits, means=means, scale_trils=scale_trils,
+        magnet_logits=magnet_logits, magnet_means=magnet_means, magnet_scale_trils=magnet_scale_trils,
         component=component, raw_action=raw_action,
         action_kind=component_to_kind(component, network.num_atoms),
         action_value=space.clip(raw_action), value=value, reward=jnp.zeros(()),
@@ -411,11 +448,11 @@ def sample_mixture_actions(
             f"meaningful for an atom-free policy, got num_atoms={network.num_atoms}. "
             "A game with atoms needs a tree-aware exploitability instead."
         )
-    logits, means, log_stds, _ = network.apply(params, obs)
+    logits, means, scale_trils, _ = network.apply(params, obs)
     action_mask = jnp.ones_like(logits, dtype=bool)
 
     def one(k: chex.PRNGKey) -> chex.Array:
-        _, raw_action = sample_mixture_component(logits, means, log_stds, action_mask, 0, k)
+        _, raw_action = sample_mixture_component(logits, means, scale_trils, action_mask, 0, k)
         return space.clip(raw_action)
 
     return jax.vmap(one)(jax.random.split(key, num_samples))
@@ -502,7 +539,7 @@ def collect_mixture_self_play_episode(
 def mixture_ppo_loss_from_outputs(
     logits: chex.Array,
     means: chex.Array,
-    log_stds: chex.Array,
+    scale_trils: chex.Array,
     value_pred: chex.Array,
     num_atoms: int,
     episode: Episode,
@@ -560,8 +597,8 @@ def mixture_ppo_loss_from_outputs(
     PPO ratio a ratio of two densities over the same support.
 
     The current policy's outputs are the *only* ones evaluated for this
-    update -- `episode.logits`/`means`/`log_stds` (the sampling-time
-    distribution) and `episode.magnet_logits`/`magnet_means`/`magnet_log_stds`
+    update -- `episode.logits`/`means`/`scale_trils` (the sampling-time
+    distribution) and `episode.magnet_logits`/`magnet_means`/`magnet_scale_trils`
     (the magnet snapshot's distribution, at the same `episode.obs`) come
     straight from the episode rather than being recomputed from
     `old_params`/`magnet_params` here; see `collect_mixture_episode`.
@@ -576,11 +613,11 @@ def mixture_ppo_loss_from_outputs(
     is_gaussian = (episode.component >= num_atoms).astype(jnp.float32)
 
     old_category_log_prob, old_gaussian_log_prob = mixture_log_probs(
-        episode.logits, episode.means, episode.log_stds, mask,
+        episode.logits, episode.means, episode.scale_trils, mask,
         episode.component, episode.raw_action, num_atoms,
     )
     new_category_log_prob, new_gaussian_log_prob = mixture_log_probs(
-        logits, means, log_stds, mask, episode.component, episode.raw_action, num_atoms
+        logits, means, scale_trils, mask, episode.component, episode.raw_action, num_atoms
     )
     category_ratio = jnp.exp(new_category_log_prob - old_category_log_prob)
     gaussian_ratio = jnp.exp(new_gaussian_log_prob - old_gaussian_log_prob)
@@ -598,23 +635,23 @@ def mixture_ppo_loss_from_outputs(
 
     category_entropy = masked_categorical_entropy(logits, mask)
     action_entropy = -is_gaussian * mixture_marginal_log_prob(
-        logits, means, log_stds, mask, episode.raw_action, num_atoms
+        logits, means, scale_trils, mask, episode.raw_action, num_atoms
     )
     entropy = category_entropy + action_entropy
 
     index = gaussian_component_index(episode.component, num_atoms)
     mean = means[index]
-    log_std = log_stds[index]
+    scale_tril = scale_trils[index]
 
     old_mean = episode.means[index]
-    old_log_std = episode.log_stds[index]
+    old_scale_tril = episode.scale_trils[index]
     trpo_category_kl = categorical_kl(episode.logits, logits, mask)
-    trpo_gaussian_kl = is_gaussian * gaussian_kl(old_mean, old_log_std, mean, log_std)
+    trpo_gaussian_kl = is_gaussian * gaussian_kl(old_mean, old_scale_tril, mean, scale_tril)
 
     magnet_mean = episode.magnet_means[index]
-    magnet_log_std = episode.magnet_log_stds[index]
+    magnet_scale_tril = episode.magnet_scale_trils[index]
     magnet_category_kl = categorical_kl(logits, episode.magnet_logits, mask)
-    magnet_gaussian_kl = is_gaussian * gaussian_kl(mean, log_std, magnet_mean, magnet_log_std)
+    magnet_gaussian_kl = is_gaussian * gaussian_kl(mean, scale_tril, magnet_mean, magnet_scale_tril)
 
     loss = (
         policy_loss
@@ -696,14 +733,14 @@ def mixture_ppo_loss(
     mean_box_penalty_coef: float = 0.0,
 ) -> tuple[chex.Array, dict[str, chex.Array]]:
     """`mixture_ppo_loss_from_outputs`, forward-passing `params` at `episode.obs` first."""
-    logits, raw_means, log_stds, value_pred = network.apply(
+    logits, raw_means, scale_trils, value_pred = network.apply(
         params, episode.obs, project_means=False
     )
     means, mean_box_penalty = projected_means_and_penalty(
         network, raw_means, mean_box_penalty_coef
     )
     return mixture_ppo_loss_from_outputs(
-        logits, means, log_stds, value_pred, network.num_atoms, episode, advantage,
+        logits, means, scale_trils, value_pred, network.num_atoms, episode, advantage,
         clip_eps, value_coef, category_entropy_coef, gaussian_entropy_coef,
         trpo_category_kl_coef, trpo_gaussian_kl_coef,
         magnet_category_kl_coef, magnet_gaussian_kl_coef, mean_box_penalty,
@@ -781,7 +818,7 @@ def build_mixture_ppo_loss_fn(
         flat_weight, flat_advantage = weight.reshape(-1), advantage.reshape(-1)
 
         if shared_obs:
-            logits, raw_means, log_stds, value_pred = network.apply(
+            logits, raw_means, scale_trils, value_pred = network.apply(
                 params, flat.obs[0], project_means=False
             )
             means, mean_box_penalty = projected_means_and_penalty(
@@ -791,7 +828,7 @@ def build_mixture_ppo_loss_fn(
                 mixture_ppo_loss_from_outputs,
                 in_axes=(None, None, None, None, None, 0, 0, None, None, None, None, None, None, None, None, None),
             )(
-                logits, means, log_stds, value_pred, network.num_atoms, flat, flat_advantage,
+                logits, means, scale_trils, value_pred, network.num_atoms, flat, flat_advantage,
                 clip_eps, value_coef, *coefs, mean_box_penalty,
             )
         else:
@@ -823,4 +860,5 @@ def build_mixture_network(hyperparams: MixturePPOHyperparams) -> MixtureActorCri
         normalization=hyperparams.normalization,
         clip_means=hyperparams.clip_means,
         num_atoms=hyperparams.num_atoms,
+        full_covariance=hyperparams.full_covariance,
     )

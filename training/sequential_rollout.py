@@ -104,20 +104,20 @@ def build_episode_sampler(
             def evaluate(index: int):
                 obs = game.observation(index, state)
                 mask = expand_kind_mask(game.action_mask(index, state), num_components)
-                logits, means, log_stds, value = networks[index].apply(params[index], obs)
+                logits, means, scale_trils, value = networks[index].apply(params[index], obs)
                 magnet = networks[index].apply(magnet_params[index], obs)
-                return obs, mask, logits, means, log_stds, value, magnet[:3]
+                return obs, mask, logits, means, scale_trils, value, magnet[:3]
 
             # Select the acting player's view. `actor` is traced, so this is a
             # select rather than a branch: both networks have already run.
             is_first = actor == 0
-            obs, mask, logits, means, log_stds, value, magnet = select_by_player(
+            obs, mask, logits, means, scale_trils, value, magnet = select_by_player(
                 is_first, evaluate(0), evaluate(1)
             )
-            magnet_logits, magnet_means, magnet_log_stds = magnet
+            magnet_logits, magnet_means, magnet_scale_trils = magnet
 
             component, raw_action = sample_mixture_component(
-                logits, means, log_stds, mask, num_atoms, sample_key
+                logits, means, scale_trils, mask, num_atoms, sample_key
             )
             action_kind = component_to_kind(component, num_atoms)
             # Only the continuous part is clipped here (the kind comes from the
@@ -135,9 +135,9 @@ def build_episode_sampler(
             )
             record = dict(
                 actor=actor, obs=obs, action_mask=mask,
-                logits=logits, means=means, log_stds=log_stds,
+                logits=logits, means=means, scale_trils=scale_trils,
                 magnet_logits=magnet_logits, magnet_means=magnet_means,
-                magnet_log_stds=magnet_log_stds, component=component,
+                magnet_scale_trils=magnet_scale_trils, component=component,
                 raw_action=raw_action, action_kind=action_kind,
                 action_value=action_value, value=value,
             )

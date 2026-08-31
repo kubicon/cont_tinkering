@@ -35,11 +35,12 @@ from games.kuhn_best_response import (
 from games.sequential_examples import KIND_CALL, KIND_PASSIVE, ContinuousKuhnPoker
 
 from .actor_critic import masked_log_softmax
+from .gaussian import marginal_std
 from .mixture import MixtureActorCritic, expand_kind_mask
 
 
 def clipped_mixture_grid_probs(
-    weights: chex.Array, means: chex.Array, log_stds: chex.Array, grid: chex.Array
+    weights: chex.Array, means: chex.Array, stds: chex.Array, grid: chex.Array
 ) -> chex.Array:
     """Probability that a *clipped* Gaussian mixture lands in each grid cell.
 
@@ -67,7 +68,7 @@ def clipped_mixture_grid_probs(
         return jnp.sum(weights, keepdims=True)
 
     midpoints = 0.5 * (grid[:-1] + grid[1:])
-    z = (midpoints[None, :] - means[:, None]) / jnp.exp(log_stds)[:, None]
+    z = (midpoints[None, :] - means[:, None]) / stds[:, None]
     cdf = jax.scipy.stats.norm.cdf(z)  # (num_components, num_grid - 1)
 
     pad = jnp.ones((cdf.shape[0], 1))
@@ -97,14 +98,16 @@ def strategy_from_network(
     cards = jnp.arange(game.num_cards)
 
     def at_open(card: chex.Array) -> tuple[chex.Array, chex.Array]:
-        logits, means, log_stds, _ = network.apply(
+        logits, means, scale_trils, _ = network.apply(
             params, game.infoset_observation(card, open_node, 0.0)
         )
         probs = jnp.exp(masked_log_softmax(logits, open_mask))
         # The Gaussian components' own probabilities stay joint, so the returned
         # size distribution already carries "and it bet at all".
+        # The bet size is action coordinate 0; its *marginal* standard deviation
+        # is what a one-dimensional CDF over that coordinate needs.
         sizes = clipped_mixture_grid_probs(
-            probs[num_atoms:], means[:, 0], log_stds[:, 0], grid
+            probs[num_atoms:], means[:, 0], marginal_std(scale_trils)[:, 0], grid
         )
         return probs[KIND_PASSIVE], sizes
 

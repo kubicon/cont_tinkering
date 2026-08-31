@@ -206,7 +206,7 @@ def test_clipped_mixture_probabilities_sum_to_the_component_weights():
     grid = jnp.linspace(0.5, 2.0, 129)
     weights = jnp.array([0.3, 0.2])
     probs = clipped_mixture_grid_probs(
-        weights, jnp.array([0.8, 1.6]), jnp.log(jnp.array([0.2, 0.4])), grid
+        weights, jnp.array([0.8, 1.6]), jnp.array([0.2, 0.4]), grid
     )
     assert float(jnp.sum(probs)) == pytest.approx(float(jnp.sum(weights)), rel=1e-5)
 
@@ -216,7 +216,7 @@ def test_clipping_mass_lands_on_the_endpoints(mean, expect_low, expect_high):
     """Means outside the box are the common case early in training, not an edge case."""
     grid = jnp.linspace(0.5, 2.0, 129)
     probs = clipped_mixture_grid_probs(
-        jnp.array([1.0]), jnp.array([mean]), jnp.log(jnp.array([0.5])), grid
+        jnp.array([1.0]), jnp.array([mean]), jnp.array([0.5]), grid
     )
     assert float(probs[0]) == pytest.approx(expect_low, abs=1e-6)
     assert float(probs[-1]) == pytest.approx(expect_high, abs=1e-6)
@@ -224,17 +224,17 @@ def test_clipping_mass_lands_on_the_endpoints(mean, expect_low, expect_high):
 
 def test_clipped_mixture_matches_sampling_the_same_clipped_mixture():
     grid = jnp.linspace(0.5, 2.0, 33)
-    weights, means, log_stds = (
+    weights, means, stds = (
         jnp.array([0.6, 0.4]),
         jnp.array([0.7, 1.7]),
-        jnp.log(jnp.array([0.3, 0.25])),
+        jnp.array([0.3, 0.25]),
     )
-    probs = clipped_mixture_grid_probs(weights, means, log_stds, grid)
+    probs = clipped_mixture_grid_probs(weights, means, stds, grid)
 
     key = jax.random.PRNGKey(0)
     component_key, noise_key = jax.random.split(key)
     which = jax.random.categorical(component_key, jnp.log(weights), shape=(200_000,))
-    raw = means[which] + jnp.exp(log_stds)[which] * jax.random.normal(noise_key, (200_000,))
+    raw = means[which] + stds[which] * jax.random.normal(noise_key, (200_000,))
     clipped = jnp.clip(raw, grid[0], grid[-1])
     cell = jnp.argmin(jnp.abs(clipped[:, None] - grid[None, :]), axis=-1)
     empirical = jnp.bincount(cell, length=grid.shape[0]) / cell.shape[0]

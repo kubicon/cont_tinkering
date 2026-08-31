@@ -71,9 +71,9 @@ def _episode(network, params, batch: int = 32, shared_obs: bool = False) -> Epis
     def one(key):
         obs_key, sample_key, reward_key = jax.random.split(key, 3)
         obs = jnp.zeros(OBS_DIM) if shared_obs else jax.random.normal(obs_key, (OBS_DIM,))
-        logits, means, log_stds, value = network.apply(params, obs)
+        logits, means, scale_trils, value = network.apply(params, obs)
         component, raw_action = sample_mixture_component(
-            logits, means, log_stds, mask, 0, sample_key
+            logits, means, scale_trils, mask, 0, sample_key
         )
         return Episode(
             actor=jnp.int32(0),
@@ -81,10 +81,10 @@ def _episode(network, params, batch: int = 32, shared_obs: bool = False) -> Epis
             action_mask=mask,
             logits=logits,
             means=means,
-            log_stds=log_stds,
+            scale_trils=scale_trils,
             magnet_logits=logits,
             magnet_means=means,
-            magnet_log_stds=log_stds,
+            magnet_scale_trils=scale_trils,
             component=component,
             raw_action=raw_action,
             action_kind=component_to_kind(component, 0),

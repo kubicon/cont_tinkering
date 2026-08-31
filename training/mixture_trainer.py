@@ -14,6 +14,7 @@ import numpy as np
 from games.base import ZeroSumGame
 
 from .actor_critic import masked_log_softmax
+from .gaussian import marginal_std
 from .checkpoint import (
     load_checkpoint_step,
     load_checkpoint_step_multi,
@@ -76,8 +77,12 @@ def _build_strategy_str(network: MixtureActorCritic):
 
     @jax.jit
     def forward(params, obs: chex.Array, mask: chex.Array):
-        logits, means, log_stds, _ = network.apply(params, obs)
-        return jnp.exp(masked_log_softmax(logits, mask)), means, jnp.exp(log_stds)
+        logits, means, scale_trils, _ = network.apply(params, obs)
+        # Marginal, not conditional: what a human reading the printed policy
+        # means by "the spread in coordinate i" is `sqrt(Sigma_ii)`, which is the
+        # factor's row norm and coincides with its diagonal only when
+        # uncorrelated. See `training.gaussian.marginal_std`.
+        return jnp.exp(masked_log_softmax(logits, mask)), means, marginal_std(scale_trils)
 
     def strategy_str(params, obs: chex.Array, mask: chex.Array | None = None) -> str:
         if mask is None:

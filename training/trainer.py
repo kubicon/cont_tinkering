@@ -80,6 +80,7 @@ class PPOTrainer:
             hidden_dims=hyperparams.hidden_dims,
             activation=hyperparams.activation,
             normalization=hyperparams.normalization,
+            full_covariance=hyperparams.full_covariance,
         )
 
         key = jax.random.PRNGKey(seed)

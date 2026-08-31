@@ -130,6 +130,28 @@ independently per axis.
    3.29 in 2-D) and resisted every knob tried here. A per-axis-factored categorical (or a
    policy that decouples the heads across coordinates) is the natural thing to test next.
 
+## Covariance parametrization
+
+The components' scale is a **Cholesky factor** `A` of the covariance (`Sigma = A A^T`,
+lower triangular, diagonal floored at `mmd.std_min`), not a `log`-standard-deviation
+vector; see `training/gaussian.py` for why the factor is the parametrization that keeps
+the KL regularizer uniformly strongly convex, and why an unconstrained square root is not.
+The MMD update is the exact natural gradient in those coordinates
+(`gaussian.natural_gradient`), which reduces on the diagonal to the `(sigma^2 grad_mu,
+1/2 grad_logsigma)` preconditioner this runner used before. The results above are
+unchanged by the switch: exp1 `0.0492`, exp4 `1.4477`, exp9 `0.1250`.
+
+`mmd.full_covariance: true` gives every component a full covariance instead of a diagonal
+one. **It does nothing on this game, by construction.** `MultiDimDecoyWellGame` is a sum of
+per-coordinate payoffs, so its expected value depends only on the per-axis marginals and its
+gradient w.r.t. every off-diagonal entry of `A` is identically zero -- the flag reproduces
+exp1's `0.0492` to four decimals. The same holds for `QuadraticZeroSumGame`,
+`ContinuousBlottoGame` and `ContinuousMatchingPennies`. The games in `games/examples.py`
+whose payoffs *do* couple a player's own coordinates are `CurvaturePumpGame` and
+`AsymmetricWellGame` (both contain `(sum_i a_i^2)^2`, hence `tr(Sigma^2) = sum_ij
+Sigma_ij^2`); this runner does not implement their closed-form expectations, so testing
+correlations idealized-style needs a non-separable game added first.
+
 ## Reproduce
 
 ```

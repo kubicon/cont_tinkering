@@ -44,8 +44,8 @@ def ppo_loss(
     value_coef: float,
     entropy_coef: float,
 ) -> tuple[chex.Array, dict[str, chex.Array]]:
-    mean, log_std, value_pred = jax.vmap(lambda o: network.apply(params, o))(batch.obs)
-    new_log_prob = gaussian_log_prob(batch.raw_action, mean, log_std)
+    mean, scale_tril, value_pred = jax.vmap(lambda o: network.apply(params, o))(batch.obs)
+    new_log_prob = gaussian_log_prob(batch.raw_action, mean, scale_tril)
     ratio = jnp.exp(new_log_prob - batch.log_prob)
 
     advantage = batch.reward - batch.value
@@ -56,7 +56,14 @@ def ppo_loss(
     policy_loss = -jnp.mean(jnp.minimum(surrogate_1, surrogate_2))
 
     value_loss = jnp.mean(jnp.square(value_pred - batch.reward))
-    entropy = gaussian_entropy(log_std)
+    # Averaged like the policy and value terms above, so `entropy_coef` weighs
+    # nats against them directly and does not silently scale with `num_envs`.
+    # (This term used to be summed, which made the effective weight
+    # `entropy_coef * num_envs`; the scale is state-independent, so every row of
+    # `scale_tril` is the same factor and the sum was exactly `num_envs` times
+    # this mean. Any `entropy_coef` tuned against the old form has to be
+    # multiplied by the `num_envs` it was tuned at.)
+    entropy = jnp.mean(gaussian_entropy(scale_tril))
 
     loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
     metrics = {

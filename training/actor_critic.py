@@ -1,11 +1,18 @@
-"""Actor-critic network and the diagonal Gaussian policy built on top of it.
+"""Actor-critic network and the Gaussian policy built on top of it.
 
 Reuses `nets.MLP` for both heads so the same activation/normalization
 toggles from `nets` apply here. The policy's action distribution is a
-diagonal Gaussian over the *unbounded* action produced by the actor head;
+Gaussian over the *unbounded* action produced by the actor head;
 `ActionSpace.clip` is applied only when the action is actually played in the
 game (the standard "clip at execution time, train on the unclipped
 Gaussian" convention used by most continuous-control PPO implementations).
+
+The scale is a Cholesky factor of the covariance, floored at
+`gaussian.SIGMA_MIN` -- diagonal by default, full with `full_covariance`. See
+`training.gaussian` for why the factor (rather than the variance, or a
+`log`-parametrized standard deviation) is the parametrization that keeps the
+KL regularizer uniformly strongly convex, and for the distribution formulas
+themselves.
 """
 
 from __future__ import annotations
@@ -18,6 +25,49 @@ import jax.numpy as jnp
 from games.spaces import MASKED_LOGIT
 from nets import MLP
 
+from .gaussian import (
+    SIGMA_MIN,
+    clamp_scale_tril,
+    diagonal_slots,
+    gaussian_entropy,
+    gaussian_kl,
+    gaussian_log_prob,
+    gaussian_sample,
+    pack_scale_tril,
+    scale_param_size,
+)
+
+__all__ = [
+    "ActorCritic",
+    "categorical_kl",
+    "gaussian_entropy",
+    "gaussian_kl",
+    "gaussian_log_prob",
+    "gaussian_sample",
+    "masked_categorical_entropy",
+    "masked_log_softmax",
+    "scale_init",
+]
+
+
+def scale_init(action_dim: int, full_covariance: bool):
+    """Initializer for a packed scale vector: unit diagonal, zero off-diagonal.
+
+    An uncorrelated unit-variance policy, i.e. what a `zeros` initializer used
+    to mean back when the head emitted `log_std`. It cannot mean that any more:
+    the head now emits the factor entries themselves, where zero is the
+    degenerate scale rather than the unit one.
+    """
+    slots = diagonal_slots(action_dim, full_covariance)
+    size = scale_param_size(action_dim, full_covariance)
+
+    def init_fn(key: chex.PRNGKey, shape: tuple[int, ...], dtype=jnp.float32) -> chex.Array:
+        del key
+        row = jnp.zeros((size,), dtype=dtype).at[slots].set(1.0)
+        return jnp.broadcast_to(row, shape).astype(dtype)
+
+    return init_fn
+
 
 class ActorCritic(nn.Module):
     """Shared-input, separate-head actor-critic: Gaussian policy + state-value baseline."""
@@ -26,9 +76,19 @@ class ActorCritic(nn.Module):
     hidden_dims: tuple[int, ...]
     activation: str = "tanh"
     normalization: str = "none"
+    # Correlate the action coordinates. Off by default: every separable payoff
+    # (see `training.gaussian`) has an expected value depending only on the
+    # per-axis marginals, so the off-diagonal entries would receive gradient
+    # from the KL term alone.
+    full_covariance: bool = False
 
     @nn.compact
     def __call__(self, obs: chex.Array, train: bool = False) -> tuple[chex.Array, chex.Array, chex.Array]:
+        """`(mean, scale_tril, value)` -- `scale_tril` is `(action_dim, action_dim)`.
+
+        The scale is state-independent (a bare parameter, not a head off the
+        torso), as it was when it was a `log_std` vector.
+        """
         mean = MLP(
             hidden_dims=self.hidden_dims,
             output_dim=self.action_dim,
@@ -37,7 +97,16 @@ class ActorCritic(nn.Module):
             output_activation="identity",
             name="actor",
         )(obs, train=train)
-        log_std = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
+        scale_flat = self.param(
+            "scale",
+            scale_init(self.action_dim, self.full_covariance),
+            (scale_param_size(self.action_dim, self.full_covariance),),
+        )
+        scale_tril = clamp_scale_tril(
+            pack_scale_tril(scale_flat, self.action_dim, self.full_covariance),
+            SIGMA_MIN,
+            jnp.inf,
+        )
         value = MLP(
             hidden_dims=self.hidden_dims,
             output_dim=1,
@@ -46,32 +115,7 @@ class ActorCritic(nn.Module):
             output_activation="identity",
             name="critic",
         )(obs, train=train)
-        return mean, log_std, jnp.squeeze(value, axis=-1)
-
-
-def gaussian_log_prob(action: chex.Array, mean: chex.Array, log_std: chex.Array) -> chex.Array:
-    """Log-density of a diagonal Gaussian, summed over the action dimensions."""
-    var = jnp.exp(2 * log_std)
-    per_dim = -0.5 * (jnp.square(action - mean) / var + 2 * log_std + jnp.log(2 * jnp.pi))
-    return jnp.sum(per_dim, axis=-1)
-
-
-def gaussian_entropy(log_std: chex.Array) -> chex.Array:
-    """Entropy of a diagonal Gaussian, summed over the action dimensions."""
-    return jnp.sum(log_std + 0.5 * jnp.log(2 * jnp.pi * jnp.e))
-
-
-def gaussian_kl(mean_p: chex.Array, log_std_p: chex.Array, mean_q: chex.Array, log_std_q: chex.Array) -> chex.Array:
-    """`KL(N_p || N_q)` between two diagonal Gaussians, summed over the action dimensions.
-
-    Unlike a mixture of Gaussians (generally intractable), a single diagonal
-    Gaussian has a closed form: `log(std_q/std_p) + (var_p + (mean_p -
-    mean_q)^2) / (2 * var_q) - 1/2` per dimension.
-    """
-    var_p = jnp.exp(2 * log_std_p)
-    var_q = jnp.exp(2 * log_std_q)
-    per_dim = (log_std_q - log_std_p) + (var_p + jnp.square(mean_p - mean_q)) / (2 * var_q) - 0.5
-    return jnp.sum(per_dim, axis=-1)
+        return mean, scale_tril, jnp.squeeze(value, axis=-1)
 
 
 def masked_log_softmax(logits: chex.Array, mask: chex.Array) -> chex.Array:

@@ -81,12 +81,14 @@ class SelfPlayPPOTrainer:
             hidden_dims=hyperparams_1.hidden_dims,
             activation=hyperparams_1.activation,
             normalization=hyperparams_1.normalization,
+            full_covariance=hyperparams_1.full_covariance,
         )
         self.network_2 = ActorCritic(
             action_dim=hyperparams_2.action_dim,
             hidden_dims=hyperparams_2.hidden_dims,
             activation=hyperparams_2.activation,
             normalization=hyperparams_2.normalization,
+            full_covariance=hyperparams_2.full_covariance,
         )
 
         key = jax.random.PRNGKey(seed)

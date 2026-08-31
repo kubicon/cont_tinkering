@@ -8,7 +8,7 @@ information set rather than from the full state, so a strategy is a
 a single distribution over actions.
 
 Nothing about the policy network has to change for this: `MixtureActorCritic`
-is already a map `obs -> (logits, means, log_stds, value)`, so feeding it the
+is already a map `obs -> (logits, means, scale_trils, value)`, so feeding it the
 observation of an infoset (rather than the constant zeros a stateless
 `ZeroSumGame` hands it) is exactly "produce the local behavioral strategy at
 this decision point".

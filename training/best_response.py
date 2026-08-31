@@ -136,14 +136,14 @@ def policy_action_fn(
     num_atoms = network.num_atoms
 
     def action_fn(obs: chex.Array, mask: chex.Array, key: chex.PRNGKey) -> HybridAction:
-        logits, means, log_stds, _ = network.apply(params, obs)
+        logits, means, scale_trils, _ = network.apply(params, obs)
         component_mask = expand_kind_mask(mask, network.num_components)
         if greedy:
             component = jnp.argmax(jnp.where(component_mask, logits, MASKED_LOGIT))
             raw_action = means[gaussian_component_index(component, num_atoms)]
         else:
             component, raw_action = sample_mixture_component(
-                logits, means, log_stds, component_mask, num_atoms, key
+                logits, means, scale_trils, component_mask, num_atoms, key
             )
         return HybridAction(
             kind=component_to_kind(component, num_atoms), value=space.box.clip(raw_action)

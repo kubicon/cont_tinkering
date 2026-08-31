@@ -43,6 +43,13 @@ class NetworkConfig:
     activation: str = "gelu"
     normalization: str = "rms_norm"
     num_components: int = 2
+    # Give each Gaussian component a full covariance (a lower-triangular
+    # Cholesky factor) instead of a diagonal one. Only meaningful for a
+    # multi-dimensional action, and only useful when the payoff actually couples
+    # a player's own coordinates: a separable payoff's expectation depends on
+    # the per-axis marginals alone, so the off-diagonal entries get exactly zero
+    # payoff gradient. See `training.gaussian`.
+    full_covariance: bool = False
     clip_means: bool = False  # constrain the mean head to the action box; see `MixtureActorCritic`
     # Pulls a mean that drifts out of the box back to its edge; only bites with
     # `clip_means` on. See `training.mixture.mean_box_excess`.
