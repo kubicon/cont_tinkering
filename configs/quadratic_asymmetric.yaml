@@ -1,0 +1,97 @@
+# QuadraticAsymmetricGame -- one file, both scripts:
+#
+#   python train.py         configs/quadratic_asymmetric.yaml   # sampled, function approximator
+#   python run_idealized.py configs/quadratic_asymmetric.yaml   # exact, no network, same hparams
+#
+# payoff(a1, a2) = ||a1||^2 * sum(a2) - ||a2||^2 * ||a1||^2 on [-1, 1]^dim.
+# Asymmetric in the two roles. `dim: 1` keeps run_idealized's quadrature
+# backend (1-D box games only) applicable.
+
+game:
+  name: quadratic_asymmetric
+  dim: 2
+
+network:
+  hidden_dims: [64, 64]   # (default)
+  activation: gelu        # (default)
+  normalization: rms_norm # (default)
+  num_components: 1      # (default) mixture components per player's policy
+  full_covariance: false # (default) inert -- payoff separates over a player's own coords
+
+optimizer:
+  learning_rate: 0.001  # (default)
+  max_grad_norm: 0.5    # (default)
+  optimizer: adam        # (default) adam | adamw | muon
+  weight_decay: 0.0      # (default) only adamw/muon support this
+
+ppo:
+  clip_eps: 0.1          # (default)
+  value_coef: 0.5        # (default)
+  batch_size: 256        # (default) num_envs
+  ppo_epochs: 1          # (default)
+
+  # --- target/magnet parameter tracking ---
+  target_tau: 0.001       # (default) EMA rate for the target/magnet network
+  magnet_interval: 500    # (default) steps between hard magnet snapshots
+
+  # --- entropy bonus, split per head ---
+  category_entropy_coef: 0.1  # (default)
+  gaussian_entropy_coef: 0.1  # (default)
+
+  # --- KL regularization, split per head (0 disables a term) ---
+  trpo_category_kl_coef: 0.05    # (default) KL(new || old), trust-region style
+  trpo_gaussian_kl_coef: 0.00    # (default)
+  magnet_category_kl_coef: 0.2   # (default) KL(new || magnet), proximal anchor
+  magnet_gaussian_kl_coef: 0.0   # (default)
+
+train:
+  mode: self_play    # self_play | fixed_opponent
+  perspective: 0          # (default) fixed_opponent: which player (0 or 1) trains
+  opponent: random         # fixed_opponent: random | static
+
+  steps: 200               # (default) outer steps (each logs + checkpoints once)
+  epochs: 200               # (default) inner training iterations per outer step
+  checkpoint_dir: data/quadratic_asymmetric  # set to null to disable checkpointing
+  seed: 123                  # (default)
+
+# Consumed by `run_idealized.py` only; `train.py` accepts and ignores this section.
+# Every field is at its default; see `IdealizedSection` in run_idealized.py.
+idealized:
+  backend: auto            # (default) auto-picks `quadrature` -- this game has no closed form
+  grid_points: 101         # (default) quadrature resolution per axis
+  max_quadrature_gib: 2.0  # (default)
+  normalize_density: true  # (default)
+
+  full_covariance: null    # (default) null inherits `network.full_covariance`
+
+  # --- `backend: sampled` only; ignored otherwise ---
+  samples: null            # (default) null = ppo.batch_size draws per iteration
+  sample_seed: null        # (default) null = train.seed
+  q_estimator: responsibility  # (default) responsibility | per_component | onpolicy
+  grad_estimator: pathwise     # (default) pathwise | score
+  entropy_source: sampled      # (default) sampled | exact
+
+  std_min: 0.001           # (default) mirrors `training.mixture.LOG_STD_MIN`
+  std_max: null            # (default) null = `high - low`
+
+  train_means: true        # (default)
+  train_std: true          # (default)
+  freeze_weights: false    # (default) true pins the categorical head
+
+  gaussian_entropy: marginal  # (default) marginal | component
+  kl_weighting: policy        # (default) policy | uniform
+
+  # Graduated optimization / mean-repulsion sweep: off by default.
+  anneal_std_from: 0.0     # (default) 0 disables
+  repulsion_coef: 0.0      # (default) 0 disables
+  repulsion_ramp: 0.2      # (default)
+  repulsion_hold: 0.5      # (default)
+
+  # Initial mixture -- defaults reproduce the trainer's own init exactly.
+  init_means: spread       # (default) component k at (k+0.5)/K of the box
+  init_weights: null       # (default) null = uniform
+  init_log_std: null       # (default) null = (high-low)/(2K)
+
+  log_rows: 16             # (default)
+  log_out: null            # (default) null = <train.checkpoint_dir>/idealized_history.json
+  verbose: true            # (default) one line per outer step

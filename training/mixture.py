@@ -1,40 +1,4 @@
 """A two-phase (discrete-then-continuous) actor-critic.
-
-`ActorCritic` (see `actor_critic.py`) is a single diagonal Gaussian: it can
-represent one continuous mode. Some games (see
-`games.examples.ContinuousMatchingPennies`) have Nash equilibria that are
-genuinely multi-modal — a mix over a handful of distinct points in an
-otherwise continuous action space — which a unimodal Gaussian cannot
-represent no matter how it's trained.
-
-`MixtureActorCritic` fixes that by picking, per action, one of
-`num_components` categorical "phases" and then sampling a Gaussian centered
-on that phase's own mean. Concretely: sample a component `k ~ Categorical
-(logits)`, then `action ~ Normal(means[k], std)`. Training needs its own
-rollout/loss functions because the policy now has a discrete part.
-
-**Atoms.** The categorical head is widened to `num_atoms + num_components`,
-and the first `num_atoms` entries are *point masses* -- discrete actions
-carrying no continuous parameter at all (fold, check, call in a poker-like
-game; see `games.spaces.HybridSpace`). Drawing one of those is the whole
-action: no Gaussian is consulted, so its log-prob, its KL and its entropy
-contribution are all masked out of the loss for that sample. This is what
-makes the probability of a discrete choice a *number the policy states*,
-rather than an integral of the Gaussian mixture over some region of the
-action space -- and hence what gives that choice a real categorical policy
-gradient instead of the gradient of a piecewise-constant payoff.
-
-**Legality masks.** A game may forbid some kinds at some nodes (calling with
-no bet outstanding). `action_mask` on the `Episode` records, per sample,
-which categorical logits were legal *when it was sampled*; every softmax,
-entropy and KL in the loss re-applies it. Skipping that would leave the PPO
-importance ratios comparing against a distribution that was never sampled
-from. The mask is over logits, not kinds: `expand_kind_mask` replicates the
-continuous kind's bit across all `num_components` Gaussian components.
-
-With `num_atoms == 0` and an all-`True` mask, every one of those terms
-collapses back to the plain mixture policy, which is what the one-shot games
-in `games.examples` use.
 """
 
 from __future__ import annotations
@@ -60,12 +24,16 @@ from .actor_critic import (
 )
 from .config import MixturePPOHyperparams
 from .gaussian import (
+    LOG_SIGMA_MIN,
     SIGMA_MIN,
     clamp_scale_tril,
     diagonal_slots,
     pack_scale_tril,
     scale_param_size,
+    scale_tril_from_log_diag,
 )
+
+SCALE_PARAMETERIZATIONS = ("linear", "log")
 
 OpponentActionFn = Callable[[chex.PRNGKey, int], chex.Array]
 
@@ -91,15 +59,19 @@ def _spread_bias_init(low: chex.Array, high: chex.Array, num_components: int) ->
 
 
 def _scale_bias_init(
-    low: chex.Array, high: chex.Array, num_components: int, full_covariance: bool
+    low: chex.Array,
+    high: chex.Array,
+    num_components: int,
+    full_covariance: bool,
+    scale_parameterization: str = "linear",
 ) -> Callable:
     """Bias initializer for `scale_head`, scaled to the action range.
 
-    Puts the same per-axis standard deviation the old `log_std` init used on
-    the *diagonal* of every component's factor and leaves every off-diagonal
-    entry at zero: the policy starts uncorrelated, and turning
-    `full_covariance` on therefore changes nothing about the initial policy --
-    only what it is free to become.
+    The same initial policy either way -- each component's conditional standard
+    deviation is one `num_components`-th of the box's half width, uncorrelated --
+    written in whichever coordinate the head emits. Under `"log"` the diagonal
+    carries `log std` and the off-diagonal stays at zero, which is exactly the
+    `S = 0` that makes `I + S` the identity.
     """
     action_dim = low.shape[0]
     slots = diagonal_slots(action_dim, full_covariance)
@@ -108,7 +80,8 @@ def _scale_bias_init(
     def init_fn(key: chex.PRNGKey, shape: tuple[int, ...], dtype=jnp.float32) -> chex.Array:
         del key
         std = jnp.maximum(_action_width(low, high) / (2 * num_components), MIN_ACTION_WIDTH)
-        row = jnp.zeros((size,), dtype=dtype).at[slots].set(std.astype(dtype))
+        diag = jnp.log(std) if scale_parameterization == "log" else std
+        row = jnp.zeros((size,), dtype=dtype).at[slots].set(diag.astype(dtype))
         values = jnp.broadcast_to(row[None, :], (num_components, size))
         return values.reshape(shape).astype(dtype)
 
@@ -123,21 +96,6 @@ def _has_width(low: chex.Array, high: chex.Array) -> chex.Array:
 def project_means_to_box(means: chex.Array, low: chex.Array, high: chex.Array) -> chex.Array:
     """`clip(means, low, high)`, straight-through: the raw mean still gets a gradient.
 
-    A plain `jnp.clip` has zero derivative outside the box, so a mean that ever
-    leaves it stops being trained at all at that observation -- it can only
-    move again as a side effect of the torso shifting for *other* inputs. Here
-    the value every consumer sees is the projected mean, while the derivative
-    w.r.t. the mean head is the identity: the gradient the loss takes at the
-    boundary is the one the raw mean receives.
-
-    On its own that trades a dead gradient for an unbounded one -- see
-    `mean_box_excess` for the restoring force that goes with it.
-
-    A zero-width dimension (`configs/kuhn_classic.yaml`'s fixed bet size, where
-    `min_bet == max_bet`) is the one case a dead gradient is the right answer:
-    the mean is a constant the game leaves nothing to learn about, so passing
-    it a gradient only feeds noise through the shared torso into the heads that
-    do matter. Those dimensions stay frozen.
     """
     projected = jnp.clip(means, low, high)
     return jnp.where(
@@ -149,18 +107,6 @@ def project_means_to_box(means: chex.Array, low: chex.Array, high: chex.Array) -
 
 def mean_box_excess(means: chex.Array, low: chex.Array, high: chex.Array) -> chex.Array:
     """Summed squared distance of `means` from `[low, high]`; `0.0` inside the box.
-
-    Weighted by `mean_box_penalty_coef` and added to the PPO loss, this is the
-    restoring force `project_means_to_box` lacks. It is needed because the
-    outward pressure is real, not hypothetical: the Gaussian factor scores
-    `Episode.raw_action`, the *unclipped* sample (only the action handed to the
-    game is clipped), so whenever the optimal action is the boundary itself the
-    good advantage sits on samples past it and `dlogp/dmu` keeps pointing out.
-    Straight-through, the raw mean would walk out arbitrarily far -- behaving
-    correctly the whole time, since the projected mean stays pinned to the
-    boundary, but owing every one of those steps back the moment the optimum
-    moves inward. The penalty parks it just outside instead, where the outward
-    policy gradient balances the inward pull.
     """
     excess = jnp.maximum(means - high, 0.0) + jnp.maximum(low - means, 0.0)
     # Frozen dimensions (see `project_means_to_box`) have nothing to pull back.
@@ -169,12 +115,6 @@ def mean_box_excess(means: chex.Array, low: chex.Array, high: chex.Array) -> che
 
 class MixtureActorCritic(nn.Module):
     """Shared torso, four linear heads: component logits, means, scales, value.
-
-    Each Gaussian component carries its own Cholesky factor of the covariance
-    (see `training.gaussian`), diagonal unless `full_covariance`. The head emits
-    the `d(d+1)/2` free lower-triangular entries per component -- or just the
-    `d` diagonal ones -- and they are packed into the factor and floored here,
-    so no caller ever sees an unclamped or non-triangular scale.
     """
 
     action_dim: int
@@ -188,6 +128,9 @@ class MixtureActorCritic(nn.Module):
     num_atoms: int = 0
     # Correlate the action coordinates within a component; see `training.gaussian`.
     full_covariance: bool = False
+    # "linear" or "log"; see `training.config.PPOHyperparams.scale_parameterization`.
+    scale_parameterization: str = "linear"
+    max_correlation: float = 0.0
 
     @nn.compact
     def __call__(
@@ -195,13 +138,6 @@ class MixtureActorCritic(nn.Module):
     ) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
         """`(logits, means, scale_trils, value)`; `scale_trils` is `(K, d, d)`.
 
-        `project_means=False` returns the mean head *unprojected*.
-
-        Only the loss passes it: the projection is not invertible, so a caller
-        that needs to know how far outside the box the raw mean sits (to
-        penalize it, see `mean_box_excess`) has to do the projection itself.
-        Everything that just wants to act -- rollouts, best responses,
-        evaluation -- takes the default and sees in-box means.
         """
         torso = obs
         for dim in self.hidden_dims:
@@ -222,22 +158,39 @@ class MixtureActorCritic(nn.Module):
             means = project_means_to_box(means, self.low, self.high)
 
         scale_size = scale_param_size(self.action_dim, self.full_covariance)
+        if self.scale_parameterization not in SCALE_PARAMETERIZATIONS:
+            raise ValueError(
+                f"scale_parameterization must be one of {SCALE_PARAMETERIZATIONS}, "
+                f"got {self.scale_parameterization!r}"
+            )
         scale_flat = nn.Dense(
             self.num_components * scale_size,
             kernel_init=nn.initializers.zeros,
             bias_init=_scale_bias_init(
-                self.low, self.high, self.num_components, self.full_covariance
+                self.low, self.high, self.num_components, self.full_covariance,
+                self.scale_parameterization,
             ),
             name="scale_head",
         )(torso)
-        scale_tril = pack_scale_tril(
-            scale_flat.reshape(self.num_components, scale_size),
-            self.action_dim,
-            self.full_covariance,
-        )
-        # Floor on the conditional standard deviations, ceiling at the box width:
-        # the projection onto the feasible set of factors, straight-through.
-        scale_tril = clamp_scale_tril(scale_tril, SIGMA_MIN, _action_width(self.low, self.high))
+        scale_raw = scale_flat.reshape(self.num_components, scale_size)
+        # Floor on the conditional standard deviations, ceiling at the box width,
+        # in whichever coordinate the head emits. Straight-through either way, so
+        # a saturated component keeps receiving gradient.
+        if self.scale_parameterization == "log":
+            scale_tril = scale_tril_from_log_diag(
+                scale_raw,
+                self.action_dim,
+                self.full_covariance,
+                LOG_SIGMA_MIN,
+                jnp.log(_action_width(self.low, self.high)),
+                self.max_correlation,
+            )
+        else:
+            scale_tril = pack_scale_tril(scale_raw, self.action_dim, self.full_covariance)
+            # The projection onto the feasible set of factors.
+            scale_tril = clamp_scale_tril(
+                scale_tril, SIGMA_MIN, _action_width(self.low, self.high)
+            )
 
         value = nn.Dense(1, name="value_head")(torso)
 
@@ -861,4 +814,6 @@ def build_mixture_network(hyperparams: MixturePPOHyperparams) -> MixtureActorCri
         clip_means=hyperparams.clip_means,
         num_atoms=hyperparams.num_atoms,
         full_covariance=hyperparams.full_covariance,
+        scale_parameterization=hyperparams.scale_parameterization,
+        max_correlation=hyperparams.max_correlation,
     )

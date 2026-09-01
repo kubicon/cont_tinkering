@@ -82,6 +82,8 @@ class SelfPlayPPOTrainer:
             activation=hyperparams_1.activation,
             normalization=hyperparams_1.normalization,
             full_covariance=hyperparams_1.full_covariance,
+            scale_parameterization=hyperparams_1.scale_parameterization,
+            max_correlation=hyperparams_1.max_correlation,
         )
         self.network_2 = ActorCritic(
             action_dim=hyperparams_2.action_dim,
@@ -89,6 +91,8 @@ class SelfPlayPPOTrainer:
             activation=hyperparams_2.activation,
             normalization=hyperparams_2.normalization,
             full_covariance=hyperparams_2.full_covariance,
+            scale_parameterization=hyperparams_2.scale_parameterization,
+            max_correlation=hyperparams_2.max_correlation,
         )
 
         key = jax.random.PRNGKey(seed)

@@ -19,7 +19,7 @@ approximation stripped out:
 
 Because every game in `games/` hands both players a constant observation, the
 network in `train.py` is only an overparameterized container for
-`(logits, means, log_std, value)` -- so the two scripts optimize the *same*
+`(logits, means, scale_tril, value)` -- so the two scripts optimize the *same*
 strategy space and a difference between their runs is attributable to
 sampling noise and the optimizer/parameterization, nothing else.
 
@@ -33,26 +33,45 @@ The older standalone schema (`mmd:` / `init:` / `log:` -- see
 `configs/idealized_*.yaml`) is still accepted; it is selected automatically by
 the presence of an `mmd:` section.
 
-Three payoff backends; the first two are auto-selected (override with
+The policy is a K-component multivariate Gaussian mixture over a `d`-dimensional
+box, `d` read off the game -- means `(K, d)` and a Cholesky factor `(K, d, d)` of
+each component's covariance, the same parametrization `train.py`'s policy uses
+(`training/gaussian.py`). `idealized.full_covariance` picks a full factor over a
+diagonal one, inheriting `network.full_covariance` when a shared config sets it. The
+Gaussian head's update is the exact natural gradient in those coordinates
+(`gaussian.natural_gradient`), which on a diagonal factor is the
+`(sigma^2 grad_mu, 1/2 grad_log_sigma)` preconditioner this solver has always used.
+
+Four payoff backends; the first three are auto-selected (override with
 `idealized.backend`):
 
-  closed_form -- exact Gaussian convolutions. Requires the game to expose the
-                 `MultiPointGame` structure (`.peaks`, `._target_moments`, ...);
-                 covers `multi_point` and `decoy_well`. Self-play only.
-  quadrature  -- discretizes the action interval and integrates numerically.
-                 Works for ANY 1-D box game (`quadratic`, `forsaken`,
-                 `matching_pennies`, ...), at the cost of grid error.
-  sampled     -- the middle ground with `train.py`: the tabular mirror step is
-                 kept, but the payoff integral is replaced by `ppo.batch_size`
-                 Monte-Carlo action draws per iteration, exactly as a rollout
-                 does. Never auto-selected -- ask for it with
-                 `idealized.backend: sampled`. `idealized.samples -> inf`
-                 recovers the quadrature run, which makes the sample count a
-                 dial between the two scripts with nothing else changing.
+  closed_form  -- exact Gaussian convolutions, 1-D. Requires the game to expose the
+                  `MultiPointGame` structure (`.peaks`, `._target_moments`, ...);
+                  covers `multi_point` and `decoy_well`. Self-play only.
+  closed_form_multidim
+               -- the same, lifted to the separable `multidim_decoy_well` game
+                  (`idealized_mmd_multidim.py`): per-axis convolutions summed over
+                  coordinates, best responses by `d` independent 1-D grid searches.
+                  Self-play only.
+  quadrature   -- discretizes the action box and integrates numerically. Works for
+                  ANY box game (`quadratic`, `forsaken`, `matching_pennies`, ...),
+                  at the cost of grid error -- and, in `d > 1`, of a payoff matrix
+                  with `grid_points^(2d)` entries, so it is practical only on a
+                  coarse grid in 2-D and refuses outright when the matrix will not
+                  fit (`idealized.max_quadrature_gib`). Prefer `sampled` above 1-D.
+  sampled      -- the middle ground with `train.py`: the tabular mirror step is
+                  kept, but the payoff integral is replaced by `ppo.batch_size`
+                  Monte-Carlo action draws per iteration, exactly as a rollout
+                  does. Its cost is independent of `d`, which makes it the backend
+                  for a genuinely multidimensional game. Never auto-selected -- ask
+                  for it with `idealized.backend: sampled`. `idealized.samples ->
+                  inf` recovers the quadrature run, which makes the sample count a
+                  dial between the two scripts with nothing else changing.
 
 Example:
   python run_idealized.py configs/quadratic.yaml
   python run_idealized.py configs/idealized_two_point.yaml
+  python run_idealized.py configs/multidim/exp4_2d_2peak_decoy.yaml
 """
 
 from __future__ import annotations
@@ -72,15 +91,62 @@ jax.config.update("jax_enable_x64", True)
 
 from games.base import ZeroSumGame
 from games.configs import GAME_CONFIGS
+from games.examples import MultiDimDecoyWellGame
 from games.sequential import SequentialZeroSumGame
 from games.spaces import BoxSpace
 from idealized_mmd import (
-    Params,
+    Params as Params1D,
     component_q as closed_form_component_q,
     expected_payoff as closed_form_expected_payoff,
     exploitability as closed_form_exploitability,
 )
+import idealized_mmd_multidim as multidim
+from training.gaussian import (
+    clamp_scale_tril,
+    diagonal_slots,
+    gaussian_kl,
+    gaussian_log_prob,
+    gaussian_sample,
+    log_scale_det,
+    marginal_std,
+    natural_gradient,
+    pack_scale_tril,
+    scale_param_size,
+    tril_positions,
+)
 from training.run_config import RunConfig, run_config_from_dict
+
+
+class Params(NamedTuple):
+    """One player's mixture policy -- the solver's entire parameter vector.
+
+    The same shape as `training.mixture.MixtureActorCritic`'s four heads minus the
+    critic: a categorical over `K` components, each a multivariate Gaussian given by
+    its mean and a lower-triangular Cholesky factor `A` of its covariance
+    (`Sigma = A A^T`). `d == 1` is the scalar-action case the solver started life as,
+    where `A` is the `(1, 1)` matrix holding the standard deviation.
+
+    The factor, rather than a `log`-standard-deviation vector, is what makes the
+    parametrization work in `d > 1`: see `training/gaussian.py` for why it keeps the
+    KL regularizer uniformly strongly convex, and `natural_gradient` for the step
+    this solver takes in these coordinates.
+    """
+
+    logits: jnp.ndarray      # (K,)       categorical logits over the K components
+    means: jnp.ndarray       # (K, d)     each component's Gaussian mean
+    scale_tril: jnp.ndarray  # (K, d, d)  each component's Cholesky covariance factor
+
+
+def _to_1d(p: Params) -> Params1D:
+    """View a `d == 1` policy as `idealized_mmd`'s scalar one, differentiably.
+
+    The 1-D closed-form backend predates the factor parametrization and speaks
+    `(means, log_std)`; this is the only place the two meet. Gradients flow back
+    through `log` into `scale_tril` unchanged, so the caller never sees the seam.
+    """
+    return Params1D(logits=p.logits,
+                    means=p.means[:, 0],
+                    log_std=jnp.log(marginal_std(p.scale_tril))[:, 0])
 
 
 # --------------------------------------------------------------------------- config
@@ -96,12 +162,28 @@ class IdealizedSection:
     """
 
     # --- payoff backend ---
-    backend: str = "auto"                  # "auto" | "closed_form" | "quadrature"
-    grid_points: int = 801                 # quadrature backend; also the grid the
-                                           #   closed-form backend integrates its
-                                           #   `gaussian_entropy: marginal` term on
+    backend: str = "auto"                  # "auto" | "closed_form" | "closed_form_multidim"
+                                           #   | "quadrature" | "sampled"
+    grid_points: int = 801                 # quadrature backend, *per axis*; also the grid
+                                           #   the closed-form backends integrate their
+                                           #   `gaussian_entropy: marginal` term on. The
+                                           #   quadrature grid has `grid_points^d` nodes and
+                                           #   its payoff matrix `grid_points^(2d)` entries,
+                                           #   so this must come down sharply above 1-D.
+    max_quadrature_gib: float = 2.0        # refuse to build a payoff matrix larger than
+                                           #   this, rather than dying in the allocator
     normalize_density: bool = True         # renormalize each mixture on the grid, so a
                                            #   component narrower than `dx` keeps its mass
+
+    # --- covariance shape. Mirrors `network.full_covariance`: a full lower-triangular
+    #     Cholesky factor per component instead of a diagonal one. Inert on a game
+    #     whose payoff separates over a player's own coordinates (every game in
+    #     `games/examples.py` except `curvature_pump` / `asymmetric_well`): such a
+    #     payoff's gradient on an off-diagonal entry vanishes wherever that entry is
+    #     zero, and the init is uncorrelated, so the extra parameters never move.
+    #     `null` (the default) inherits `network.full_covariance`, so one field in a
+    #     shared config sets the covariance shape for both scripts at once. ---
+    full_covariance: bool | None = None
 
     # --- `backend: sampled` only. The payoff integral becomes an average over
     #     `samples` joint action draws, redrawn once per iteration (and reused
@@ -158,9 +240,14 @@ class IdealizedSection:
 
     # --- initial mixture. Defaults reproduce the trainer's own init exactly
     #     (`training.mixture._spread_bias_init` / `_std_bias_init`). ---
-    init_means: Any = "spread"             # "spread" | list[float] | list[list[float]] (per player)
+    init_means: Any = "spread"             # "spread" (component k at (k+0.5)/K of the box in
+                                           #   every axis -- the diagonal) | a nested list
+                                           #   shaped (K,), (K, d), or (2, K, d) per player
     init_weights: Any = None               # None (uniform) | list[float]
-    init_log_std: Any = None               # None -> (high-low)/(2K), as the trainer does
+    init_log_std: Any = None               # None -> (high-low)/(2K), as the trainer does.
+                                           #   A *standard deviation* despite the name, put
+                                           #   on the factor's diagonal (the init is always
+                                           #   uncorrelated, `full_covariance` or not)
 
     # --- logging ---
     log_rows: int = 16                     # rows in the end-of-run summary table
@@ -274,7 +361,11 @@ def _shared_to_solver(cfg: RunConfig, idealized: IdealizedSection) -> SolverConf
         mode=cfg.train.mode,
         perspective=cfg.train.perspective,
         opponent=cfg.train.opponent,
-        idealized=idealized,
+        idealized=dataclasses.replace(
+            idealized,
+            full_covariance=(cfg.network.full_covariance if idealized.full_covariance is None
+                             else idealized.full_covariance),
+        ),
     )
 
 
@@ -297,6 +388,7 @@ class _LegacyMMDSection:
     repulsion_ramp: float = 0.2
     repulsion_hold: float = 0.5
     freeze_weights: bool = False
+    full_covariance: bool = False
     backend: str = "auto"
     grid_points: int = 801
 
@@ -350,6 +442,7 @@ def _legacy_to_solver(raw: dict) -> SolverConfig:
             train_means=mmd.train_means,
             train_std=mmd.train_std,
             freeze_weights=mmd.freeze_weights,
+            full_covariance=mmd.full_covariance,
             gaussian_entropy="component",   # legacy term: sum(log_std)
             kl_weighting="uniform",         # legacy term: plain sum over components
             init_means=init.means,
@@ -405,61 +498,88 @@ def load_config(path: str | Path) -> tuple[Any, SolverConfig, RunConfig | None]:
 # say nothing.
 
 
-def _density_grid(lo: float, hi: float, n: int, std_max: float):
-    """The padded integration grid both backends integrate densities on.
+def _density_grid(lo: np.ndarray, hi: np.ndarray, n: int, std_max: np.ndarray):
+    """The padded integration grid the grid backends integrate densities on.
+
+    Returns `(nodes, dv, per_axis)`: `nodes` is `(n**d, d)`, the cartesian product of
+    `d` per-axis grids of `n` points each, in C order; `dv` is the volume element
+    `prod_j dx_j`; `per_axis` is the list of 1-D grids, which the exploitability
+    search and the grid-resolution warning still want separately.
 
     Padded by `4 * std_max` on each side so a wide component's tails are not
     truncated; the payoff is only ever evaluated (and best responses only ever
-    taken) on the `in_box` part.
+    taken) on the `in_box` part. Note the node count is `n**d`: this is the grid
+    backends' whole scaling problem, and the reason `sampled` exists.
     """
-    grid = jnp.linspace(lo - 4.0 * std_max, hi + 4.0 * std_max, n, dtype=jnp.float64)
-    return grid, float(grid[1] - grid[0])
+    axes = [jnp.linspace(lo[j] - 4.0 * std_max[j], hi[j] + 4.0 * std_max[j], n, dtype=jnp.float64)
+            for j in range(len(lo))]
+    dv = float(np.prod([float(a[1] - a[0]) for a in axes]))
+    nodes = jnp.stack(jnp.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, len(axes))
+    return nodes, dv, axes
 
 
-def _component_densities(p: Params, grid, dx: float, normalize: bool):
-    """Per-component density on `grid`, each renormalized to unit mass if `normalize`
-    -- otherwise a component narrower than `dx` silently loses its mass between grid
-    points."""
-    s = jnp.exp(p.log_std)
-    comp = jnp.exp(-((grid[None, :] - p.means[:, None]) ** 2) / (2 * s[:, None] ** 2))
-    comp = comp / (jnp.sqrt(2 * jnp.pi) * s[:, None])
+def _log_prob_at(nodes, mean, scale_tril):
+    """`log N(node | mean, A A^T)` for a batch of nodes against ONE component -> `(M,)`.
+
+    `gaussian.gaussian_log_prob` broadcasts its leading axes elementwise (its
+    triangular solve needs the action and the factor to agree on them), so a batch of
+    actions against a single component is a `vmap`, not a broadcast.
+    """
+    return jax.vmap(gaussian_log_prob, in_axes=(0, None, None))(nodes, mean, scale_tril)
+
+
+def _component_densities(p: Params, nodes, dv: float, normalize: bool):
+    """Per-component density at every grid node, `(K, n**d)`.
+
+    Each renormalized to unit mass if `normalize` -- otherwise a component narrower
+    than the grid spacing silently loses its mass between nodes. In `d > 1` the
+    density is the full multivariate one, so a correlated component is represented
+    exactly rather than by its marginals.
+    """
+    log_p = jax.vmap(_log_prob_at, in_axes=(None, 0, 0))(nodes, p.means, p.scale_tril)
+    comp = jnp.exp(log_p)                                        # (K, n**d)
     if normalize:
-        comp = comp / (jnp.sum(comp, axis=-1, keepdims=True) * dx + 1e-300)
-    return comp  # (K, n)
+        comp = comp / (jnp.sum(comp, axis=-1, keepdims=True) * dv + 1e-300)
+    return comp
 
 
-def _marginal_entropy(p: Params, grid, dx: float, normalize: bool):
-    """Exact differential entropy of the mixture, `-int p log p` on `grid` -- what
+def _marginal_entropy(p: Params, nodes, dv: float, normalize: bool):
+    """Exact differential entropy of the mixture, `-int p log p` on the grid -- what
     `mixture_ppo_loss` estimates with `-mixture_marginal_log_prob(...)`."""
     w = jax.nn.softmax(p.logits)
-    d = jnp.sum(w[:, None] * _component_densities(p, grid, dx, normalize), axis=0)
-    return -jnp.sum(d * jnp.log(d + 1e-300)) * dx
+    d = jnp.sum(w[:, None] * _component_densities(p, nodes, dv, normalize), axis=0)
+    return -jnp.sum(d * jnp.log(d + 1e-300)) * dv
 
 
 class ClosedFormBackend:
-    """Exact Gaussian convolutions -- only for the `MultiPointGame` family."""
+    """Exact Gaussian convolutions -- 1-D, and only for the `MultiPointGame` family.
+
+    The `handle` a payoff question is asked about is the policy itself: this backend
+    integrates two mixtures against each other analytically, with no grid in between
+    (the grid it does hold is only for the entropy term below).
+    """
 
     name = "closed_form"
     supports_fixed_opponent = False
     stochastic = False
 
-    def __init__(self, game: ZeroSumGame, grid, dx: float, normalize: bool):
+    def __init__(self, game: ZeroSumGame, nodes, dv: float, normalize: bool):
         self.game = game
         # payoffs are closed-form, but a mixture's differential entropy is not, so
         # `entropy` still needs a grid -- see the note on `entropy` below.
-        self._grid, self._dx, self._normalize = grid, dx, normalize
+        self._nodes, self._dv, self._normalize = nodes, dv, normalize
 
     def handle(self, p: Params, noise=None, player: int = 0) -> Params:
         return p
 
     def expected_payoff(self, h0, h1):
-        return closed_form_expected_payoff(h0, h1, self.game)
+        return closed_form_expected_payoff(_to_1d(h0), _to_1d(h1), self.game)
 
     def component_q(self, p: Params, h_opp, sign: float, noise=None):
-        return closed_form_component_q(p, h_opp, self.game, sign)
+        return closed_form_component_q(_to_1d(p), _to_1d(h_opp), self.game, sign)
 
     def exploitability(self, h0, h1):
-        return closed_form_exploitability(h0, h1, self.game)
+        return closed_form_exploitability(_to_1d(h0), _to_1d(h1), self.game)
 
     def entropy(self, p: Params, noise=None, player: int = 0):
         """Exact differential entropy of the mixture, integrated on a grid.
@@ -473,61 +593,136 @@ class ClosedFormBackend:
         Integrating costs one `(K, grid_points)` array per call, which is cheap
         next to the closed-form payoff this backend exists for.
         """
-        return _marginal_entropy(p, self._grid, self._dx, self._normalize)
+        return _marginal_entropy(p, self._nodes, self._dv, self._normalize)
+
+
+class ClosedFormMultiDimBackend:
+    """`ClosedFormBackend` lifted to the separable `multidim_decoy_well` game.
+
+    Same contract, same exactness, `d` dimensions: the integrals live in
+    `idealized_mmd_multidim.py` and reduce to per-axis Gaussian convolutions summed
+    over coordinates, because the game's payoff is a sum of per-coordinate terms.
+    The exploitability's best responses separate the same way, into `d` independent
+    1-D grid searches -- which is what keeps this backend free of the `grid^d`
+    blow-up the quadrature one suffers.
+
+    That separability is also the backend's one caveat: only the *marginal* variances
+    enter, and an off-diagonal entry `A_ij` reaches those only through its own square
+    (`Sigma_ii = sum_j A_ij^2`), so the payoff's gradient on it *vanishes at zero*.
+    Since `build_init` always starts uncorrelated, `idealized.full_covariance` is
+    inert here by construction -- nothing in the objective can push a component off
+    the diagonal, the magnet KL least of all (it pulls back toward the snapshot's
+    correlations, which are zero too). The flag is not useless in general, just on
+    this game; a payoff with genuine cross-coordinate structure (`curvature_pump`,
+    `asymmetric_well`) needs the `sampled` backend, whose expectations this module
+    does not have to know.
+    """
+
+    name = "closed_form_multidim"
+    supports_fixed_opponent = False
+    stochastic = False
+
+    def __init__(self, game: MultiDimDecoyWellGame, nodes, dv: float, normalize: bool):
+        self.game = game
+        self.geom = multidim.geometry(game)
+        self._nodes, self._dv, self._normalize = nodes, dv, normalize
+
+    def handle(self, p: Params, noise=None, player: int = 0) -> Params:
+        return p
+
+    def expected_payoff(self, h0, h1):
+        return multidim.expected_payoff(h0, h1, self.geom)
+
+    def component_q(self, p: Params, h_opp, sign: float, noise=None):
+        return multidim.component_q(p, h_opp, self.geom, sign)
+
+    def exploitability(self, h0, h1):
+        return multidim.exploitability(h0, h1, self.game, self.geom)
+
+    def entropy(self, p: Params, noise=None, player: int = 0):
+        """As `ClosedFormBackend.entropy`, on the `d`-dimensional grid.
+
+        The only part of this backend that pays the `grid_points^d` cost, and the
+        reason `gaussian_entropy: component` (the cheap per-component surrogate)
+        exists -- the multidim experiments in `MultiDim.md` all use it.
+        """
+        return _marginal_entropy(p, self._nodes, self._dv, self._normalize)
 
 
 class QuadratureBackend:
-    """Numeric integration on a 1-D grid. Works for any 1-D box game.
+    """Numeric integration on a tensor-product grid. Works for any box game.
 
-    The payoff matrix `R[i, j] = payoff(a_i, a_j)` is built once. Expected payoff is
-    `d0^T R d1 * dx^2`; best responses are optimized over grid points inside the box
-    (actions must be feasible), while the mixture densities are integrated over a
-    padded grid so the Gaussian tails are not truncated.
+    The payoff matrix `R[i, j] = payoff(a_i, a_j)` over the `M = grid_points^d` nodes
+    is built once. Expected payoff is `d0^T R d1 * dv^2`; best responses are optimized
+    over nodes inside the box (actions must be feasible), while the mixture densities
+    are integrated over a padded grid so the Gaussian tails are not truncated.
+
+    `R` has `M^2 = grid_points^(2d)` entries, which is the hard limit on this backend:
+    the 1-D default (801 points) is 5 MB, the same grid in 2-D would be 3 TB. Above
+    1-D either drop `grid_points` to a few dozen and accept the grid error, or use the
+    `sampled` backend, whose cost does not depend on `d` at all. `max_quadrature_gib`
+    turns the difference between the two into an error message instead of an OOM.
     """
 
     name = "quadrature"
     supports_fixed_opponent = True
     stochastic = False
 
-    def __init__(self, game: ZeroSumGame, n: int, std_max: float, normalize: bool):
+    def __init__(self, game: ZeroSumGame, n: int, std_max: np.ndarray, normalize: bool,
+                 max_gib: float = 2.0):
         space = game.action_space(0)
-        if not isinstance(space, BoxSpace) or space.shape != (1,):
+        if not isinstance(space, BoxSpace):
             raise ValueError(
-                "quadrature backend supports 1-D BoxSpace games only "
-                f"(got {type(space).__name__} with shape {getattr(space, 'shape', None)}); "
-                "set the game's `dim: 1`, or use `idealized.backend: closed_form`."
+                "quadrature backend supports BoxSpace games only "
+                f"(got {type(space).__name__}); use `idealized.backend: sampled`."
             )
-        self.lo, self.hi = float(space.low[0]), float(space.high[0])
-        self.grid, self.dx = _density_grid(self.lo, self.hi, n, std_max)
-        self.in_box = (self.grid >= self.lo) & (self.grid <= self.hi)
+        self.lo, self.hi = _bounds(game)
+        self.dim = len(self.lo)
+        nodes = n**self.dim
+        gib = nodes**2 * 8 / 2**30
+        if gib > max_gib:
+            raise ValueError(
+                f"a {self.dim}-D quadrature grid of {n} points per axis needs a "
+                f"{nodes} x {nodes} payoff matrix ({gib:.1f} GiB > "
+                f"idealized.max_quadrature_gib={max_gib}). Lower `idealized.grid_points` "
+                f"(to about {int((max_gib * 2**30 / 8) ** (0.5 / self.dim))} for this "
+                f"dimension), raise the cap, or use `idealized.backend: sampled`, whose "
+                f"cost does not grow with the dimension."
+            )
+        self.grid, self.dv, self.axes = _density_grid(self.lo, self.hi, n, std_max)
+        self.dx = float(self.axes[0][1] - self.axes[0][0])
+        self.in_box = jnp.all((self.grid >= jnp.asarray(self.lo)) & (self.grid <= jnp.asarray(self.hi)),
+                              axis=-1)
         self.normalize = normalize
 
-        a = self.grid[:, None]
+        a = self.grid
         pay = jax.vmap(lambda x: jax.vmap(lambda y: game.payoff(x, y))(a))(a)
-        self.R = jnp.asarray(pay, dtype=jnp.float64)  # (n, n)
+        self.R = jnp.asarray(pay, dtype=jnp.float64)  # (M, M)
 
     # -- handles -----------------------------------------------------------
     def handle(self, p: Params, noise=None, player: int = 0):
         w = jax.nn.softmax(p.logits)
-        return jnp.sum(w[:, None] * self.component_densities(p), axis=0)  # (n,)
+        return jnp.sum(w[:, None] * self.component_densities(p), axis=0)  # (M,)
 
     def component_densities(self, p: Params):
-        return _component_densities(p, self.grid, self.dx, self.normalize)  # (K, n)
+        return _component_densities(p, self.grid, self.dv, self.normalize)  # (K, M)
 
     def uniform_handle(self):
         d = jnp.where(self.in_box, 1.0, 0.0)
-        return d / (jnp.sum(d) * self.dx)
+        return d / (jnp.sum(d) * self.dv)
 
-    def point_handle(self, x: float):
-        idx = int(jnp.argmin(jnp.abs(self.grid - x)))
-        return jnp.zeros_like(self.grid).at[idx].set(1.0 / self.dx)
+    def point_handle(self, x):
+        """A point mass at the grid node nearest `x` (a scalar or a `(d,)` action)."""
+        x = jnp.broadcast_to(jnp.asarray(x, dtype=jnp.float64), (self.dim,))
+        idx = int(jnp.argmin(jnp.sum(jnp.square(self.grid - x), axis=-1)))
+        return jnp.zeros(self.grid.shape[0], dtype=jnp.float64).at[idx].set(1.0 / self.dv)
 
     # -- questions ---------------------------------------------------------
     def expected_payoff(self, h0, h1):
-        return (h0 @ self.R @ h1) * self.dx**2
+        return (h0 @ self.R @ h1) * self.dv**2
 
     def component_q(self, p: Params, h_opp, sign: float, noise=None):
-        """Per-component expected utility `q_k = E_{a~N(mu_k, s_k)}[ this player's utility ]`.
+        """Per-component expected utility `q_k = E_{a~N(mu_k, Sigma_k)}[ this player's utility ]`.
 
         `R` is indexed `[player 0's action, player 1's action]`, so which side of it the
         opponent's density is contracted against depends on who is asking: player 0 gets
@@ -536,13 +731,13 @@ class QuadratureBackend:
         for `quadratic` with a nonzero coupling, or any other game whose two players do
         not share one landscape, they do not.
         """
-        u = (self.R @ h_opp if sign > 0 else -(h_opp @ self.R)) * self.dx  # utility of a *pure* action
-        return (self.component_densities(p) @ u) * self.dx
+        u = (self.R @ h_opp if sign > 0 else -(h_opp @ self.R)) * self.dv  # utility of a *pure* action
+        return (self.component_densities(p) @ u) * self.dv
 
     def exploitability(self, h0, h1):
-        U = (h0 @ self.R @ h1) * self.dx**2
-        v0 = (self.R @ h1) * self.dx                    # player 0's value of each pure action
-        v1 = (h0 @ self.R) * self.dx                    # player 1's cost of each pure action
+        U = (h0 @ self.R @ h1) * self.dv**2
+        v0 = (self.R @ h1) * self.dv                    # player 0's value of each pure action
+        v1 = (h0 @ self.R) * self.dv                    # player 1's cost of each pure action
         br0 = jnp.max(jnp.where(self.in_box, v0, -jnp.inf))
         br1 = jnp.min(jnp.where(self.in_box, v1, jnp.inf))
         return (br0 - U) + (U - br1)
@@ -550,7 +745,7 @@ class QuadratureBackend:
     def entropy(self, p: Params, noise=None, player: int = 0):
         """Exact differential entropy of the mixture -- what `mixture_ppo_loss`
         estimates with `-mixture_marginal_log_prob(...)` at the sampled action."""
-        return _marginal_entropy(p, self.grid, self.dx, self.normalize)
+        return _marginal_entropy(p, self.grid, self.dv, self.normalize)
 
 
 class SampledNoise(NamedTuple):
@@ -563,22 +758,28 @@ class SampledNoise(NamedTuple):
     numbers, the sampled analogue of the exact solver re-integrating at every step.
     """
 
-    eps: jnp.ndarray = None      # (2, N) standard normals, one row per player
-    comp: jnp.ndarray = None     # (2, N) component indices drawn from the rollout policy
-    unif: jnp.ndarray = None     # (N,)   uniform draws in the box, for a `random` fixed opponent
+    eps: jnp.ndarray = None      # (2, N, d) standard normals, one row per player
+    comp: jnp.ndarray = None     # (2, N)    component indices drawn from the rollout policy
+    unif: jnp.ndarray = None     # (N, d)    uniform draws in the box, for a `random` opponent
 
 
 class SampledHandle(NamedTuple):
     """A batch of actions a player is playing, plus their log-probs for `score`."""
 
-    actions: jnp.ndarray = None   # (N, 1)
+    actions: jnp.ndarray = None   # (N, d)
     log_prob: jnp.ndarray = None  # (N,), differentiable w.r.t. this player's params
 
 
-def _gaussian_log_prob(a, mean, log_std):
-    """`log N(a | mean, exp(log_std))`, broadcasting."""
-    z = (a - mean) / jnp.exp(log_std)
-    return -0.5 * z**2 - log_std - 0.5 * float(np.log(2 * np.pi))
+def _per_component_log_prob(actions, p: Params):
+    """`log N(a_n | mu_k, Sigma_k)` for every draw against every component -> `(N, K)`."""
+    return jax.vmap(_log_prob_at, in_axes=(None, 0, 0), out_axes=1)(
+        actions, p.means, p.scale_tril)
+
+
+def _mixture_log_prob(actions, p: Params):
+    """`log p_mix(a_n)` -> `(N,)`."""
+    return jax.nn.logsumexp(jax.nn.log_softmax(p.logits)[None, :]
+                            + _per_component_log_prob(actions, p), axis=-1)
 
 
 class SampledBackend:
@@ -589,7 +790,7 @@ class SampledBackend:
     estimated from `samples` joint action draws per iteration:
 
       q_k = E_{a~N(mu_k,s_k)}[u(a, b)]     -> `component_q`, see `q_estimator`
-      grad_(mu, log_std) E[u]              -> `expected_payoff`, see `grad_estimator`
+      grad_(mu, A) E[u]                    -> `expected_payoff`, see `grad_estimator`
 
     Everything else in the objective (the magnet KL, the trust-region KL, the
     repulsion term) is closed-form *in the parameters*, so it stays exact and the
@@ -616,6 +817,7 @@ class SampledBackend:
         self.game = game
         self.metrics = metrics          # exact grid; only the reported metrics use it
         self.lo, self.hi = metrics.lo, metrics.hi
+        self.dim = len(self.lo)
         self.n = int(i.samples) if i.samples is not None else int(cfg.batch_size)
         if self.n < 1:
             raise ValueError(f"idealized.samples must be >= 1, got {self.n}")
@@ -627,7 +829,7 @@ class SampledBackend:
                 raise ValueError(f"unknown idealized.{field} {value!r}, choices: {list(allowed)}")
         self.q_estimator, self.grad_estimator = i.q_estimator, i.grad_estimator
         self.entropy_source = i.entropy_source
-        self._payoff = jax.vmap(game.payoff)     # (N, 1), (N, 1) -> (N,)
+        self._payoff = jax.vmap(game.payoff)     # (N, d), (N, d) -> (N,)
         self.detail = (f"{self.n} draws/iteration, seed {self.seed}, q={self.q_estimator}, "
                        f"grad={self.grad_estimator}, entropy={self.entropy_source}")
 
@@ -637,29 +839,33 @@ class SampledBackend:
         of the iteration, which is the policy `train.py` would have rolled out."""
         k_eps, k_c0, k_c1, k_u = jax.random.split(key, 4)
         return SampledNoise(
-            eps=jax.random.normal(k_eps, (2, self.n), dtype=jnp.float64),
+            eps=jax.random.normal(k_eps, (2, self.n, self.dim), dtype=jnp.float64),
             comp=jnp.stack([jax.random.categorical(k_c0, p0.logits, shape=(self.n,)),
                             jax.random.categorical(k_c1, p1.logits, shape=(self.n,))]),
-            unif=jax.random.uniform(k_u, (self.n,), dtype=jnp.float64,
-                                    minval=self.lo, maxval=self.hi),
+            unif=jax.random.uniform(k_u, (self.n, self.dim), dtype=jnp.float64,
+                                    minval=jnp.asarray(self.lo), maxval=jnp.asarray(self.hi)),
         )
 
     def _actions(self, p: Params, noise: SampledNoise, player: int):
-        """Reparameterized draws `a_n = mu_{k_n} + s_{k_n} * eps_n`, and their log-probs."""
+        """Reparameterized draws `a_n = mu_{k_n} + A_{k_n} eps_n`, `(N, d)`.
+
+        The triangular matvec is the one place a correlated component differs from a
+        diagonal one in the sampler -- see `gaussian.gaussian_sample`.
+        """
         eps, comp = noise.eps[player], noise.comp[player]
-        mean, log_std = p.means[comp], p.log_std[comp]
-        return mean + jnp.exp(log_std) * eps, mean, log_std
+        mean, scale_tril = p.means[comp], p.scale_tril[comp]
+        return gaussian_sample(mean, scale_tril, eps), mean, scale_tril
 
     def handle(self, p: Params, noise: SampledNoise = None, player: int = 0) -> SampledHandle:
-        actions, mean, log_std = self._actions(p, noise, player)
+        actions, mean, scale_tril = self._actions(p, noise, player)
         if self.grad_estimator == "score":
             # REINFORCE differentiates the log-prob, not the action, so the action is
             # cut off the graph exactly as a PPO rollout's stored `raw_action` is.
             actions = jax.lax.stop_gradient(actions)
-            log_prob = _gaussian_log_prob(actions, mean, log_std)
+            log_prob = gaussian_log_prob(actions, mean, scale_tril)
         else:
-            log_prob = jnp.zeros_like(actions)
-        return SampledHandle(actions=actions[:, None], log_prob=log_prob)
+            log_prob = jnp.zeros(actions.shape[0], dtype=actions.dtype)
+        return SampledHandle(actions=actions, log_prob=log_prob)
 
     def fixed_handle(self, kind: str, noise: SampledNoise) -> SampledHandle:
         """The non-training opponent's batch, for `train.mode: fixed_opponent`.
@@ -671,10 +877,12 @@ class SampledBackend:
         if kind == "random":
             actions = noise.unif
         elif kind == "static":
-            actions = jnp.full((self.n,), 0.5 * (self.lo + self.hi), dtype=jnp.float64)
+            mid = jnp.asarray(0.5 * (self.lo + self.hi), dtype=jnp.float64)
+            actions = jnp.broadcast_to(mid, (self.n, self.dim))
         else:
             raise ValueError(f"unknown train.opponent {kind!r}")
-        return SampledHandle(actions=actions[:, None], log_prob=jnp.zeros_like(actions))
+        return SampledHandle(actions=actions,
+                             log_prob=jnp.zeros(self.n, dtype=jnp.float64))
 
     # -- questions ---------------------------------------------------------
     def expected_payoff(self, h0, h1):
@@ -720,16 +928,17 @@ class SampledBackend:
         player = 0 if sign > 0 else 1
         b = h_opp.actions
 
-        def utility(a):                                   # a: (N, 1) -> (N,)
+        def utility(a):                                   # a: (N, d) -> (N,)
             return self._payoff(a, b) if sign > 0 else -self._payoff(b, a)
 
         if self.q_estimator == "per_component":
-            eps = noise.eps[player]
-            a = p.means[:, None] + jnp.exp(p.log_std)[:, None] * eps[None, :]   # (K, N)
-            return jax.vmap(lambda a_k: jnp.mean(utility(a_k[:, None])))(a)
+            eps = noise.eps[player]                       # (N, d), shared across components
+            a = jax.vmap(gaussian_sample, in_axes=(0, 0, None))(
+                p.means, p.scale_tril, eps)               # (K, N, d)
+            return jax.vmap(lambda a_k: jnp.mean(utility(a_k)))(a)
 
         actions, _, _ = self._actions(p, noise, player)
-        u = utility(actions[:, None])                     # (N,)
+        u = utility(actions)                              # (N,)
 
         if self.q_estimator == "onpolicy":
             onehot = jax.nn.one_hot(noise.comp[player], p.means.shape[0], dtype=jnp.float64)
@@ -739,8 +948,7 @@ class SampledBackend:
             # relative advantage, and a constant drops out of the softmax update.
             return jnp.where(count > 0, total / jnp.maximum(count, 1.0), jnp.mean(u))
 
-        log_r = (jax.nn.log_softmax(p.logits)[None, :]
-                 + _gaussian_log_prob(actions[:, None], p.means[None, :], p.log_std[None, :]))
+        log_r = jax.nn.log_softmax(p.logits)[None, :] + _per_component_log_prob(actions, p)
         r = jax.nn.softmax(log_r, axis=-1)                # (N, K), rows sum to 1
         return (r.T @ u) / jnp.maximum(jnp.sum(r, axis=0), 1e-300)
 
@@ -759,35 +967,60 @@ class SampledBackend:
         if self.entropy_source == "exact":
             return self.metrics.entropy(p)
         actions, _, _ = self._actions(p, noise, player)
-        actions = jax.lax.stop_gradient(actions)
-        log_p = jax.nn.logsumexp(
-            jax.nn.log_softmax(p.logits)[None, :]
-            + _gaussian_log_prob(actions[:, None], p.means[None, :], p.log_std[None, :]),
-            axis=-1,
-        )
-        return -jnp.mean(log_p)
+        return -jnp.mean(_mixture_log_prob(jax.lax.stop_gradient(actions), p))
 
     def exploitability(self, h0, h1):
         raise AssertionError("the sampled backend reports metrics through `.metrics`")
 
 
 def build_backend(game: ZeroSumGame, cfg: SolverConfig):
+    """Pick and construct the payoff backend named by `idealized.backend`.
+
+    `auto` takes the most exact backend the game supports: a closed form where one
+    exists (the 1-D `MultiPointGame` family, or the separable `multidim_decoy_well`),
+    otherwise the grid. It never picks `sampled` -- that backend exists to *add* noise
+    back, which is a thing to ask for, not a fallback.
+    """
+    i = cfg.idealized
+    dim = len(_bounds(game)[0])
+    multi = isinstance(game, MultiDimDecoyWellGame)
     supports_closed_form = hasattr(game, "peaks") and hasattr(game, "_target_moments")
-    choice = cfg.idealized.backend
-    if choice == "auto":
-        choice = "closed_form" if supports_closed_form else "quadrature"
-    if choice == "closed_form":
-        if not supports_closed_form:
-            raise ValueError(
-                f"{type(game).__name__} has no `.peaks`/`._target_moments`, so the closed-form "
-                "backend does not apply. Use `idealized.backend: quadrature`."
-            )
+    exact_1d = supports_closed_form and dim == 1
+    exact_nd = supports_closed_form and multi
+
+    def grid():
         lo, hi = _bounds(game)
-        grid, dx = _density_grid(lo, hi, cfg.idealized.grid_points, _std_max(game, cfg))
-        return ClosedFormBackend(game, grid, dx, cfg.idealized.normalize_density)
+        return _density_grid(lo, hi, i.grid_points, _std_max(game, cfg))
+
+    choice = i.backend
+    if choice == "auto":
+        if exact_nd and dim > 1:
+            choice = "closed_form_multidim"
+        elif exact_1d:
+            choice = "closed_form"
+        else:
+            choice = "quadrature"
+    if choice == "closed_form":
+        if not exact_1d:
+            raise ValueError(
+                f"{type(game).__name__} (dim {dim}) has no 1-D closed form -- it needs "
+                "`.peaks`/`._target_moments` and a scalar action. Use "
+                f"`idealized.backend: {'closed_form_multidim' if exact_nd else 'quadrature'}`."
+            )
+        nodes, dv, _ = grid()
+        return ClosedFormBackend(game, nodes, dv, i.normalize_density)
+    if choice == "closed_form_multidim":
+        if not exact_nd:
+            raise ValueError(
+                f"the multidim closed form is specialised to MultiDimDecoyWellGame's "
+                f"separable payoff, and {type(game).__name__} is not one. Use "
+                "`idealized.backend: quadrature` (1-D or a coarse 2-D grid) or `sampled`."
+            )
+        nodes, dv, _ = grid()
+        return ClosedFormMultiDimBackend(game, nodes, dv, i.normalize_density)
     if choice in ("quadrature", "sampled"):
-        quadrature = QuadratureBackend(game, cfg.idealized.grid_points, _std_max(game, cfg),
-                                       cfg.idealized.normalize_density)
+        quadrature = QuadratureBackend(game, i.grid_points, _std_max(game, cfg),
+                                       i.normalize_density, i.max_quadrature_gib)
         if choice == "quadrature":
             return quadrature
         # the grid is kept as the *metrics* backend: exploitability estimated off the
@@ -799,40 +1032,45 @@ def build_backend(game: ZeroSumGame, cfg: SolverConfig):
 # --------------------------------------------------------------------------- init
 
 
-def _bounds(game: ZeroSumGame) -> tuple[float, float]:
-    """`(low, high)` of the 1-D action box, or a clear error.
+def _bounds(game: ZeroSumGame) -> tuple[np.ndarray, np.ndarray]:
+    """Per-axis `(low, high)` of the action box, or a clear error.
 
-    Both backends parameterize the policy as a Gaussian mixture over a scalar
-    action, so a game whose players act on a simplex (`blotto`) has no idealized
-    counterpart -- only `train.py` can run it.
+    Every backend parameterizes the policy as a Gaussian mixture over a box, so a
+    game whose players act on a simplex (`blotto`) has no idealized counterpart --
+    only `train.py` can run it. The dimension is read off the space: `(1,)` is the
+    scalar case, anything larger is the multivariate one.
     """
     space = game.action_space(0)
     if not isinstance(space, BoxSpace):
         raise ValueError(
             f"{type(game).__name__} gives players a {type(space).__name__}; the idealized "
-            "solver only handles 1-D box action spaces. Run this game with train.py."
+            "solver only handles box action spaces. Run this game with train.py."
         )
-    if space.shape != (1,):
-        raise ValueError(
-            f"{type(game).__name__}'s action space has shape {space.shape}; the idealized "
-            "solver is 1-D. Set the game's `dim: 1`, or use idealized_mmd_multidim.py."
-        )
-    return float(space.low[0]), float(space.high[0])
+    return (np.asarray(space.low, dtype=np.float64).reshape(-1),
+            np.asarray(space.high, dtype=np.float64).reshape(-1))
 
 
-def _std_max(game: ZeroSumGame, cfg: SolverConfig) -> float:
-    """`idealized.std_max`, defaulting to `MixtureActorCritic`'s own ceiling `high - low`."""
-    if cfg.idealized.std_max is not None:
-        return float(cfg.idealized.std_max)
+def _std_max(game: ZeroSumGame, cfg: SolverConfig) -> np.ndarray:
+    """Per-axis `idealized.std_max`, defaulting to `MixtureActorCritic`'s own ceiling
+    `high - low`. A scalar in the config is broadcast over the axes."""
     lo, hi = _bounds(game)
+    if cfg.idealized.std_max is not None:
+        return np.broadcast_to(np.asarray(cfg.idealized.std_max, dtype=np.float64), lo.shape).copy()
     return hi - lo
 
 
 def build_init(game: ZeroSumGame, cfg: SolverConfig) -> tuple[Params, Params]:
     """The trainer's own init by default: means spread over the box, uniform weights,
     `std = (high - low) / (2K)` -- see `training.mixture._spread_bias_init` /
-    `_std_bias_init`, and note that `logits_head` outputs zeros at a zero observation."""
+    `_std_bias_init`, and note that `logits_head` outputs zeros at a zero observation.
+
+    In `d > 1` the spread runs along the box diagonal: component `k` sits at fraction
+    `(k+0.5)/K` of the box in *every* axis, which is what the trainer's per-axis bias
+    init also produces. The factor always starts diagonal, so `full_covariance` never
+    moves the starting point -- only what the dynamics may do to it afterwards.
+    """
     lo, hi = _bounds(game)
+    dim = len(lo)
     k = cfg.num_components
     init = cfg.idealized
 
@@ -842,18 +1080,37 @@ def build_init(game: ZeroSumGame, cfg: SolverConfig) -> tuple[Params, Params]:
             if m != "spread":
                 raise ValueError(f"unknown idealized.init_means {m!r}")
             frac = (jnp.arange(k, dtype=jnp.float64) + 0.5) / k
-            return lo + frac * (hi - lo)
+            return jnp.asarray(lo) + frac[:, None] * jnp.asarray(hi - lo)
         arr = jnp.asarray(m, dtype=jnp.float64)
-        if arr.ndim == 2:  # per-player means
+        if arr.ndim == 3:               # (2, K, d): one block per player
             arr = arr[player]
-        if arr.shape[0] != k:
-            raise ValueError(f"idealized.init_means has {arr.shape[0]} entries, expected num_components={k}")
+        elif arr.ndim == 2 and dim == 1 and arr.shape == (2, k):
+            arr = arr[player][:, None]  # (2, K) per-player scalar means
+        elif arr.ndim == 1:             # (K,) scalar means, shared by both players
+            arr = arr[:, None]
+        if arr.shape != (k, dim):
+            raise ValueError(
+                f"idealized.init_means has shape {tuple(arr.shape)}, expected "
+                f"(num_components, dim) = ({k}, {dim})"
+            )
         return arr
 
+    std_max = _std_max(game, cfg)
     if init.init_log_std is None:
-        log_std_val = float(np.log((hi - lo) / (2 * k)))
+        std_val = (hi - lo) / (2 * k)
     else:
-        log_std_val = float(np.log(init.init_log_std)) if init.init_log_std > 0 else float(init.init_log_std)
+        # a *standard deviation*, despite the name it has carried since the parameter
+        # itself was a log-std; a non-positive value was the log then, so it still is
+        value = float(init.init_log_std)
+        std_val = np.broadcast_to(np.exp(value) if value <= 0 else value, lo.shape)
+    std_val = np.clip(std_val, init.std_min, std_max)   # (d,)
+
+    # Only the diagonal is populated: the policy starts uncorrelated either way, and
+    # under `full_covariance: false` the off-diagonal entries are not even allocated.
+    full_covariance = bool(init.full_covariance)
+    flat = jnp.zeros((k, scale_param_size(dim, full_covariance)), dtype=jnp.float64)
+    flat = flat.at[:, diagonal_slots(dim, full_covariance)].set(jnp.asarray(std_val))
+    scale_tril = pack_scale_tril(flat, dim, full_covariance)
 
     if init.init_weights is None:
         logits = jnp.zeros(k, dtype=jnp.float64)
@@ -863,10 +1120,8 @@ def build_init(game: ZeroSumGame, cfg: SolverConfig) -> tuple[Params, Params]:
             raise ValueError(f"idealized.init_weights has {w.shape[0]} entries, expected num_components={k}")
         logits = jnp.log(w)
 
-    log_std = jnp.full((k,), log_std_val, dtype=jnp.float64)
-    log_std = jnp.clip(log_std, jnp.log(init.std_min), jnp.log(_std_max(game, cfg)))
-    return (Params(logits=logits, means=means_for(0), log_std=log_std),
-            Params(logits=logits, means=means_for(1), log_std=log_std))
+    return (Params(logits=logits, means=means_for(0), scale_tril=scale_tril),
+            Params(logits=logits, means=means_for(1), scale_tril=scale_tril))
 
 
 # --------------------------------------------------------------------------- update
@@ -899,12 +1154,6 @@ def categorical_mirror_update(logits, q, magnet_logits, old_logits, eta, tau, ta
     return num / (1.0 + eta * tau + eta * tau_ent + eta * tau_trpo)
 
 
-def gaussian_kl_per_component(m_p, ls_p, m_q, ls_q):
-    """`KL(N(m_p, s_p) || N(m_q, s_q))` per component, shape (K,)."""
-    vp, vq = jnp.exp(2 * ls_p), jnp.exp(2 * ls_q)
-    return ls_q - ls_p + (vp + (m_p - m_q) ** 2) / (2 * vq) - 0.5
-
-
 def repulsion_coef_at(cfg: SolverConfig, frac):
     """Ramp 0 -> coef over `repulsion_ramp`, hold for `repulsion_hold`, then anneal to 0."""
     i = cfg.idealized
@@ -918,11 +1167,16 @@ def repulsion_coef_at(cfg: SolverConfig, frac):
 
 
 def std_floor_at(cfg: SolverConfig, frac):
-    """Anneal the log-std floor from `anneal_std_from` down to `std_min`."""
-    base = float(np.log(cfg.idealized.std_min))
+    """Anneal the floor on the scale factor's diagonal from `anneal_std_from` to `std_min`.
+
+    Geometric interpolation -- linear in `log sigma`, as it was when the parameter
+    itself was `log sigma` -- so the schedule is unchanged and only its units differ.
+    """
+    base = float(cfg.idealized.std_min)
     if cfg.idealized.anneal_std_from <= 0.0:
         return jnp.full((), base, dtype=jnp.float64)
-    return (1.0 - frac) * float(np.log(cfg.idealized.anneal_std_from)) + frac * base
+    return jnp.exp((1.0 - frac) * float(np.log(cfg.idealized.anneal_std_from))
+                   + frac * float(np.log(base)))
 
 
 # --------------------------------------------------------------------------- run
@@ -945,13 +1199,23 @@ def build_iteration(game: ZeroSumGame, cfg: SolverConfig, backend):
     integral) defines the "old" policy, `ppo.ppo_epochs` gradient steps are taken
     against it, then the target EMA and the magnet snapshot tick once.
     """
-    lo, hi = _bounds(game)
-    log_std_hi = float(np.log(_std_max(game, cfg)))
+    lo, hi = jnp.asarray(_bounds(game)[0]), jnp.asarray(_bounds(game)[1])
+    dim = lo.shape[0]
+    std_hi = jnp.asarray(_std_max(game, cfg))
     i = cfg.idealized
     total = max(cfg.total_iters - 1, 1)
 
     if cfg.magnet_interval < 1:
         raise ValueError("magnet_interval must be >= 1")
+
+    # Which entries of the factor are parameters at all. Under `full_covariance:
+    # false` the off-diagonal ones are not, and masking the step is what enforces
+    # that -- `training/mixture.py` gets it for free by never allocating them, but
+    # here the factor *is* the parameter, and a term the payoff does not separate
+    # over (the mixture's differential entropy, say) has a nonzero gradient on an
+    # off-diagonal entry even at a factor that is exactly diagonal.
+    scale_mask = jnp.zeros((dim, dim), dtype=jnp.float64).at[
+        tril_positions(dim, i.full_covariance)].set(1.0)
 
     trains = {0: True, 1: True}
     if cfg.mode == "fixed_opponent":
@@ -960,8 +1224,9 @@ def build_iteration(game: ZeroSumGame, cfg: SolverConfig, backend):
     if i.gaussian_entropy == "marginal":
         entropy_term = backend.entropy           # mixture differential entropy
     elif i.gaussian_entropy == "component":
-        # noqa: E731 -- legacy per-component term
-        entropy_term = lambda pp, noise=None, player=0: jnp.sum(pp.log_std)
+        # noqa: E731 -- legacy per-component term; `sum_j log A_jj == 1/2 log det Sigma`
+        # is its multivariate form, and reduces to `sum(log_std)` on a diagonal factor
+        entropy_term = lambda pp, noise=None, player=0: jnp.sum(log_scale_det(pp.scale_tril))
     else:
         raise ValueError(f"unknown idealized.gaussian_entropy {i.gaussian_entropy!r}")
 
@@ -994,23 +1259,32 @@ def build_iteration(game: ZeroSumGame, cfg: SolverConfig, backend):
                    else -backend.expected_payoff(h_opp, h))
             ent = cfg.gaussian_entropy_coef * entropy_term(pp, noise, player)
             mag = cfg.magnet_gaussian_kl_coef * jnp.sum(
-                kl_w * gaussian_kl_per_component(pp.means, pp.log_std, magnet.means, magnet.log_std)
+                kl_w * gaussian_kl(pp.means, pp.scale_tril, magnet.means, magnet.scale_tril)
             )
             # `mixture_ppo_loss` penalizes KL(old || new) for the Gaussian head; kept
             # in that direction here since a gradient step needs no closed-form argmax.
             trpo = cfg.trpo_gaussian_kl_coef * jnp.sum(
-                kl_w * gaussian_kl_per_component(old.means, old.log_std, pp.means, pp.log_std)
+                kl_w * gaussian_kl(old.means, old.scale_tril, pp.means, pp.scale_tril)
             )
-            rep = lam * jnp.sum(jnp.abs(pp.means[:, None] - pp.means[None, :])) / 2.0
+            # per-axis L1 repulsion between component means, summed over pairs and axes
+            rep = lam * jnp.sum(jnp.abs(pp.means[:, None, :] - pp.means[None, :, :])) / 2.0
             return pay + ent + rep - mag - trpo
 
         g = jax.grad(obj)(p)
-        # Fisher metric of N(mu, s) in (mu, rho = log s): I_mu = 1/s^2, I_rho = 2.
-        means = p.means + (cfg.lr * jnp.exp(2 * p.log_std) * g.means if i.train_means else 0.0)
-        log_std = p.log_std + (cfg.lr * 0.5 * g.log_std if i.train_std else 0.0)
+        # `F^-1 grad` for the Gaussian Fisher metric in `(mu, A)` coordinates. On a
+        # diagonal factor this is exactly the `(sigma^2 grad_mu, 1/2 sigma^2 grad_sigma)`
+        # preconditioner the scalar solver used, written in `sigma` rather than
+        # `log sigma`; the natural gradient is parametrization-invariant, so the two
+        # agree in the continuous limit and differ only in the discretization.
+        nat_mean, nat_scale = natural_gradient(p.scale_tril, g.means, g.scale_tril * scale_mask)
+        nat_scale = nat_scale * scale_mask
+        means = p.means + (cfg.lr * nat_mean if i.train_means else 0.0)
+        scale_tril = p.scale_tril + (cfg.lr * nat_scale if i.train_std else 0.0)
+        # `A E` with both factors lower triangular is lower triangular, so the step
+        # preserves the structure exactly and only the diagonal needs a projection.
         return Params(logits=logits,
                       means=jnp.clip(means, lo, hi),
-                      log_std=jnp.clip(log_std, floor, log_std_hi))
+                      scale_tril=clamp_scale_tril(scale_tril, floor, std_hi))
 
     def iteration(carry, _):
         p0, p1, m0, m1, e0, e1, fixed_handle, it, key = carry
@@ -1089,18 +1363,29 @@ def run(game: ZeroSumGame, cfg: SolverConfig, p0: Params, p1: Params):
     def expl_fn(a, b):
         return metrics.exploitability(*handles_of(a, b))
 
-    def record(t: int, a: Params, b: Params, ea: Params, eb: Params) -> dict:
+    def player_record(p: Params) -> dict:
+        """One player's strategy, per component: weight, mean, and *marginal* std.
+
+        `marginal_std` rather than the factor's diagonal: the diagonal is the
+        conditional std given the earlier coordinates, and only coincides with the
+        per-axis spread when the component is uncorrelated (`training/gaussian.py`).
+        `corr` is the largest off-diagonal correlation each component carries, which
+        is the only place a `full_covariance` run's extra parameters are visible at
+        all -- it is identically zero for a diagonal factor.
+        """
         return {
-            "t": t,
-            "expl": float(expl_fn(a, b)),
-            "target_expl": float(expl_fn(ea, eb)),
-            "w0": [float(x) for x in jax.nn.softmax(a.logits)],
-            "means0": [float(x) for x in a.means],
-            "std0": [float(x) for x in jnp.exp(a.log_std)],
-            "w1": [float(x) for x in jax.nn.softmax(b.logits)],
-            "means1": [float(x) for x in b.means],
-            "std1": [float(x) for x in jnp.exp(b.log_std)],
+            "w": [float(x) for x in jax.nn.softmax(p.logits)],
+            "means": np.asarray(p.means).tolist(),
+            "std": np.asarray(marginal_std(p.scale_tril)).tolist(),
+            "corr": [float(x) for x in _max_abs_correlation(p.scale_tril)],
         }
+
+    def record(t: int, a: Params, b: Params, ea: Params, eb: Params) -> dict:
+        entry = {"t": t, "expl": float(expl_fn(a, b)), "target_expl": float(expl_fn(ea, eb))}
+        for player, p in ((0, a), (1, b)):
+            for key, value in player_record(p).items():
+                entry[f"{key}{player}"] = value
+        return entry
 
     carry = (p0, p1, p0, p1, p0, p1, fixed_handle, jnp.zeros((), dtype=jnp.int64),
              jax.random.PRNGKey(backend.seed if backend.stochastic else 0))
@@ -1124,8 +1409,41 @@ def run(game: ZeroSumGame, cfg: SolverConfig, p0: Params, p1: Params):
 # --------------------------------------------------------------------------- cli
 
 
-def _fmt(w, mu, sd) -> str:
-    return "[" + " ".join(f"{a:.2f}@{b:+.2f}(sd{c:.3f})" for a, b, c in zip(w, mu, sd)) + "]"
+def _max_abs_correlation(scale_tril):
+    """Largest `|Sigma_ij| / sqrt(Sigma_ii Sigma_jj)`, `i != j`, per component -> `(K,)`.
+
+    Zero for a diagonal factor and for `d == 1`. Reported because it is the only
+    thing a `full_covariance` run does that a diagonal one cannot, and without it a
+    correlation that never moved off zero is indistinguishable from one that did.
+    """
+    if scale_tril.shape[-1] == 1:
+        return jnp.zeros(scale_tril.shape[0], dtype=scale_tril.dtype)
+    cov = jnp.einsum("...ij,...kj->...ik", scale_tril, scale_tril)
+    sd = marginal_std(scale_tril)
+    corr = cov / (sd[..., :, None] * sd[..., None, :])
+    off = corr * (1.0 - jnp.eye(corr.shape[-1], dtype=corr.dtype))
+    return jnp.max(jnp.abs(off), axis=(-2, -1))
+
+
+def _fmt(w, mu, sd, corr=None) -> str:
+    """One player's mixture as a line: `weight@mean(sd)` per component.
+
+    A `d`-dimensional mean prints as a parenthesized tuple and the std alongside it
+    is the per-axis marginal one; a nonzero correlation is appended as `r<value>` so
+    that a `full_covariance` run's off-diagonals are visible in the run's own output.
+    """
+    parts = []
+    for k, (wk, mk, sk) in enumerate(zip(w, mu, sd)):
+        mk, sk = np.atleast_1d(mk), np.atleast_1d(sk)
+        if mk.size == 1:      # a scalar action reads better without the brackets
+            body = f"{mk[0]:+.2f}(sd{sk[0]:.3f})"
+        else:
+            body = ("(" + ",".join(f"{x:+.2f}" for x in mk) + ")"
+                    + "(sd" + ",".join(f"{x:.3f}" for x in sk) + ")")
+        if corr is not None and abs(corr[k]) > 5e-3:
+            body += f"r{corr[k]:+.2f}"
+        parts.append(f"{wk:.2f}@{body}")
+    return "[" + " ".join(parts) + "]"
 
 
 def _report_unused(run_config: RunConfig, cfg: SolverConfig) -> None:
@@ -1156,10 +1474,10 @@ def _warn_grid(backend, history: list[dict]) -> None:
     backend = backend.metrics if backend.stochastic else backend
     if backend.name != "quadrature":
         return
-    reached = min(min(h["std0"] + h["std1"]) for h in history)
+    reached = float(min(np.min(np.asarray(h["std0"] + h["std1"])) for h in history))
     if reached >= 2 * backend.dx:
         return
-    span = float(backend.grid[-1] - backend.grid[0])
+    span = float(backend.axes[0][-1] - backend.axes[0][0])
     needed = int(span / (reached / 3.0)) + 1
     print(f"WARNING: a component reached std={reached:.4g}, below the grid spacing "
           f"dx={backend.dx:.4g}. A component that narrow falls between grid points, so its "
@@ -1205,7 +1523,8 @@ def main() -> None:
     frozen = (1 - cfg.perspective) if cfg.mode == "fixed_opponent" else None
     for i in idx:
         e = history[i]
-        cols = [_fmt(e["w0"], e["means0"], e["std0"]), _fmt(e["w1"], e["means1"], e["std1"])]
+        cols = [_fmt(e["w0"], e["means0"], e["std0"], e["corr0"]),
+                _fmt(e["w1"], e["means1"], e["std1"], e["corr1"])]
         if frozen is not None:  # not a mixture -- its params never moved and mean nothing
             cols[frozen] = f"fixed({cfg.opponent})"
         print(f"  t={e['t']:7d}  expl={e['expl']:+8.4f}   P0 {cols[0]}   P1 {cols[1]}")

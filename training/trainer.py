@@ -81,6 +81,8 @@ class PPOTrainer:
             activation=hyperparams.activation,
             normalization=hyperparams.normalization,
             full_covariance=hyperparams.full_covariance,
+            scale_parameterization=hyperparams.scale_parameterization,
+            max_correlation=hyperparams.max_correlation,
         )
 
         key = jax.random.PRNGKey(seed)

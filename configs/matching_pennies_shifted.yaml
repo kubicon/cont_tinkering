@@ -1,18 +1,17 @@
-# python train.py         configs/matching_pennies.yaml
-# python run_idealized.py configs/matching_pennies.yaml
+# python train.py         configs/matching_pennies_shifted.yaml
+# python run_idealized.py configs/matching_pennies_shifted.yaml
 
 game:
-  name: matching_pennies
-  dim: 1
+  name: matching_pennies_shifted
 
 network:
   hidden_dims: [64, 64]
   activation: gelu
   normalization: rms_norm
-  num_components: 2
+  num_components: 1
 
 optimizer:
-  learning_rate: 0.001   # big enough that the bilinear rotation is visible in 20k iters
+  learning_rate: 0.05   # big enough that the bilinear rotation is visible in 20k iters
   max_grad_norm: 0.5
   optimizer: adam
   weight_decay: 0.0
@@ -27,22 +26,22 @@ ppo:
   category_entropy_coef: 0.1
   gaussian_entropy_coef: 0.1
   trpo_category_kl_coef: 0.05
-  trpo_gaussian_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.00
   magnet_category_kl_coef: 0.2
-  magnet_gaussian_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.0
 
 train:
   mode: self_play
   perspective: 0
   opponent: random
   steps: 100
-  epochs: 500
-  checkpoint_dir: data/matching_pennies
+  epochs: 200
+  checkpoint_dir: data/matching_pennies_shifted
   seed: 123
 
 idealized:
-  backend: sampled
-  grid_points: 101
+  backend: quadrature
+  grid_points: 2001
   normalize_density: true
 
   std_min: 0.005
@@ -60,12 +59,12 @@ idealized:
   repulsion_ramp: 0.2
   repulsion_hold: 0.5
 
-  init_means: [[0.2, 0.2]]     # start OFF the Nash. `spread` puts the single component at the
+  init_means: [0.2]     # start OFF the Nash. `spread` puts the single component at the
                         #   box midpoint 0.5, which IS a Nash here (payoff is bilinear, so
                         #   only the mean matters) -- the run then sits at a fixed point
                         #   from step 0 and "converges" without ever taking a real step.
   init_weights: [0.3]
-  init_log_std: 0.5
+  init_log_std: 0.1
 
   log_rows: 16
   log_out: null

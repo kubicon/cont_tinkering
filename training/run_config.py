@@ -50,6 +50,14 @@ class NetworkConfig:
     # the per-axis marginals alone, so the off-diagonal entries get exactly zero
     # payoff gradient. See `training.gaussian`.
     full_covariance: bool = False
+    # "linear" (the default) or "log" -- how the scale head's output is read into
+    # the Cholesky factor. See `training.config.PPOHyperparams` for the tradeoff;
+    # "log" is positive by construction and gives the spread and the correlations
+    # separate gradients, at the cost of the KL's uniform strong convexity.
+    scale_parameterization: str = "log"
+    # `scale_parameterization: "log"` + `full_covariance` only; bounds the
+    # condition number of `Sigma`. 0 leaves the off-diagonal unbounded.
+    max_correlation: float = 0.0
     clip_means: bool = False  # constrain the mean head to the action box; see `MixtureActorCritic`
     # Pulls a mean that drifts out of the box back to its edge; only bites with
     # `clip_means` on. See `training.mixture.mean_box_excess`.

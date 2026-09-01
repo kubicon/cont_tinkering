@@ -12,7 +12,10 @@ The scale is a Cholesky factor of the covariance, floored at
 `training.gaussian` for why the factor (rather than the variance, or a
 `log`-parametrized standard deviation) is the parametrization that keeps the
 KL regularizer uniformly strongly convex, and for the distribution formulas
-themselves.
+themselves. That strong convexity is what makes `scale_parameterization:
+"linear"` the default; `"log"` trades it for a factor that is positive by
+construction and separates the spread from the correlations
+(`gaussian.scale_tril_from_log_diag`).
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from games.spaces import MASKED_LOGIT
 from nets import MLP
 
 from .gaussian import (
+    LOG_SIGMA_MIN,
     SIGMA_MIN,
     clamp_scale_tril,
     diagonal_slots,
@@ -35,7 +39,10 @@ from .gaussian import (
     gaussian_sample,
     pack_scale_tril,
     scale_param_size,
+    scale_tril_from_log_diag,
 )
+
+SCALE_PARAMETERIZATIONS = ("linear", "log")
 
 __all__ = [
     "ActorCritic",
@@ -50,20 +57,24 @@ __all__ = [
 ]
 
 
-def scale_init(action_dim: int, full_covariance: bool):
+def scale_init(action_dim: int, full_covariance: bool, scale_parameterization: str = "linear"):
     """Initializer for a packed scale vector: unit diagonal, zero off-diagonal.
 
     An uncorrelated unit-variance policy, i.e. what a `zeros` initializer used
-    to mean back when the head emitted `log_std`. It cannot mean that any more:
-    the head now emits the factor entries themselves, where zero is the
-    degenerate scale rather than the unit one.
+    to mean back when the head emitted `log_std`. Under
+    `scale_parameterization: "linear"` it cannot mean that any more -- the head
+    emits the factor entries themselves, where zero is the degenerate scale
+    rather than the unit one -- so the diagonal is set explicitly. Under `"log"`
+    the head is back in `log_std` coordinates and all-zeros *is* the unit
+    policy, which is what this returns.
     """
     slots = diagonal_slots(action_dim, full_covariance)
     size = scale_param_size(action_dim, full_covariance)
+    diag = 0.0 if scale_parameterization == "log" else 1.0
 
     def init_fn(key: chex.PRNGKey, shape: tuple[int, ...], dtype=jnp.float32) -> chex.Array:
         del key
-        row = jnp.zeros((size,), dtype=dtype).at[slots].set(1.0)
+        row = jnp.zeros((size,), dtype=dtype).at[slots].set(diag)
         return jnp.broadcast_to(row, shape).astype(dtype)
 
     return init_fn
@@ -81,6 +92,9 @@ class ActorCritic(nn.Module):
     # per-axis marginals, so the off-diagonal entries would receive gradient
     # from the KL term alone.
     full_covariance: bool = False
+    # "linear" or "log"; see `training.config.PPOHyperparams.scale_parameterization`.
+    scale_parameterization: str = "linear"
+    max_correlation: float = 0.0
 
     @nn.compact
     def __call__(self, obs: chex.Array, train: bool = False) -> tuple[chex.Array, chex.Array, chex.Array]:
@@ -97,16 +111,27 @@ class ActorCritic(nn.Module):
             output_activation="identity",
             name="actor",
         )(obs, train=train)
+        if self.scale_parameterization not in SCALE_PARAMETERIZATIONS:
+            raise ValueError(
+                f"scale_parameterization must be one of {SCALE_PARAMETERIZATIONS}, "
+                f"got {self.scale_parameterization!r}"
+            )
         scale_flat = self.param(
             "scale",
-            scale_init(self.action_dim, self.full_covariance),
+            scale_init(self.action_dim, self.full_covariance, self.scale_parameterization),
             (scale_param_size(self.action_dim, self.full_covariance),),
         )
-        scale_tril = clamp_scale_tril(
-            pack_scale_tril(scale_flat, self.action_dim, self.full_covariance),
-            SIGMA_MIN,
-            jnp.inf,
-        )
+        if self.scale_parameterization == "log":
+            scale_tril = scale_tril_from_log_diag(
+                scale_flat, self.action_dim, self.full_covariance,
+                LOG_SIGMA_MIN, jnp.inf, self.max_correlation,
+            )
+        else:
+            scale_tril = clamp_scale_tril(
+                pack_scale_tril(scale_flat, self.action_dim, self.full_covariance),
+                SIGMA_MIN,
+                jnp.inf,
+            )
         value = MLP(
             hidden_dims=self.hidden_dims,
             output_dim=1,

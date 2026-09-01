@@ -33,7 +33,7 @@ network:
   clip_means: true    # the action *is* the raise size, so keep the means in the betting range
 
 optimizer:
-  learning_rate: 0.003
+  learning_rate: 0.001
   max_grad_norm: 0.5
   optimizer: adam
   weight_decay: 0.0
@@ -44,12 +44,12 @@ ppo:
   batch_size: 512
   ppo_epochs: 1
   target_tau: 0.001
-  magnet_interval: 300
+  magnet_interval: 2000
 
   # The categorical head carries the fold/check/call/raise decision, so its
   # entropy is what keeps the policy from collapsing to pure play.
-  category_entropy_coef: 0.04
-  gaussian_entropy_coef: 0.04
+  category_entropy_coef: 0.03
+  gaussian_entropy_coef: 0.03
 
   trpo_category_kl_coef: 0.05
   trpo_gaussian_kl_coef: 0.05
@@ -58,7 +58,7 @@ ppo:
 
 train:
   mode: self_play     # the only mode a sequential game supports
-  steps: 60
-  epochs: 400
+  steps: 100
+  epochs: 2000
   checkpoint_dir: data/leduc
   seed: 0

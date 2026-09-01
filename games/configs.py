@@ -22,11 +22,13 @@ from .examples import (
     ContinuousBlottoGame,
     ContinuousMatchingPennies,
     ContinuousMatchingPenniesShifted,
+    CoupledRotationGame,
     CurvaturePumpGame,
     DecoyWellGame,
     ForsakenGame,
     MultiDimDecoyWellGame,
     MultiPointGame,
+    QuadraticAsymmetricGame,
     QuadraticZeroSumGame,
 )
 from .leduc import ContinuousLeducHoldem
@@ -36,8 +38,10 @@ from .sequential_examples import ContinuousKuhnPoker
 
 @dataclasses.dataclass
 class MatchingPenniesConfig:
+    dim: int = 1
+
     def build(self) -> ZeroSumGame:
-        return ContinuousMatchingPennies()
+        return ContinuousMatchingPennies(dim=self.dim)
 
 
 @dataclasses.dataclass
@@ -71,6 +75,32 @@ class QuadraticConfig:
     def build(self) -> ZeroSumGame:
         coupling = self.coupling * jnp.eye(self.dim)
         return QuadraticZeroSumGame(coupling=coupling, bound=self.bound)
+
+
+@dataclasses.dataclass
+class QuadraticAsymmetricConfig:
+    dim: int = 1
+
+    def build(self) -> ZeroSumGame:
+        return QuadraticAsymmetricGame(dim=self.dim)
+
+
+@dataclasses.dataclass
+class CoupledRotationConfig:
+    dim: int = 2
+    coupling: float = 20.0
+    warp: float = 0.3
+    damping: float = 0.25
+    bound: float = 1.5
+
+    def build(self) -> ZeroSumGame:
+        return CoupledRotationGame(
+            dim=self.dim,
+            coupling=self.coupling,
+            warp=self.warp,
+            damping=self.damping,
+            bound=self.bound,
+        )
 
 
 @dataclasses.dataclass
@@ -220,6 +250,8 @@ GAME_CONFIGS: dict[str, type] = {
     "matching_pennies_shifted": MatchingPenniesShiftedConfig,
     "multi_point": MultiPointConfig,
     "quadratic": QuadraticConfig,
+    "quadratic_asymmetric": QuadraticAsymmetricConfig,
+    "coupled_rotation": CoupledRotationConfig,
     "blotto": BlottoConfig,
     "asymmetric_well": AsymmetricWellConfig,
     "curvature_pump": CurvaturePumpConfig,

@@ -1,42 +1,4 @@
 """Multivariate Gaussian policies parametrized by a Cholesky factor.
-
-The policy's scale is stored as the **lower-triangular factor** `A` of the
-covariance, `Sigma = A A^T`, with the diagonal of `A` held at or above
-`SIGMA_MIN`. Every distribution quantity the training code needs -- log
-density, entropy, KL to another Gaussian, and the reparametrized sample --
-is computed from `A` directly, so nothing ever forms or factorizes `Sigma`.
-
-Two deliberate choices, both of which the alternatives get wrong:
-
-**The factor, not the covariance.** Parametrizing by `Sigma` itself leaves the
-KL regularizer's curvature in the scale block equal to `Sigma^-1 (x) Sigma^-1`,
-whose eigenvalues `1 / (2 lambda_i lambda_j)` vanish as the covariance grows:
-the regularizer's strong-convexity modulus is then zero over an unbounded
-parameter set. Under the factor, the `tr(Sigmabar^-1 A A^T)` term of the KL is
-*quadratic* in `A` and so contributes constant curvature `lambda_min
-(Sigmabar^-1)`, uniformly. This is the multivariate form of the familiar 1-D
-statement that one should parametrize by the standard deviation rather than
-by the variance.
-
-**Lower triangular, not a general square root.** `Sigma = A A^T` is invariant
-under `A -> A Q` for any orthogonal `Q`, so over unconstrained square `A` the
-KL is not a convex function of the parameters at all (`-log|det A|` is not
-convex, and the whole orthogonal orbit of a factor achieves the same value).
-Restricting `A` to be lower triangular removes that invariance -- the Cholesky
-factor with positive diagonal is unique -- and turns `-1/2 log det Sigma` into
-`-sum_i log A_ii`, which is convex, with Hessian `diag(A_ii^-2)`.
-
-**The diagonal parametrization is the same code.** `full_covariance=False`
-emits only the `d` diagonal entries and leaves the off-diagonals structurally
-zero; `A` is then `diag(sigma)` and every formula below collapses to the usual
-per-dimension one. That is the right default: a payoff that is a sum of
-per-coordinate terms (`games.examples.MultiDimDecoyWellGame`, and every other
-separable game here) has an expected value depending only on the per-axis
-marginals, so its gradient w.r.t. every off-diagonal entry is identically
-zero. Turning correlations on there buys nothing and costs `d(d-1)/2`
-parameters fed by pure sampling noise. `CurvaturePumpGame` and
-`AsymmetricWellGame`, whose payoffs contain `(sum_i a_i^2)^2` and hence
-`tr(Sigma^2) = sum_ij Sigma_ij^2`, are the games where it does something.
 """
 
 from __future__ import annotations
@@ -52,6 +14,9 @@ import numpy as np
 # with large off-diagonal entries can still drive towards zero. Nothing here needs
 # it to.
 SIGMA_MIN = 1e-3
+
+# `SIGMA_MIN` in the coordinate `scale_parameterization: "log"` works in.
+LOG_SIGMA_MIN = float(np.log(SIGMA_MIN))
 
 
 def scale_param_size(action_dim: int, full_covariance: bool) -> int:
@@ -112,40 +77,86 @@ def marginal_std(scale_tril: chex.Array) -> chex.Array:
     return jnp.sqrt(jnp.sum(jnp.square(scale_tril), axis=-1))
 
 
+def straight_through_clip(x: chex.Array, lo: chex.Array, hi: chex.Array) -> chex.Array:
+    """`clip(x, lo, hi)` by value, the identity by gradient.
+
+    Value is exactly `clip(x, lo, hi)` (the second term is a bit-exact zero) and
+    `d/dx` is exactly `1`, in range and out of it alike -- a plain `jnp.clip`
+    would zero the gradient at the boundary, so a parameter that once saturated
+    could never come back.
+
+    The price is that the raw parameter is free to drift arbitrarily far outside
+    `[lo, hi]` while the value stays pinned, and recovery then costs as many
+    steps as the drift. That is a real hazard in `sigma` coordinates, where the
+    loss offers no restoring force once the value is pinned; it is a much
+    smaller one in `log sigma`, where the entropy bonus and both KL log-det
+    terms each contribute a *constant* upward force on the raw parameter (their
+    derivative w.r.t. `log sigma` does not vanish with `sigma`), so a saturated
+    floor is actively pushed back into range.
+    """
+    clipped = jnp.clip(x, lo, hi)
+    return jax.lax.stop_gradient(clipped) + (x - jax.lax.stop_gradient(x))
+
+
 def clamp_scale_tril(
     scale_tril: chex.Array, sigma_min: chex.Array, sigma_max: chex.Array
 ) -> chex.Array:
     """Clamp `diag(A)` to `[sigma_min, sigma_max]`, straight-through.
 
-    The network analogue of the Euclidean projection onto `{A_ii >= sigma_min}`:
-    the set is a box in the diagonal coordinates alone, so projecting onto it
-    *is* clamping them, and the off-diagonal entries -- unconstrained -- are
-    left untouched.
-
-    Straight-through, for the reason `mixture.project_means_to_box` is: a plain
-    `jnp.clip` has zero derivative outside the range, so a diagonal that ever
-    reaches the floor would receive no gradient there and could never come back
-    up, which is the opposite of what the projection does (the projected point
-    keeps being scored, and the gradient at it still points inward when inward
-    is where the loss wants to go). Here every consumer sees the clamped factor
-    -- so `log A_ii` is always finite and the density is always proper -- while
-    the head that produced it is differentiated as if unclamped.
-
-    The caveat is the same one `mean_box_excess` exists to answer for means:
-    with the gradient passed through, a persistently downward push walks the raw
-    diagonal arbitrarily far below the floor, and it owes every one of those
-    steps back before the emitted scale moves again. There is no restoring force
-    on the scale head here.
     """
-    diag = scale_diagonal(scale_tril)
-    clamped = jnp.clip(diag, sigma_min, sigma_max)
-    # Value is exactly `clamped` (the second term is a bit-exact zero), gradient
-    # w.r.t. `diag` is exactly the identity, in range and out of it alike.
-    adjusted = jax.lax.stop_gradient(clamped) + (diag - jax.lax.stop_gradient(diag))
+    adjusted = straight_through_clip(scale_diagonal(scale_tril), sigma_min, sigma_max)
     eye = jnp.eye(scale_tril.shape[-1], dtype=scale_tril.dtype)
     # Replace the diagonal rather than add a correction to it: adding would lose
     # precision whenever the raw diagonal sits far below the floor.
     return scale_tril * (1.0 - eye) + adjusted[..., :, None] * eye
+
+
+def scale_tril_from_log_diag(
+    flat: chex.Array,
+    action_dim: int,
+    full_covariance: bool,
+    log_sigma_min: chex.Array,
+    log_sigma_max: chex.Array,
+    max_correlation: float = 0.0,
+) -> chex.Array:
+    """`pack_scale_tril`'s counterpart for `scale_parameterization: "log"`.
+
+    Reads the packed head output as `(d, S)` rather than as the factor entries
+    themselves, and builds
+
+        A = diag(exp(d)) (I + S),    S strictly lower triangular,
+
+    so that `A_ii = exp(d_i)` -- the same *conditional* standard deviation the
+    linear parametrization puts on the diagonal, but positive by construction
+    rather than by projection. Two things follow that the linear factor cannot
+    express:
+
+    * `log det A = sum_i d_i` exactly. Every log-determinant term in the loss
+      (the Gaussian entropy bonus, both KL regularizers) therefore depends on
+      `d` alone, with no cross-talk from the correlation structure: the spread
+      and the correlations receive separate gradients.
+    * `S` is dimensionless -- a correlation-like quantity, not one in action
+      units -- so a single learning rate is coherent across the diagonal and the
+      off-diagonal, which it is not when both are entries of `A`.
+
+    `max_correlation > 0` squashes `S` through `c tanh(S/c)`, which bounds the
+    condition number of `Sigma`. Worth knowing that flooring `diag(A)` alone
+    does *not* bound the smallest eigenvalue of `Sigma` (see `SIGMA_MIN`); this
+    is the knob that does. `0.0` (the default) leaves `S` unbounded.
+
+    `log_sigma_max` bounds the conditional standard deviation, not the marginal
+    one: with correlations present, row `i` of `A` has norm `exp(d_i) ||I + S||`
+    along that row, which is the larger of the two.
+    """
+    packed = pack_scale_tril(flat, action_dim, full_covariance)
+    eye = jnp.eye(action_dim, dtype=packed.dtype)
+    log_diag = straight_through_clip(scale_diagonal(packed), log_sigma_min, log_sigma_max)
+    # The upper triangle is already a structural zero out of `pack_scale_tril`,
+    # so masking the diagonal is all it takes to be left with `S`.
+    strict_lower = packed * (1.0 - eye)
+    if full_covariance and max_correlation > 0.0:
+        strict_lower = max_correlation * jnp.tanh(strict_lower / max_correlation)
+    return jnp.exp(log_diag)[..., :, None] * (eye + strict_lower)
 
 
 def _solve_lower(scale_tril: chex.Array, rhs: chex.Array) -> chex.Array:

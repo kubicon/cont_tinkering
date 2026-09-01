@@ -1,0 +1,59 @@
+# Idealized (noise-free, exact-gradient) MMD on QuadraticZeroSumGame.
+# Run: python run_idealized.py <this file>
+#
+# QuadraticZeroSumGame has no `.peaks`/`._target_moments`, so only the
+# `quadrature` backend applies (auto-selects it) -- and that backend only
+# supports 1-D box games, hence `dim: 1` below. Keep this `game:` block in
+# sync with configs/quadratic.yaml (train.py) if you change the payoff.
+#
+# The unique Nash is both players at 0 (see nash_xy_demo.py); starting the
+# mixture there and watching `expl` stay ~0 is the sanity check this config
+# is for.
+#
+# Every settable field is listed; "(default)" marks values left at the
+# schema default (see MMDSection / InitSection / LogSection in run_idealized.py).
+
+game:
+  name: quadratic
+  dim: 1
+  coupling: 0.5        # |coupling| < 2 keeps the origin the unique saddle
+  bound: 3.0
+
+mmd:
+  # --- core MMD ---
+  lr: 0.05                # (default) step size (eta)
+  steps: 20000            # (default)
+  magnet_interval: 200    # (default) iterations between hard magnet snapshots
+  magnet_coef: 0.0        # (default) tau: proximal weight on KL(. || magnet)
+  entropy_coef: 0.0       # (default) pull of the categorical head toward uniform
+  num_components: 2       # (default)
+
+  # --- which heads train ---
+  train_means: true       # (default)
+  train_std: true         # (default)
+  freeze_weights: false   # (default) true pins the categorical head (isolates the Gaussian one)
+
+  # --- std bounds / graduated optimization ---
+  anneal_std_from: 0.0    # (default) 0 disables
+  std_min: 0.001          # (default)
+  std_max: 1.0            # (default)
+
+  # --- annealed mean-repulsion sweep ---
+  repulsion_coef: 0.0     # (default) 0 disables
+  repulsion_ramp: 0.2     # (default)
+  repulsion_hold: 0.5     # (default)
+
+  # --- payoff backend ---
+  backend: quadrature     # explicit: this game has no closed-form backend
+  grid_points: 801        # (default) quadrature only
+
+init:
+  means: [-1.5, 1.5]      # start OFF the Nash: the question is whether it FINDS it.
+                           #   `spread` = the trainer's own init (component k at (k+0.5)/K of the box)
+  weights: null            # (default) null = uniform
+  log_std: null             # (default) null = (high-low)/(2K), as the trainer does
+
+log:
+  every: 500                # (default)
+  rows: 16                  # (default)
+  out: null                  # (default) optional path to dump the full history as JSON

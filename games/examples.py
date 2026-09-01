@@ -270,65 +270,6 @@ class ForsakenGame(ZeroSumGame):
 class DecoyWellGame(ZeroSumGame):
     """`num_components == |Nash support|` is enough capacity -- and MMD still cannot get there.
 
-    Same skeleton as `MultiPointGame` (shared well + moment-matching coupling,
-    so it is squarely inside the C1/C2/C4 class of `ROUTE_A.md`), with one
-    addition: the well carries extra **decoy** bumps that are *strictly lower*
-    than the true peaks but far **broader**.
-
-    payoff(a1, a2) = D(a1) - D(a2) + coupling * sum_j feat_j(a1) * feat_j(a2)
-
-        D(a) = sum_k peak_height * exp(-(a - peak_k)^2 / (2 * peak_width^2))
-             + sum_d height_d   * exp(-(a - center_d)^2 / (2 * width_d^2))
-
-    The coupling features are built from the **true peaks only** (identical to
-    `MultiPointGame`), so the equilibrium analysis is unchanged: at a Nash the
-    opponent matches all K-1 moments, the coupling term vanishes for *every*
-    action, and each player is left maximizing `D` alone. Since every decoy is
-    strictly lower than the peaks, the argmax of `D` is exactly the peaks, so
-    the unique Nash is still the K-point mixture on `peaks` with `weights`.
-    **The decoys carry zero equilibrium mass.** `num_components = K` suffices to
-    represent it exactly.
-
-    Why it is nevertheless a counterexample -- *mass beats height under
-    smoothing*. A Gaussian bump of height `h` and width `w`, convolved with
-    `N(0, s^2)`, has height `h * w / sqrt(w^2 + s^2)`: for `s >> w` that is
-    `~ (h*w)/s`, i.e. it decays in proportion to the bump's **mass** `h*w`, not
-    its height. With the defaults (peaks: h=1.0, w=0.05, mass 0.05; decoy:
-    h=0.7, w=0.45, mass 0.315) the decoy has ~6x the mass of a peak, so:
-
-      - at `s = 0`   the global maxima of `D` are the true peaks (1.06 vs 0.70);
-      - at `s >~ 0.1` the global maximum of the *smoothed* `D` is the **decoy**;
-      - at `s >~ 0.5` the smoothed `D` is **unimodal** -- one basin, the decoy's.
-
-    This inverts the ranking exactly where graduated optimization relies on it.
-    A broad-initialized (or std-annealed) component feels the smoothed
-    landscape, so it is pulled to the *decoy*; as the std anneals down, the
-    decoy remains a strict local maximum of `D`, and the peaks are so narrow
-    that the region between them is numerically flat (a component at `a = 0.5`
-    feels a peak-gradient of order `exp(-50)`). So the component has no gradient
-    with which to leave, and no gradient telling it where to go. The std-anneal
-    escape hatch that rescues `idealized_mmd.py`'s other traps
-    (`MMDConfig.anneal_std_from`) here does the opposite: it *delivers* the
-    components into the trap and then locks the door.
-
-    The trap is an exact, stable fixed point, not a slow drift. With the default
-    symmetric setup (`peaks=(-1,1)`, `weights=(0.5,0.5)`) the target first moment
-    is 0, so a player sitting entirely on the decoy at `a = 0` has feature
-    `feat(0) = u(0) - 0 = 0`: the coupling term vanishes identically, each player's
-    effective landscape collapses to `D` alone, and `a = 0` is a strict local
-    maximum of `D` with zero gradient. Both players collapsed onto the decoy is
-    therefore a fixed point of the MMD vector field -- and it is *not* a Nash:
-    each player could deviate to a peak and gain `1.06 - 0.70`, for a total
-    exploitability of ~0.72.
-
-    The default `action_margin=2.0` puts the box at `[-3, 3]`, which is
-    deliberate: `training.mixture._spread_bias_init` starts `K=2` components at
-    `+-1.5` -- inside the dead zone, where the only gradient they can feel is the
-    decoy's. The natural initialization walks straight in.
-
-    Knobs to make the trap milder/harsher: raise `peak_width` (more peak mass ->
-    smoothing eventually finds them), lower the decoy `height`/`width` (less
-    mass), or shrink `action_margin`.
     """
 
     def __init__(
@@ -550,13 +491,21 @@ class MultiDimDecoyWellGame(ZeroSumGame):
 
 
 class ContinuousMatchingPennies(ZeroSumGame):
-    """Matching pennies embedded in a continuous action: `a1, a2 in [0, 1]`.
+    """Matching pennies embedded in a continuous `dim`-dimensional action.
 
-    payoff(a1, a2) = a1 * a2
+    Actions `a1, a2 in [-1, 1]^dim` and the payoff is the bilinear form
+
+        payoff(a1, a2) = <a1, a2> = sum_{d=1}^{dim} a1_d * a2_d
+
+    `dim == 1` reproduces the scalar `f(x, y) = x * y`; `dim == 2` gives
+    `f(x, y) = x1*y1 + x2*y2`. Still bilinear, still a degenerate equilibrium.
     """
 
-    def __init__(self):
-        self._space = box(-jnp.ones(1), jnp.ones(1))
+    def __init__(self, dim: int = 1):
+        if dim < 1:
+            raise ValueError(f"dim must be >= 1, got {dim}")
+        self.dim = dim
+        self._space = box(-jnp.ones(dim), jnp.ones(dim))
 
     def action_space(self, player: int) -> ActionSpace:
         return self._space
@@ -580,3 +529,125 @@ class ContinuousMatchingPenniesShifted(ZeroSumGame):
     def payoff(self, action_1: chex.Array, action_2: chex.Array) -> chex.Array:
         return jnp.sum((2 * action_1 - 1) * (2 * action_2 - 1))
 
+
+class QuadraticAsymmetricGame(ZeroSumGame):
+    """payoff(a1, a2) = ||a1||^2 * sum(a2) - ||a2||^2 * ||a1||^2 on the box [-1, 1]^dim.
+
+    Asymmetric in the two players' roles: player 1 enters only through
+    `||a1||^2`, player 2 through both `sum(a2)` and `||a2||^2`.
+    """
+
+    def __init__(self, dim: int = 1):
+        if dim < 1:
+            raise ValueError(f"dim must be >= 1, got {dim}")
+        self.dim = dim
+        self._space = box(-jnp.ones(dim), jnp.ones(dim))
+
+    def action_space(self, player: int) -> ActionSpace:
+        return self._space
+
+    def payoff(self, action_1: chex.Array, action_2: chex.Array) -> chex.Array:
+        sq_1 = jnp.sum(jnp.square(action_1))
+        sq_2 = jnp.sum(jnp.square(action_2))
+        return sq_1 * jnp.sum(action_2) - sq_2 * sq_1
+
+
+class CoupledRotationGame(ZeroSumGame):
+    """Rotation the magnet has to damp: MMD cycles at `tau = 0`, converges at `tau > 0`.
+
+    payoff(a1, a2) = coupling * g(a1)^T A g(a2)
+                     - (damping / 4) * (||a1||^4 - ||a2||^4)
+
+        g(z)   = z + warp * z^3            (elementwise, odd, g(0) = 0)
+        A      = S - S^T,  S the super-diagonal shift (A_{i,i+1} = 1)
+
+    Four things this game is built to have at once:
+
+    * **`dim >= 2`, any `dim`.** `A` is the tridiagonal skew matrix, defined for
+      every `dim >= 2`; nothing else in the payoff cares about the dimension.
+    * **Not bilinear.** The coupling is bilinear in `g`, not in the actions --
+      `g(a1)^T A g(a2)` carries `a1_i^3 a2_j`, `a1_i a2_j^3`, `a1_i^3 a2_j^3`
+      terms -- and the damping term is quartic.
+    * **Coordinates are not independent.** `||a||^4 = (sum_i a_i^2)^2` mixes every
+      pair of a player's *own* coordinates, and `A` (being off-diagonal) makes
+      coordinate `i` of one player pay off against coordinates `i-1, i+1` of the
+      other. So the payoff does not split into a sum of per-axis games the way
+      `MultiDimDecoyWellGame` does, and a `full_covariance` policy has something
+      to gain here.
+    * **Unique Nash, at the origin.** `U(x, 0) = -damping/4 ||x||^4 <= 0` and
+      `U(0, y) = +damping/4 ||y||^4 >= 0`, so `(delta_0, delta_0)` is a Nash with
+      value 0; the best response to `delta_0` is `0` and nothing else, so by the
+      interchangeability of optimal strategies in a zero-sum game it is the
+      *only* Nash, mixed extension included. Exploitability therefore measures
+      exactly "how far are both players from the origin", and one mixture
+      component is enough capacity.
+
+    **Why the magnet coefficient decides the outcome.** At the origin the own
+    Hessians vanish (the quartic is flat to second order, and `A g(0) = 0`), so
+    the pseudo-gradient linearizes to the *purely skew* field
+    `[[0, -c A], [c A^T, 0]]`: eigenvalues on the imaginary axis. Continuous-time
+    flow would circle at constant radius, and the quartic term is dissipative
+    (`-damping ||x||^2 x` pulls inward), so the *flow* converges. A discrete
+    ascent/descent step of size `eta` does not: it adds the usual
+    `O(eta^2)` outward push, which near the origin is linear in the radius and so
+    dominates the cubic dissipation. The iterates spiral out until dissipation
+    catches up, and settle on a **limit cycle** -- exploitability plateaus at a
+    positive value and stays there.
+
+    The magnet's proximal `KL(. || magnet)` term is the standard cure: it turns
+    the explicit step into an (approximate) proximal-point step, whose rotation
+    is contractive rather than expansive. Raising `magnet_gaussian_kl_coef` from
+    `0` shrinks the cycle, and above a threshold the run collapses onto the
+    origin.
+
+    Measured with `configs/coupled_rotation.yaml` (2-D, one component, 6000
+    idealized iterations, `lr=0.05`, exact quadrature payoffs), sweeping only
+    `ppo.magnet_gaussian_kl_coef`:
+
+        tau = 0.0  ->  exploitability 28.9 -> 72.0   (means driven to the box wall)
+        tau = 0.2  ->  28.9 -> 5.8                   (cycle shrinks, still far)
+        tau = 1.0  ->  28.9 -> 0.001                 (both players at the origin)
+        tau = 4.0  ->  28.9 -> 0.018
+
+    The same sweep at `dim=3` (Monte-Carlo `backend: sampled`, since a 3-D
+    quadrature grid fine enough for these components does not fit): `tau=0`
+    goes 33.5 -> 139, `tau=1.0` goes 33.5 -> 0.06. The default `coupling=20`
+    against `damping=0.25` is what sets that separation -- it makes the
+    rotation dominate the dissipation over the whole box, so the `tau=0` run
+    leaves rather than settling on a small interior cycle.
+
+    `warp = 0` degenerates the coupling to bilinear `a1^T A a2` (the damping term
+    keeps the game itself non-bilinear); `damping = 0` removes the only inward
+    force and every run diverges to the box wall. `bound` should stay large
+    enough that the `tau = 0` limit cycle is interior -- a cycle pinned against
+    the wall is a clipping artifact, not the dynamics.
+    """
+
+    def __init__(
+        self,
+        dim: int = 2,
+        coupling: float = 20.0,
+        warp: float = 0.3,
+        damping: float = 0.25,
+        bound: float = 1.5,
+    ):
+        if dim < 2:
+            raise ValueError(f"dim must be >= 2 for a nonzero skew coupling, got {dim}")
+        self.dim = dim
+        self.coupling = coupling
+        self.warp = warp
+        self.damping = damping
+        shift = jnp.eye(dim, k=1)
+        self.skew = shift - shift.T
+        self._space = box(-bound * jnp.ones(dim), bound * jnp.ones(dim))
+
+    def action_space(self, player: int) -> ActionSpace:
+        return self._space
+
+    def _g(self, action: chex.Array) -> chex.Array:
+        return action + self.warp * action**3
+
+    def payoff(self, action_1: chex.Array, action_2: chex.Array) -> chex.Array:
+        rotation = self._g(action_1) @ self.skew @ self._g(action_2)
+        wells = jnp.sum(action_1**2) ** 2 - jnp.sum(action_2**2) ** 2
+        return self.coupling * rotation - self.damping / 4 * wells

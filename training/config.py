@@ -26,6 +26,23 @@ class PPOHyperparams:
     # `d(d-1)/2` parameters per component only collect sampling noise. See
     # `training.gaussian`.
     full_covariance: bool = False
+    # How the scale head's output is read into the Cholesky factor `A`.
+    #   "linear" -- the output *is* `diag(A)` (and the off-diagonal entries),
+    #       projected onto `[SIGMA_MIN, box width]`. The historical default, and
+    #       the parametrization in which the KL regularizer is uniformly
+    #       strongly convex -- which is what the MMD analysis in `MultiDim.md` /
+    #       `theory/THEORY.md` rests on. Kept as the default so every existing
+    #       config and checkpoint reproduces unchanged.
+    #   "log"    -- the output is `(log diag(A), S)` with `A = diag(exp(d))(I+S)`;
+    #       see `training.gaussian.scale_tril_from_log_diag`. Positive by
+    #       construction, exact `log det`, and a dimensionless off-diagonal.
+    #       Note this gives up the strong convexity above: `KL`'s log-det term is
+    #       *linear* in `d`, so the modulus degenerates as `d -> -inf`.
+    scale_parameterization: str = "linear"
+    # `scale_parameterization: "log"` + `full_covariance` only: squash the
+    # off-diagonal through `c tanh(S/c)`, bounding the condition number of
+    # `Sigma`. 0 leaves it unbounded.
+    max_correlation: float = 0.0
 
     # Optimization.
     learning_rate: float = 3e-4

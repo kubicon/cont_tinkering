@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from training.gaussian import (
+    LOG_SIGMA_MIN,
     SIGMA_MIN,
     clamp_scale_tril,
     diagonal_slots,
@@ -23,11 +24,13 @@ from training.gaussian import (
     gaussian_kl,
     gaussian_log_prob,
     gaussian_sample,
+    log_scale_det,
     marginal_std,
     natural_gradient,
     pack_scale_tril,
     scale_diagonal,
     scale_param_size,
+    scale_tril_from_log_diag,
 )
 
 DIM = 3
@@ -215,3 +218,103 @@ def test_gradient_of_a_separable_payoff_ignores_the_off_diagonals():
 
     assert float(jax.grad(rotated_payoff)(0.0)) == pytest.approx(0.0, abs=1e-6)
     assert off_diagonal.shape == (DIM, DIM)
+
+
+# --- `scale_parameterization: "log"` -------------------------------------
+
+
+def _log_flat(log_diag, off=0.0):
+    """A packed vector in log coordinates: `log_diag` on the diagonal slots."""
+    size = scale_param_size(DIM, True)
+    flat = jnp.full((size,), off).at[diagonal_slots(DIM, True)].set(jnp.asarray(log_diag))
+    return flat
+
+
+def test_log_diag_factor_has_the_intended_shape():
+    """`A = diag(exp(d))(I + S)`: lower triangular, with `A_ii = exp(d_i)` exactly."""
+    log_diag = jnp.array([0.1, -0.5, 0.3])
+    flat = _log_flat(log_diag, off=0.4)
+    scale = scale_tril_from_log_diag(flat, DIM, True, LOG_SIGMA_MIN, jnp.inf)
+
+    assert np.allclose(np.triu(scale, 1), 0.0)
+    assert np.allclose(np.array(scale_diagonal(scale)), np.array(jnp.exp(log_diag)), rtol=1e-6)
+    # Row i is exp(d_i) times row i of (I + S), S the raw strictly-lower entries.
+    expected = np.diag(np.array(jnp.exp(log_diag))) @ (np.eye(DIM) + np.tril(np.full((DIM, DIM), 0.4), -1))
+    assert np.allclose(np.array(scale), expected, rtol=1e-6)
+
+
+def test_log_diag_is_diagonal_without_full_covariance():
+    scale = scale_tril_from_log_diag(
+        jnp.array([0.1, -0.5, 0.3]), DIM, False, LOG_SIGMA_MIN, jnp.inf
+    )
+    assert np.allclose(np.array(scale), np.diag(np.exp(np.array([0.1, -0.5, 0.3]))), rtol=1e-6)
+
+
+def test_log_det_depends_only_on_the_diagonal():
+    """The point of the `diag(exp(d))(I + S)` form: no cross-talk into `log det`.
+
+    Every log-determinant term in the loss -- the entropy bonus and both KL
+    regularizers -- therefore puts gradient on `d` alone.
+    """
+    log_diag = jnp.array([0.1, -0.5, 0.3])
+
+    def log_det(off):
+        flat = _log_flat(log_diag, off=off)
+        return log_scale_det(scale_tril_from_log_diag(flat, DIM, True, LOG_SIGMA_MIN, jnp.inf))
+
+    assert np.allclose(float(log_det(0.0)), float(jnp.sum(log_diag)), rtol=1e-6)
+    assert np.allclose(float(log_det(1.7)), float(jnp.sum(log_diag)), rtol=1e-6)
+    assert abs(float(jax.grad(log_det)(1.7))) < 1e-6
+
+
+def test_log_diag_is_positive_far_below_the_floor():
+    """Where the linear factor needs a projection to stay a valid scale."""
+    flat = _log_flat(jnp.array([-40.0, -40.0, -40.0]))
+    scale = scale_tril_from_log_diag(flat, DIM, True, LOG_SIGMA_MIN, jnp.inf)
+    assert np.allclose(np.array(scale_diagonal(scale)), SIGMA_MIN, rtol=1e-5)
+    # Even unclamped the factor stays positive, which `pack_scale_tril` does not.
+    unclamped = scale_tril_from_log_diag(flat, DIM, True, -jnp.inf, jnp.inf)
+    assert np.all(np.array(scale_diagonal(unclamped)) > 0.0)
+
+
+def test_log_diag_clip_passes_the_gradient_through():
+    flat = _log_flat(jnp.array([-40.0, -40.0, -40.0]))
+
+    def emitted(raw):
+        return jnp.sum(jnp.log(scale_diagonal(
+            scale_tril_from_log_diag(raw, DIM, True, LOG_SIGMA_MIN, jnp.inf)
+        )))
+
+    grad = jax.grad(emitted)(flat)
+    assert np.allclose(np.array(grad[diagonal_slots(DIM, True)]), 1.0)
+
+
+def test_max_correlation_bounds_the_condition_number():
+    flat = _log_flat(jnp.zeros(DIM), off=50.0)
+    unbounded = scale_tril_from_log_diag(flat, DIM, True, LOG_SIGMA_MIN, jnp.inf)
+    bounded = scale_tril_from_log_diag(flat, DIM, True, LOG_SIGMA_MIN, jnp.inf, max_correlation=0.9)
+
+    assert np.max(np.abs(np.array(bounded) - np.diag(np.diag(np.array(bounded))))) <= 0.9 + 1e-6
+    cond = lambda a: np.linalg.cond(np.array(a) @ np.array(a).T)
+    assert cond(bounded) < cond(unbounded) / 100.0
+    # It does not touch the diagonal, so the conditional spread is unchanged.
+    assert np.allclose(np.array(scale_diagonal(bounded)), np.array(scale_diagonal(unbounded)))
+
+
+def test_log_diag_reproduces_the_linear_factor_it_is_a_reparametrization_of():
+    """Both coordinates can express the same `A`, so the model is unchanged."""
+    log_diag = jnp.array([0.1, -0.5, 0.3])
+    sigma = jnp.exp(log_diag)
+    log_scale = scale_tril_from_log_diag(_log_flat(log_diag, off=0.4), DIM, True, LOG_SIGMA_MIN, jnp.inf)
+
+    rows, cols = np.tril_indices(DIM)
+    linear_flat = jnp.asarray(np.array(log_scale)[rows, cols])
+    linear_scale = pack_scale_tril(linear_flat, DIM, True)
+
+    mean, action = jnp.array([0.3, -0.2, 1.0]), jnp.array([0.5, 0.1, 0.7])
+    assert np.allclose(
+        float(gaussian_log_prob(action, mean, log_scale)),
+        float(gaussian_log_prob(action, mean, linear_scale)),
+        rtol=1e-6,
+    )
+    assert np.allclose(np.array(scale_diagonal(log_scale)), np.array(sigma), rtol=1e-6)

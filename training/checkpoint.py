@@ -46,6 +46,8 @@ def _default_build_network(hyperparams: PPOHyperparams) -> ActorCritic:
         activation=hyperparams.activation,
         normalization=hyperparams.normalization,
         full_covariance=hyperparams.full_covariance,
+        scale_parameterization=hyperparams.scale_parameterization,
+        max_correlation=hyperparams.max_correlation,
     )
 
 

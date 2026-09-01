@@ -34,7 +34,7 @@ best_response:
   # Which responder iterate the bound is read off: "live" (PPO's current
   # iterate, normally the tighter bound), "target" (the responder's own Polyak
   # average), or "both". The target network is tracked either way.
-  responder_iterate: live
+  responder_iterate: target
   eval_episodes: 200000
   eval_batch_size: 20000
   eval_seed: 32432432

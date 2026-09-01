@@ -1,0 +1,83 @@
+# CoupledRotationGame -- the magnet-decides-it game.
+#
+#   python run_idealized.py configs/coupled_rotation_magnet.yaml
+#
+# payoff(a1, a2) = coupling * g(a1)^T A g(a2) - damping/4 * (||a1||^4 - ||a2||^4),
+#   g(z) = z + warp*z^3 (elementwise), A the skew tridiagonal shift.
+#
+# Non-bilinear, coordinates coupled (both by A and by ||.||^4), any dim >= 2,
+# unique Nash at the origin. The knob this file exists for is
+# `ppo.magnet_gaussian_kl_coef`: 0.0 leaves the discrete MMD step spiralling out
+# onto a limit cycle, a large enough value collapses it onto the Nash.
+#
+# Measured (2-D, one component, 6000 iterations, exact quadrature), sweeping only
+# that coefficient:
+#   tau=0.0 -> expl 28.9 -> 72.0 (means at the box wall)   tau=0.2 -> 5.8
+#   tau=1.0 -> 28.9 -> 0.001                               tau=4.0 -> 0.018
+# `num_components: 1` + `freeze_weights: true` keep the categorical head inert,
+# so the Gaussian magnet term is the only one acting.
+# This file is the tau = 1 case: it converges to the origin (expl ~1e-3).
+
+game:
+  name: coupled_rotation
+  dim: 2
+  coupling: 20.0    # rotation strength; large relative to `damping` on purpose
+  warp: 0.3
+  damping: 0.25
+  bound: 1.5
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 1        # the Nash is a single point mass; capacity is not the issue
+  full_covariance: false
+
+optimizer:
+  learning_rate: 0.02
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 256
+  ppo_epochs: 1
+
+  target_tau: 0.001
+  magnet_interval: 200
+
+  category_entropy_coef: 0.1
+  gaussian_entropy_coef: 0.1
+
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.5
+  magnet_gaussian_kl_coef: 0.0    # <- the knob; 0.0 in configs/coupled_rotation.yaml diverges
+
+train:
+  mode: self_play
+  steps: 100
+  epochs: 200
+  checkpoint_dir: null
+  seed: 123
+
+idealized:
+  backend: quadrature
+  grid_points: 81
+  max_quadrature_gib: 2.0
+  normalize_density: true
+
+  train_means: true
+  train_std: true
+  freeze_weights: true
+
+  init_means: [[[0.3, 0.0]], [[0.0, 0.3]]]   # start off the Nash, and off the x=y diagonal
+                                             #   (x = y is an invariant manifold here)
+  std_max: 0.4
+  init_log_std: 0.2
+
+  log_rows: 16
+  log_out: null
+  verbose: true

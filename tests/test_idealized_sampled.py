@@ -32,9 +32,9 @@ import pytest
 _X64_BEFORE = jax.config.jax_enable_x64
 
 from games.configs import GAME_CONFIGS  # noqa: E402 -- must follow the line above
-from idealized_mmd import Params  # noqa: E402
 from run_idealized import (  # noqa: E402
     IdealizedSection,
+    Params,
     SolverConfig,
     build_backend,
     build_init,
@@ -56,15 +56,17 @@ def _game():
     return GAME_CONFIGS["quadratic"](dim=1, coupling=0.5, bound=3.0).build()
 
 
+def _scalar_params(logits, means, stds) -> Params:
+    """A 1-D mixture in the solver's `(means (K, 1), scale_tril (K, 1, 1))` shape."""
+    return Params(logits=jnp.asarray(logits),
+                  means=jnp.asarray(means)[:, None],
+                  scale_tril=jnp.asarray(stds)[:, None, None])
+
+
 def _params(seed: int = 0) -> tuple[Params, Params]:
     """Two deliberately asymmetric 2-component mixtures (nothing at the Nash)."""
-    p0 = Params(logits=jnp.asarray([0.4, -0.9]),
-                means=jnp.asarray([-1.2, 0.7]),
-                log_std=jnp.asarray([np.log(0.6), np.log(0.9)]))
-    p1 = Params(logits=jnp.asarray([-0.3, 0.5]),
-                means=jnp.asarray([0.4, 1.6]),
-                log_std=jnp.asarray([np.log(0.8), np.log(0.5)]))
-    return p0, p1
+    return (_scalar_params([0.4, -0.9], [-1.2, 0.7], [0.6, 0.9]),
+            _scalar_params([-0.3, 0.5], [0.4, 1.6], [0.8, 0.5]))
 
 
 def _cfg(**idealized) -> SolverConfig:
@@ -109,7 +111,7 @@ def test_gaussian_gradients_match_the_exact_ones(grad_estimator: str) -> None:
     # the score estimator is unbiased but far noisier, so it gets a looser leash
     tol = 0.05 if grad_estimator == "pathwise" else 0.5
     assert jnp.max(jnp.abs(g_hat.means - g.means)) < tol, (g_hat.means, g.means)
-    assert jnp.max(jnp.abs(g_hat.log_std - g.log_std)) < tol, (g_hat.log_std, g.log_std)
+    assert jnp.max(jnp.abs(g_hat.scale_tril - g.scale_tril)) < tol, (g_hat.scale_tril, g.scale_tril)
 
 
 def test_sampled_entropy_bonus_has_a_mean_zero_gradient() -> None:
@@ -125,10 +127,10 @@ def test_sampled_entropy_bonus_has_a_mean_zero_gradient() -> None:
 
     def sampled_grad(seed: int):
         noise = sampled.draw_noise(jax.random.PRNGKey(seed), p0, p1)
-        return jax.grad(lambda pp: sampled.entropy(pp, noise, 0))(p0).log_std
+        return jax.grad(lambda pp: sampled.entropy(pp, noise, 0))(p0).scale_tril[:, 0, 0]
 
     averaged = jnp.mean(jnp.stack([sampled_grad(s) for s in range(16)]), axis=0)
-    exact_grad = jax.grad(exact.entropy)(p0).log_std
+    exact_grad = jax.grad(exact.entropy)(p0).scale_tril[:, 0, 0]
 
     assert jnp.max(jnp.abs(averaged)) < 0.05, averaged
     # the exact term is a real force pushing every std outward -- weighted by the
@@ -162,7 +164,11 @@ def test_large_sample_run_reproduces_the_quadrature_run() -> None:
     for exact_row, sampled_row in zip(exact_history, sampled_history):
         assert sampled_row["expl"] == pytest.approx(exact_row["expl"], abs=0.02)
         for field in ("means0", "std0", "w0", "means1", "std1", "w1"):
-            assert sampled_row[field] == pytest.approx(exact_row[field], abs=0.02), field
+            # means/stds are per-component *vectors* now (one entry per action
+            # dimension), so compare them flattened
+            got = np.ravel(np.asarray(sampled_row[field], dtype=float))
+            want = np.ravel(np.asarray(exact_row[field], dtype=float))
+            assert got == pytest.approx(want, abs=0.02), field
 
 
 def test_sampled_backend_rejects_unknown_estimators() -> None:
