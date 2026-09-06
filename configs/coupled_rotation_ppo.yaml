@@ -54,12 +54,12 @@ ppo:
   trpo_category_kl_coef: 0.05
   trpo_gaussian_kl_coef: 0.01
   magnet_category_kl_coef: 0.2
-  magnet_gaussian_kl_coef: 0.0    # <- the knob; 0.0 in configs/coupled_rotation.yaml diverges
+  magnet_gaussian_kl_coef: 0.2    # <- the knob; 0.0 in configs/coupled_rotation.yaml diverges
 
 train:
   mode: self_play
   steps: 100
-  epochs: 1000
+  epochs: 3000
   checkpoint_dir: null
   seed: 123
 

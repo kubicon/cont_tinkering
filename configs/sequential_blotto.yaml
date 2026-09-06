@@ -1,0 +1,69 @@
+# python train.py configs/sequential_blotto.yaml
+#
+# Colonel Blotto contested one front at a time, with continuous bids (see
+# `games/sequential_blotto.py`). Sequential, so `train.py` runs
+# `SequentialSelfPlayPPOTrainer`; the schema is otherwise the shared one.
+#
+# The action is the *fraction of the remaining budget* to commit, so the policy
+# lives on `[0, 1]` at every front and `clip_means: true` keeps the mixture
+# components inside it.
+#
+# There is no exact best response here (the state carries real bid sizes), so
+# nothing prints an exploitability column while training -- measure the
+# checkpoint afterwards with `python best_response.py
+# configs/sequential_blotto_br.yaml`.
+#
+# The equilibrium wants *spread out* bids, so a collapsing mixture is the
+# failure to watch for: if the payoff sticks near zero and the components pile
+# up, raise the entropy coefficients before touching anything else, and only
+# then consider a lower `sharpness`.
+
+game:
+  name: sequential_blotto
+  num_fields: 3
+  field_values: null    # null = every front worth 1
+  budget: 1.0
+  # Steepness of the logistic contest on a front. With budget 1 over 3 fronts a
+  # typical bid gap is ~0.1, so 10 makes a gap that size worth ~0.73 win
+  # probability. `null` means the bigger bid simply wins -- trainable under PPO,
+  # but it gives a collapsed policy no gradient at all (see the module doc).
+  sharpness: 10.0
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 3
+  clip_means: true      # the action is a fraction, so keep the means in [0, 1]
+
+optimizer:
+  learning_rate: 0.003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 300
+
+  # The categorical head only chooses *which component* to bid from (this game
+  # has no atoms), so its entropy is what keeps the mixture from collapsing onto
+  # one bid size.
+  category_entropy_coef: 0.04
+  gaussian_entropy_coef: 0.04
+
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  mode: self_play     # the only mode a sequential game supports
+  steps: 40
+  epochs: 400
+  checkpoint_dir: data/sequential_blotto
+  seed: 0

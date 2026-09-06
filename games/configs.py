@@ -33,6 +33,7 @@ from .examples import (
 )
 from .leduc import ContinuousLeducHoldem
 from .sequential import SequentialZeroSumGame
+from .sequential_blotto import ContinuousSequentialBlotto
 from .sequential_examples import ContinuousKuhnPoker
 
 
@@ -245,6 +246,33 @@ class LeducConfig:
         )
 
 
+@dataclasses.dataclass
+class SequentialBlottoConfig:
+    """Colonel Blotto contested one front at a time -- the third *sequential* game.
+
+    `sharpness: null` in the YAML means the bigger bid simply wins; any positive
+    number softens the front into a logistic contest, which is what to reach for
+    when a run stalls (see `games.sequential_blotto`). Like `leduc` there is no
+    exact best response, so this trains without an exploitability metric --
+    measure it afterwards with `best_response.py`.
+    """
+
+    num_fields: int = 3
+    # One value per front; `null` weights every front equally.
+    field_values: tuple[float, ...] | None = None
+    budget: float = 1.0
+    # Positive: a logistic contest of this steepness. `null`: hard argmax.
+    sharpness: float | None = 10.0
+
+    def build(self) -> SequentialZeroSumGame:
+        return ContinuousSequentialBlotto(
+            num_fields=self.num_fields,
+            field_values=tuple(self.field_values) if self.field_values is not None else None,
+            budget=self.budget,
+            sharpness=self.sharpness,
+        )
+
+
 GAME_CONFIGS: dict[str, type] = {
     "matching_pennies": MatchingPenniesConfig,
     "matching_pennies_shifted": MatchingPenniesShiftedConfig,
@@ -260,4 +288,5 @@ GAME_CONFIGS: dict[str, type] = {
     "multidim_decoy_well": MultiDimDecoyWellConfig,
     "kuhn": KuhnConfig,
     "leduc": LeducConfig,
+    "sequential_blotto": SequentialBlottoConfig,
 }

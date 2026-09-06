@@ -23,6 +23,7 @@ from training.actor_critic import (
     masked_log_softmax,
 )
 from training.config import MixturePPOHyperparams
+from training.gaussian import gaussian_kl
 from training.mixture import (
     Episode,
     build_mixture_network,
@@ -305,3 +306,65 @@ def test_masked_logit_constant_is_finite():
     """`-inf` would make `p * log p` a NaN in the entropy; the sentinel must not be one."""
     assert jnp.isfinite(jnp.asarray(MASKED_LOGIT))
     assert float(jnp.exp(masked_log_softmax(jnp.zeros(3), jnp.array([True, True, False]))[2])) == 0.0
+
+
+def test_gaussian_kls_match_the_sampled_component_estimator_in_expectation():
+    """The exact weighted sum is the Rao-Blackwellization of the per-draw form.
+
+    Averaging the old estimator -- `gaussian_kl` at the component that happened
+    to be drawn -- over many draws at one observation must converge to the
+    deterministic sum the loss now computes, and the sum itself must be exactly
+    the component probabilities dotted with the per-component KLs.
+    """
+    num_atoms, num_components = 2, 3
+    network, params = _network(num_atoms=num_atoms, num_components=num_components)
+    mask = expand_kind_mask(jnp.ones(num_atoms + 1, dtype=bool), num_components)
+
+    obs = jax.random.normal(jax.random.PRNGKey(1), (OBS_DIM,))
+    logits, means, scale_trils, value = network.apply(params, obs)
+    # A magnet the policy has already moved off, so the KLs are not all zero.
+    magnet_means = means + 0.3
+    magnet_scale_trils = scale_trils * 1.5
+
+    def one(key):
+        sample_key, reward_key = jax.random.split(key)
+        component, raw_action = sample_mixture_component(
+            logits, means, scale_trils, mask, num_atoms, sample_key
+        )
+        return Episode(
+            actor=jnp.int32(0),
+            obs=obs,
+            action_mask=mask,
+            logits=logits,
+            means=means,
+            scale_trils=scale_trils,
+            magnet_logits=logits,
+            magnet_means=magnet_means,
+            magnet_scale_trils=magnet_scale_trils,
+            component=component,
+            raw_action=raw_action,
+            action_kind=component_to_kind(component, num_atoms),
+            action_value=jnp.clip(raw_action, 0.0, 1.0),
+            value=value,
+            reward=jax.random.normal(reward_key, ()),
+        )
+
+    episode = jax.vmap(one)(jax.random.split(jax.random.PRNGKey(2), 20000))
+    _, metrics = _loss(network, params, episode)
+    reported = float(metrics["magnet_gaussian_kl"])
+
+    # Exact: the component weights dotted with the per-component KLs.
+    weight = jnp.exp(masked_log_softmax(logits, mask))[num_atoms:]
+    exact = float(
+        jnp.sum(weight * gaussian_kl(means, scale_trils, magnet_means, magnet_scale_trils))
+    )
+    assert exact > 0.0  # the magnet offset above actually bites
+    assert reported == pytest.approx(exact, rel=1e-5)
+
+    # Monte Carlo: the estimator this replaced, averaged over the component draw.
+    index = gaussian_component_index(episode.component, num_atoms)
+    is_gaussian = (episode.component >= num_atoms).astype(jnp.float32)
+    per_draw = is_gaussian * gaussian_kl(
+        means[index], scale_trils[index], magnet_means[index], magnet_scale_trils[index]
+    )
+    assert float(jnp.mean(per_draw)) == pytest.approx(exact, rel=0.05)

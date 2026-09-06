@@ -540,11 +540,26 @@ def mixture_ppo_loss_from_outputs(
     It is a property of the observation, not of the sample, so it is identical
     for every sample sharing an `obs`.
 
+    Both Gaussian KLs are summed over *every* component, weighted by that
+    component's probability under the sampling-time policy, rather than being
+    evaluated at the drawn component alone. Unlike the surrogate -- which needs
+    the importance ratio at `raw_action` and so exists only for the component
+    that was actually drawn -- a Gaussian KL is a closed form in the head
+    outputs, with an exact gradient for all `num_components` of them at once.
+    Indexing it by the draw would estimate a quantity that can simply be
+    computed, at the cost of the draw's variance and of leaving a low-weight
+    component's mean/scale rows un-anchored on the samples that missed it. The
+    weights come from `episode.logits` (the policy the component was drawn
+    from), not from the current `logits`, so the expectation matches the
+    per-draw form exactly even after several PPO epochs have moved the policy.
+
     Atoms and legality masks both act by *zeroing* terms rather than by
     branching. For a sample that drew an atom, the Gaussian ratio, its clipped
-    surrogate, both Gaussian KLs and the marginal-density entropy are all forced
-    to `0.0`: an atom has no mean and no spread, so there is nothing there for
-    those terms to say. Illegal categorical entries are handled inside
+    surrogate and the marginal-density entropy are all forced to `0.0`: an atom
+    has no mean and no spread, so there is nothing there for those terms to say.
+    The Gaussian KLs need no such factor -- their weights already carry it, and
+    an illegal or atom-only state drives every Gaussian weight to exactly `0.0`.
+    Illegal categorical entries are handled inside
     `masked_log_softmax`/`categorical_kl` via `episode.action_mask`, the mask
     recorded at sampling time -- re-applying exactly that mask is what keeps the
     PPO ratio a ratio of two densities over the same support.
@@ -592,19 +607,21 @@ def mixture_ppo_loss_from_outputs(
     )
     entropy = category_entropy + action_entropy
 
-    index = gaussian_component_index(episode.component, num_atoms)
-    mean = means[index]
-    scale_tril = scale_trils[index]
+    # Weight of each Gaussian component under the policy the component was drawn
+    # from; sums to `P(drew a Gaussian)` rather than to one, which is what makes
+    # the two sums below match the sampled-component estimator in expectation.
+    component_weight = jnp.exp(masked_log_softmax(episode.logits, mask))[num_atoms:]
 
-    old_mean = episode.means[index]
-    old_scale_tril = episode.scale_trils[index]
     trpo_category_kl = categorical_kl(episode.logits, logits, mask)
-    trpo_gaussian_kl = is_gaussian * gaussian_kl(old_mean, old_scale_tril, mean, scale_tril)
+    trpo_gaussian_kl = jnp.sum(
+        component_weight * gaussian_kl(episode.means, episode.scale_trils, means, scale_trils)
+    )
 
-    magnet_mean = episode.magnet_means[index]
-    magnet_scale_tril = episode.magnet_scale_trils[index]
     magnet_category_kl = categorical_kl(logits, episode.magnet_logits, mask)
-    magnet_gaussian_kl = is_gaussian * gaussian_kl(mean, scale_tril, magnet_mean, magnet_scale_tril)
+    magnet_gaussian_kl = jnp.sum(
+        component_weight
+        * gaussian_kl(means, scale_trils, episode.magnet_means, episode.magnet_scale_trils)
+    )
 
     loss = (
         policy_loss

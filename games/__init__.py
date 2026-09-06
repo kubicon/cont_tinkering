@@ -10,6 +10,7 @@ from .kuhn_best_response import (
     game_value,
 )
 from .sequential import SequentialZeroSumGame, TERMINAL
+from .sequential_blotto import BlottoState, ContinuousSequentialBlotto
 from .sequential_examples import ContinuousKuhnPoker, KuhnState
 from .spaces import (
     ActionSpace,
@@ -28,6 +29,8 @@ __all__ = [
     "SequentialZeroSumGame",
     "TERMINAL",
     "ContinuousKuhnPoker",
+    "ContinuousSequentialBlotto",
+    "BlottoState",
     "ContinuousLeducHoldem",
     "KuhnStrategy",
     "analytic_equilibrium",
