@@ -214,12 +214,22 @@ class MixturePPOTrainer:
         steps: int,
         epochs: int = 10,
         checkpoint_dir: str | Path | None = None,
+        verbose: bool = True,
+        measure_exploitability: bool = True,
     ) -> list[dict]:
         """Trains for `steps` chunks of `epochs` `lax.scan`-ned iterations each,
         logging and checkpointing once per chunk (`steps * epochs` iterations total).
 
         Checkpoints are `{step}.pkl` inside `checkpoint_dir`: `0.pkl` is the
         untrained, freshly initialized params, `1.pkl` is after the first chunk, etc.
+
+        `verbose=False` / `measure_exploitability=False` are for the case this
+        trainer is somebody's *inner* loop rather than the run itself -- a best
+        response inside PSRO or NFSP (see `baselines/neural/br_oracle.py`), which
+        may be called hundreds of times and whose intermediate exploitability
+        against a frozen opponent is neither wanted nor cheap (it gradient-ascends
+        a best response to a 512-sample batch, every chunk). Both default to the
+        historical behaviour.
         """
         if epochs < 1:
             raise ValueError(f"epochs must be at least 1, got {epochs}")
@@ -232,29 +242,35 @@ class MixturePPOTrainer:
             self.state, metrics_stack = self._run_chunk(self.state, step_keys)
 
             record = append_chunk_records(self.history, metrics_stack, chunk, epochs)
-            live, target = jax.device_get(
-                self._exploitability(self.state.params, self.state.target_params, exploit_key)
-            )
-            record["exploitability"] = float(live)
-            record["exploitability_target"] = float(target)
+            if measure_exploitability:
+                live, target = jax.device_get(
+                    self._exploitability(self.state.params, self.state.target_params, exploit_key)
+                )
+                record["exploitability"] = float(live)
+                record["exploitability_target"] = float(target)
 
-            print(
-                f"iter {record['iteration']:5d} | reward {record['mean_reward']:+.4f} "
-                f"| policy_loss {record['policy_loss']:+.4f} | value_loss {record['value_loss']:.4f} "
-                f"| entropy {record['entropy']:.4f} (category {record['category_entropy']:.4f}) "
-                f"| approx_kl {record['approx_kl']:.4f} "
-                f"| exploitability {record['exploitability']:.4f}"
-                f" (target {record['exploitability_target']:.4f})"
-            )
-            print(
-                f"  player {self.perspective} strategy: "
-                f"{self._strategy_str(self.state.params, self._obs)}"
-            )
-            print(
-                f"  player {self.perspective} target strategy: "
-                f"{self._strategy_str(self.state.target_params, self._obs)}"
-            )
-            print(f"  opponent sample: {self._opponent_sample}")
+            if verbose:
+                message = (
+                    f"iter {record['iteration']:5d} | reward {record['mean_reward']:+.4f} "
+                    f"| policy_loss {record['policy_loss']:+.4f} | value_loss {record['value_loss']:.4f} "
+                    f"| entropy {record['entropy']:.4f} (category {record['category_entropy']:.4f}) "
+                    f"| approx_kl {record['approx_kl']:.4f}"
+                )
+                if measure_exploitability:
+                    message += (
+                        f" | exploitability {record['exploitability']:.4f}"
+                        f" (target {record['exploitability_target']:.4f})"
+                    )
+                print(message)
+                print(
+                    f"  player {self.perspective} strategy: "
+                    f"{self._strategy_str(self.state.params, self._obs)}"
+                )
+                print(
+                    f"  player {self.perspective} target strategy: "
+                    f"{self._strategy_str(self.state.target_params, self._obs)}"
+                )
+                print(f"  opponent sample: {self._opponent_sample}")
 
             if checkpoint_dir is not None:
                 self.save(checkpoint_dir, chunk + 1)
@@ -423,6 +439,8 @@ class MixtureSelfPlayPPOTrainer:
         steps: int,
         epochs: int = 10,
         checkpoint_dir: str | Path | None = None,
+        verbose: bool = True,
+        measure_exploitability: bool = True,
     ) -> list[dict]:
         """Trains for `steps` chunks of `epochs` `lax.scan`-ned iterations each,
         logging and checkpointing once per chunk (`steps * epochs` iterations total).
@@ -430,6 +448,13 @@ class MixtureSelfPlayPPOTrainer:
         Checkpoints are `{step}.pkl` inside `checkpoint_dir`, holding both
         players' params: `0.pkl` is the untrained, freshly initialized params,
         `1.pkl` is after the first chunk, etc.
+
+        `verbose=False` / `measure_exploitability=False` are for a benchmark harness
+        driving this trainer chunk by chunk (see
+        `experiments/one_shot_neural/run_cell.py`): the per-chunk exploitability
+        gradient-ascends a best response to a 512-sample batch and can cost more than
+        the training it reports on, which is exactly what a wall-time comparison must
+        not include. Both default to the historical behaviour.
         """
         if epochs < 1:
             raise ValueError(f"epochs must be at least 1, got {epochs}")
@@ -444,20 +469,27 @@ class MixtureSelfPlayPPOTrainer:
             )
 
             record = append_chunk_records(self.history, metrics_stack, chunk, epochs)
-            live, target = jax.device_get(
-                self._exploitability(self.params, self.target_params, exploit_key)
-            )
-            record["exploitability"] = float(live)
-            record["exploitability_target"] = float(target)
+            if measure_exploitability:
+                live, target = jax.device_get(
+                    self._exploitability(self.params, self.target_params, exploit_key)
+                )
+                record["exploitability"] = float(live)
+                record["exploitability_target"] = float(target)
+
+            if not verbose:
+                if checkpoint_dir is not None:
+                    self.save(checkpoint_dir, chunk + 1)
+                continue
 
             print(
                 f"iter {record['iteration']:5d} | reward {record['mean_reward_1']:+.4f} "
                 f"| p1 policy_loss {record['policy_loss_1']:+.4f} value_loss {record['value_loss_1']:.4f} "
                 f"category_entropy {record['category_entropy_1']:.4f} "
                 f"| p2 policy_loss {record['policy_loss_2']:+.4f} value_loss {record['value_loss_2']:.4f} "
-                f"category_entropy {record['category_entropy_2']:.4f} "
-                f"| exploitability {record['exploitability']:.4f}"
-                f" (target {record['exploitability_target']:.4f})"
+                f"category_entropy {record['category_entropy_2']:.4f}"
+                + (f" | exploitability {record['exploitability']:.4f}"
+                   f" (target {record['exploitability_target']:.4f})"
+                   if measure_exploitability else "")
             )
             print(f"  p1 strategy: {self._strategy_str_1(self.state_1.params, self._obs_1)}")
             print(f"  p2 strategy: {self._strategy_str_2(self.state_2.params, self._obs_2)}")

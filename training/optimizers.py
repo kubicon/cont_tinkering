@@ -21,6 +21,9 @@ OPTIMIZERS: dict[str, Callable[[float], optax.GradientTransformation]] = {
     "optimistic_sgd": optax.optimistic_gradient_descent,
     "adam": optax.adam,
     "adamw": optax.adamw,
+    # AdaBelief is what Martin & Sandholm's pseudo-gradient work uses; see
+    # `baselines/neural/randomized_policy.py`.
+    "adabelief": optax.adabelief,
     "optimistic_adam_v2": optax.optimistic_adam_v2,
     "muon": optax_contrib.muon,
 }
