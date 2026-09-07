@@ -1,0 +1,77 @@
+# CoupledRotationGame, dim = 3 -- exact idealized MMD (quadrature payoffs), magnet OFF.
+#
+#   python run_idealized.py experiments/failing_gaussian_wo_magnet/rerun/rot3_nomagnet_idealized.yaml
+#
+# One cell of the 3 domains x {magnet, no magnet} x 3 losses grid. Within a domain the
+# magnet pair differs only in `ppo.magnet_gaussian_kl_coef`. Checkpoints land in
+# `data/failing_gaussian_rerun/rot3_nomagnet_idealized` (idealized_history.json).
+
+game:
+  name: coupled_rotation
+  dim: 3
+  coupling: 20.0
+  warp: 0.3
+  damping: 0.25
+  bound: 1.5
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 1        # the Nash is a single point mass; capacity is not the issue
+  full_covariance: true    # the payoff couples a player's own coordinates
+
+optimizer:
+  learning_rate: 0.02  # the exact solver's mirror step size
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 256
+  ppo_epochs: 1
+
+  target_tau: 0.001
+  magnet_interval: 200
+
+  category_entropy_coef: 0.1
+  gaussian_entropy_coef: 0.1
+
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.5
+  magnet_gaussian_kl_coef: 0.0    # <- the knob, OFF; the only difference from rot3_magnet_idealized.yaml
+
+train:
+  mode: self_play
+  perspective: 0
+  opponent: random
+  steps: 200
+  epochs: 500
+  checkpoint_dir: data/failing_gaussian_rerun/rot3_nomagnet_idealized
+  seed: 123
+
+idealized:
+  backend: quadrature
+  grid_points: 21
+  normalize_density: true
+
+  max_quadrature_gib: 2.0
+
+  std_max: 0.4
+
+  train_means: true
+  train_std: true
+  freeze_weights: true
+
+  gaussian_entropy: marginal
+  kl_weighting: policy
+
+  init_means: [[[0.3, 0.0, 0.0]], [[0.0, 0.3, 0.0]]]
+  init_log_std: 0.2
+
+  log_rows: 16
+  log_out: null         # -> <train.checkpoint_dir>/idealized_history.json
+  verbose: true

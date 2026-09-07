@@ -1,0 +1,79 @@
+# ContinuousMatchingPennies (1-D) -- the neural network (PPO, `train.py`), magnet ON.
+#
+#   python train.py experiments/failing_gaussian_wo_magnet/rerun/mp_magnet_ppo.yaml
+#
+# One cell of the 3 domains x {magnet, no magnet} x 3 losses grid. Within a domain the
+# magnet pair differs only in `ppo.magnet_gaussian_kl_coef`. Checkpoints land in
+# `data/failing_gaussian_rerun/mp_magnet_ppo` ({step}.pkl, 0..200).
+
+game:
+  name: matching_pennies
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 1        # the Nash is a single point mass; capacity is not the issue
+  clip_means: true         # project the mean head onto the action box, as
+                           #   run_idealized.py does after every step
+
+optimizer:
+  learning_rate: 0.001  # PPO network setting; the exact/sampled copies use 0.05
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 256
+  ppo_epochs: 1
+
+  target_tau: 0.001
+  magnet_interval: 500
+
+  category_entropy_coef: 0.1
+  gaussian_entropy_coef: 0.1
+
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2    # <- the knob; the no-magnet sibling differs in this line and nothing else
+
+train:
+  mode: self_play
+  perspective: 0
+  opponent: random
+  steps: 200
+  epochs: 500
+  checkpoint_dir: data/failing_gaussian_rerun/mp_magnet_ppo
+  seed: 123
+
+idealized:
+  backend: quadrature
+  grid_points: 2001
+  normalize_density: true
+
+  std_min: 0.005
+  std_max: 0.5
+
+  train_means: true
+  train_std: true
+  freeze_weights: false
+
+  gaussian_entropy: marginal
+  kl_weighting: policy
+
+  anneal_std_from: 0.0
+  repulsion_coef: 0.0
+  repulsion_ramp: 0.2
+  repulsion_hold: 0.5
+
+  init_means: [0.2]     # start OFF the Nash; `spread` would put the single component at
+                        #   the box midpoint 0.5, which IS a Nash for a bilinear payoff.
+  init_weights: [0.3]
+  init_log_std: 0.1
+
+  log_rows: 16
+  log_out: null         # -> <train.checkpoint_dir>/idealized_history.json
+  verbose: true
