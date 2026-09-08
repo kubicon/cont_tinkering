@@ -35,36 +35,36 @@ import jax
 
 from ..common import GridOracle
 from .common import RunWriter, load_run, neural_parser
-from .randomized_policy import add_arguments, hyperparams_from_config, report, \
-    run_pseudo_gradient, spg_pseudo_gradients, tree_add_scaled, tree_normal, tree_scale
+from .randomized_policy import add_arguments, batch_utility_keys, contract_noise, \
+    hyperparams_from_config, noise_batch, perturb, report, run_pseudo_gradient, \
+    spg_pseudo_gradients, tree_scale
 
 
 def jpspg_pseudo_gradients(utility, params, key: chex.PRNGKey, sigma: float,
-                           antithetic: bool = True) -> tuple[tuple, int]:
-    """Both players' pseudo-gradients from **one** joint perturbation.
+                           antithetic: bool = True, batch: int = 2) -> tuple[tuple, int]:
+    """Both players' pseudo-gradients from **one** joint perturbation per draw.
 
     In a two-player zero-sum game the two players' utilities are `+u` and `-u` at the
     *same* perturbed profile, so a single (central-differenced) evaluation of `u` gives
     both coefficients -- which is the whole saving. Note the noise blocks stay per-player:
-    each player's gradient is its own perturbation scaled by its own utility difference,
-    not the other's.
+    each player's gradient is its own perturbation scaled by the joint utility
+    difference, not the other's.
+
+    `batch` perturbations are drawn and averaged per iteration. The saving is in the
+    *ratio*: SPG spends `n * batch` evaluations on the same batch, JPSPG spends `batch`.
+    Averaging is not optional at either count -- a single joint draw is `~0.02` cosine
+    away from the pseudo-gradient it estimates (see `RandomizedPolicyHyperparams`).
     """
     noise_key_0, noise_key_1, utility_key = jax.random.split(key, 3)
-    noise = (tree_normal(noise_key_0, params[0]), tree_normal(noise_key_1, params[1]))
+    noise = (noise_batch(noise_key_0, params[0], batch, antithetic),
+             noise_batch(noise_key_1, params[1], batch, antithetic))
+    perturbed = tuple(perturb(params[i], tree_scale(noise[i], sigma)) for i in (0, 1))
 
-    plus = tuple(tree_add_scaled(params[i], noise[i], sigma) for i in (0, 1))
-    u_plus = utility(plus, utility_key)
-    if antithetic:
-        minus = tuple(tree_add_scaled(params[i], noise[i], -sigma) for i in (0, 1))
-        u_minus = utility(minus, utility_key)
-        coefficient = (u_plus - u_minus) / (2.0 * sigma)
-        evaluations = 2
-    else:
-        coefficient = u_plus / sigma
-        evaluations = 1
-
+    values = jax.vmap(utility)(perturbed, batch_utility_keys(utility_key, batch, antithetic))
     # Player 1 maximizes the negated payoff, so its coefficient is the negated one.
-    return (tree_scale(noise[0], coefficient), tree_scale(noise[1], -coefficient)), evaluations
+    scale = 1.0 / (batch * sigma)
+    return (contract_noise(noise[0], values, scale),
+            contract_noise(noise[1], values, -scale)), batch
 
 
 ESTIMATORS = {"joint": jpspg_pseudo_gradients, "separate": spg_pseudo_gradients}
@@ -80,7 +80,7 @@ def main() -> None:
     game, game_config, config = load_run(args.config)
     oracle = GridOracle(game, points=args.grid)
     hyperparams = hyperparams_from_config(game, config, args)
-    per_iteration = (2 if args.estimator == "joint" else 4) // (1 if not args.no_antithetic else 2)
+    per_iteration = hyperparams.perturbation_batch * (1 if args.estimator == "joint" else 2)
 
     print(f"game    : {type(game).__name__}  {dataclasses.asdict(game_config)}")
     print(f"policy  : randomized network a=f(o,z), noise {hyperparams.noise_dim}, "

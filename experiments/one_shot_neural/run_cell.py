@@ -76,19 +76,41 @@ ACCESS_MODEL = {
 
 @dataclasses.dataclass
 class Settings:
-    """Per-method knobs. Defaults match each baseline's own, so a cell run through this
-    harness is the same run as the baseline's CLI at the same budget."""
+    """Per-method knobs. Defaults match each baseline's own, *except* the pseudo-gradient
+    block below, which carries this repo's tuned settings rather than the paper's -- see
+    the comment there. Everything is recorded in each run's `meta.json`, so a run's
+    settings are always recoverable from the run itself rather than from this file."""
 
     checkpoints: int = 40           # logged points per run, evenly spaced
     grid: int = 401                 # deviation grid (only used when --score)
-    samples: int = 4096             # actions sampled from a continuous policy per checkpoint
+    # Actions sampled from a continuous policy per checkpoint -- the *metric's* sample,
+    # not the algorithm's. It is what a checkpointed strategy is, so the exploitability
+    # scored from it carries that sampling error: the best-response term is a max over a
+    # grid of noisy empirical means and is therefore biased upward, by roughly 1/sqrt(n).
+    # Shared by every method that carries a continuous policy, so raising it changes the
+    # metric for all of them equally.
+    samples: int = 16384
     # mmd_discrete
     bins: int = 51
-    # spg / jpspg
-    sigma: float = 0.1
-    pseudo_lr: float = 1e-4
+    # spg / jpspg. NOT the paper's defaults (those are sigma=0.1, lr=1e-4, noise_dim=8,
+    # no clipping) -- under them both methods drive the tanh squash into saturation on
+    # `circle` and `all_pay_auction`: the policy becomes a point mass, the two antithetic
+    # utility evaluations return the identical number, and the pseudo-gradient is exactly
+    # zero from then on. A large `sigma` is what keeps the estimator alive, because a
+    # perturbation of that size still moves the action once the squash has saturated.
+    # `experiments/pseudo_gradient_convergence/` is the sweep these came from; run.py
+    # there pins the paper's values explicitly so that comparison still means what it says.
+    sigma: float = 2.0
+    pseudo_lr: float = 1e-3
+    pseudo_optimizer: str = "adabelief"
     utility_samples: int = 256
-    noise_dim: int = 8
+    # Perturbations averaged per iteration. The papers' `batch_size`; their reference
+    # implementation defaults to 2, their experiments use 256. At 2 the pseudo-gradient
+    # is ~99% noise (a random direction in R^d is near-orthogonal to the gradient), which
+    # is why these two methods did not converge here at all.
+    perturbation_batch: int = 256
+    noise_dim: int = 16
+    pseudo_max_grad_norm: float = 1.0
     dynamics: str = "simultaneous"
     # nfsp / psro
     br_steps: int = 50
@@ -112,8 +134,9 @@ def plan_units(method: str, budget: int, settings: Settings, batch_size: int) ->
     The cost formulas, all in scored action pairs:
 
       mixture, mmd_discrete   one self-play rollout per iteration      `batch`
-      spg, jpspg              `utility_samples` per utility evaluation, 4 (separate) or
-                              2 (joint) evaluations per iteration
+      spg, jpspg              `utility_samples` per utility evaluation, and
+                              `perturbation_batch` evaluations (joint) or twice that
+                              (separate) per iteration
       sisa                    two payoff matrices and two Jacobian passes  `4 n^2`
       nfsp                    two best responses per round               `2 * br_iters * batch`
       psro                    the same, plus every *new* population pair's outer product
@@ -127,7 +150,11 @@ def plan_units(method: str, budget: int, settings: Settings, batch_size: int) ->
         per = batch_size
         return {"iterations": max(int(budget // per), 1), "evals_per_unit": per}
     if method in ("spg", "jpspg"):
-        per = settings.utility_samples * (2 if method == "jpspg" else 4)
+        per = (settings.utility_samples * settings.perturbation_batch
+               * (1 if method == "jpspg" else 2))
+        # Extragradient estimates twice per iteration (look-ahead + update).
+        if settings.dynamics == "extragradient":
+            per *= 2
         return {"iterations": max(int(budget // per), 1), "evals_per_unit": per}
     if method == "sisa":
         per = 4 * settings.atoms ** 2
@@ -290,9 +317,11 @@ def run_pseudo_gradient(method: str):
         class _Args:
             noise_dim = settings.noise_dim
             lr = settings.pseudo_lr
-            optimizer = "adabelief"
+            optimizer = settings.pseudo_optimizer
+            max_grad_norm = settings.pseudo_max_grad_norm
             sigma = settings.sigma
             utility_samples = settings.utility_samples
+            perturbation_batch = settings.perturbation_batch
             no_antithetic = False
             dynamics = settings.dynamics
 

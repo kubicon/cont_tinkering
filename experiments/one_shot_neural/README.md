@@ -23,6 +23,29 @@ python experiments/one_shot_neural/score.py --out data/one_shot_neural --grid 80
 Methods: `mixture` (this repo's Gaussian-mixture MMD — the method under test),
 `mmd_discrete`, `nfsp`, `psro`, `spg`, `jpspg`, `sisa`.
 
+## The games
+
+Two groups, and the second one is what makes a comparison of *representations* possible.
+
+|game|Nash|what a residual there means|
+|-|-|-|
+|`two_point`, `multi_point`|finitely many points, known in closed form|the optimizer: a `K`-component mixture can represent this exactly|
+|`idealized_decoy_well`|finite support, exactly as large as `K`|the counterexample: enough capacity and MMD still cannot reach it|
+|`all_pay_auction`|**uniform on an interval**|the representation: no finite mixture is a Nash here at all|
+|`glicksberg_gross`|**density `~1/sqrt(t)`, unbounded at 0**|the representation, at its hardest; value is exactly `4/pi`|
+|`circle`|uniform, and any `M > harmonics` evenly spaced atoms|cycling, not capacity — the last iterate rotates while the average converges|
+
+The three continuum-support games carry their analytic equilibrium as
+`game.nash_strategy(num_atoms)`, in the same `(support, weights)` form `GridOracle`
+consumes, so "how far is this run from the true Nash" is answerable directly and not
+only through exploitability. `tests/test_continuum_games.py` pins those equilibria.
+
+One warning that shows up immediately: `all_pay_auction` uses the **hard** win rule by
+default (`sharpness: null`), under which the payoff has no useful gradient — the
+exact-gradient method (`sisa`) sees only the `-a1 + a2` term and sits at `expl ~ 1`.
+That is the game being honest, not a bug; set `game.sharpness` to soften the contest,
+at the cost of the analytic equilibrium no longer being exactly uniform.
+
 ## The two decisions that make the comparison mean something
 
 **Budgets are in payoff evaluations, not iterations.** An iteration of PSRO and an
@@ -76,6 +99,67 @@ Two caveats to state whenever wall-time is reported:
   the exact solvers. It is the same for every method, so comparisons are fair, but the
   absolute numbers are not what a float32 implementation would give.
 
+## The pseudo-gradient defaults are this repo's, not the paper's
+
+`run_cell.Settings` matches each baseline's own defaults, with one deliberate exception:
+the `spg` / `jpspg` block.
+
+| knob | paper | here | why |
+|-|-|-|-|
+| `sigma` | 0.1 | **2.0** | the one that matters — see below |
+| `pseudo_lr` | 1e-4 | **1e-3** | |
+| `noise_dim` | 8 | **16** | latent noise fed to the implicit policy |
+| `pseudo_max_grad_norm` | 0 (off) | **1.0** | |
+| `utility_samples` | 256 | 256 | unchanged |
+| `dynamics` | simultaneous | simultaneous | unchanged |
+
+Under the paper's values both methods drive the `tanh` squash into **saturation** on
+`circle` and `all_pay_auction`: the pre-tanh output drifts to +22 (circle) or +56
+(all-pay) while the parameter norm barely moves, `tanh` returns `1 - 1e-5` with a
+derivative to match, and the policy becomes a point mass insensitive to its own noise
+input. At that point the two antithetic evaluations `u(theta + sigma z)` and
+`u(theta - sigma z)` return the *identical* number, so
+
+```python
+coefficient = (u_plus - u_minus) / (2.0 * sigma)   # exactly 0.0
+```
+
+and the run is dead — `grad_norm` reaches literally `0.0`, and no later move by the
+opponent can restart it. A saturated squash is an absorbing state for a parameter-space
+smoothed gradient, which is the same pathology the `randomized_policy` docstring notes
+for a hard clip, arrived at asymptotically instead of immediately. A large `sigma` is
+what keeps the estimator alive: a perturbation of that size still moves the action after
+the squash has saturated. `experiments/pseudo_gradient_convergence/tune.py` reports
+`spread` / `pinned` per run and flags a collapsed one, because its exploitability is a
+frozen number rather than a converged one.
+
+These are settings, not code: every one is recorded in each run's `meta.json`, so what a
+stored run used is always recoverable from the run itself. `pseudo_gradient_convergence/run.py`
+and `ablate_jpspg.py` pin the paper's values explicitly rather than inheriting these, since
+measuring the paper's defaults is the whole point of those two.
+
+**`samples` moved too, and it is not method-specific.** It is now 16384 (was 4096) —
+the actions drawn from a continuous policy per checkpoint, i.e. what a checkpointed
+strategy *is*. The exploitability scored from it inherits that sampling error, and
+because the best-response term is a max over a grid of noisy empirical means it is biased
+*upward* by roughly `1/sqrt(n)`. Measured on a stored run by resampling: mean expl
++0.0535 at n=256, +0.0432 at n=1024, +0.0415 at n=4096 on `glicksberg_gross`. Raising it
+to 16384 shrinks that bias and the seed-to-seed noise, at the cost of a slower `score.py`
+pass (the best-response block scales linearly in `n`). It applies to *every* method that
+carries a continuous policy, so it changes the metric for all of them equally.
+
+**Runs made before this change used the old values.** `run_all.py` skips a cell that
+already has a `meta.json`, so re-running will not overwrite them — but it also means a
+tree can end up holding both, indistinguishable in `summary.md`. Either re-run the two
+methods with `--overwrite`:
+
+```bash
+python experiments/one_shot_neural/run_all.py --methods spg jpspg --overwrite
+```
+
+or send the new runs to a fresh `--out` tree. The already-stored `data/one_shot_neural`
+spg/jpspg runs are paper-default runs; the collapse described above is what they show.
+
 `run_all.py` caps each cell's thread pool (`--threads-per-cell`, by default the core count
 divided by `--max-parallel`) so that parallel cells do not measure contention with each
 other.
@@ -88,3 +172,49 @@ secondary one) from the same `curves.json`. Keep the `access_model` column in an
 PPO-based methods sit in between — putting them on one axis without saying so implies a
 fairness that is not there. Use several seeds and show median with an IQR band; these are
 stochastic and single-seed curves do not reproduce.
+
+## Wall-time-matched re-run of SPG / JPSPG (`run_walltime_matched.py`)
+
+Equal payoff evaluations is the right common currency, but it is not the only question a
+reader has. The zeroth-order methods are an order of magnitude cheaper *per evaluation*
+than everything else — at 2e7 evals on this tree,
+
+| method | mixture | mmd_discrete | psro | nfsp | spg | jpspg |
+|-|-|-|-|-|-|-|
+| train s (mean over games/seeds) | ~730 | ~430 | ~440 | ~1200 | ~38 | ~50 |
+
+so the eval-matched grid also hands the mixture ~20× the compute, and "SPG loses" invites
+the objection that it was never given the same *time*. [`run_walltime_matched.py`](run_walltime_matched.py)
+removes that objection: it measures each pseudo-gradient method's throughput
+(`payoff_evals / train_seconds`) and the mixture's wall-time from this tree, then picks
+the per-`(game, method)` budget that lands the re-run at the same wall-time × `--headroom`
+(1.1 by default, so the answer is "more time, still behind" rather than a near-miss).
+
+```bash
+# what budgets, and why — runs nothing
+python experiments/one_shot_neural/run_walltime_matched.py --dry-run
+
+# run them (~24 cells; matching the reference's --max-parallel keeps wall-times comparable)
+python experiments/one_shot_neural/run_walltime_matched.py --max-parallel 4
+
+# score the new tree and plot it against the reference mixture
+python experiments/one_shot_neural/run_walltime_matched.py --plot
+```
+
+The budget differs per cell, which is what `run_all.py`'s single `--budget` cannot
+express — hence a separate script and a **separate tree**, `data/one_shot_neural_walltime`.
+`data/one_shot_neural` is only ever read; the calibration it derived is written to
+`calibration.json` / `calibration.md` next to the new runs, and `--target-seconds`
+overrides it when re-running on a different machine.
+
+`--plot` writes `<game>_walltime_curves.png` with exactly three curves: the two re-runs,
+relabelled `spg (wall-matched)` / `jpspg (wall-matched)`, and `mixture` read from the
+reference tree's `curves.json`. The relabelling is not cosmetic — the two trees hold
+different budgets under the same method name, and the merged plot's *budget* panel is
+therefore no longer a like-for-like comparison. Read the wall-time panel; that is the one
+this experiment is for. `--include-reference-pseudo` adds the original eval-matched
+spg/jpspg curves for contrast, and `--match` targets a method other than `mixture`.
+
+Achieved wall-times are printed against their targets when the runs finish, because
+throughput is measured rather than guaranteed — check that column before quoting the
+result.

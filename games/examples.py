@@ -651,3 +651,222 @@ class CoupledRotationGame(ZeroSumGame):
         rotation = self._g(action_1) @ self.skew @ self._g(action_2)
         wells = jnp.sum(action_1**2) ** 2 - jnp.sum(action_2**2) ** 2
         return self.coupling * rotation - self.damping / 4 * wells
+
+
+class AllPayAuctionGame(ZeroSumGame):
+    """Complete-information all-pay auction, as a zero-sum difference game.
+
+    Both bidders commit `a in [0, high]` for one prize; the higher bid takes it
+    and **both** bids are spent. The natural utility `v * 1{win} - a` does not
+    sum to zero across the players (the prize is created out of nothing), so
+    what is played here is the *difference* game, which is what a two-player
+    zero-sum solver can consume:
+
+        payoff(a1, a2) = value * contest(a1 - a2) - a1 + a2,
+        contest(m)     = sign(m)                 (`sharpness=None`, the default)
+                       = tanh(sharpness * m)     (otherwise)
+
+    Since `sign(m) = 2 * 1{a1 > a2} - 1` for a tie-free profile, maximizing this
+    is maximizing the ordinary all-pay utility with a prize of `2 * value` --
+    hence the equilibrium below on `[0, 2 * value]` rather than `[0, value]`, and
+    hence the default `value=0.5`, which puts it on exactly `[0, 1]`.
+
+    **Its equilibrium has continuum support**, which is the reason for having it
+    here. Every other one-shot game in this module has a Nash supported on
+    finitely many points, so a `K`-component mixture can represent it exactly and
+    the only question is whether the algorithm finds it. Here no finite mixture
+    is a Nash at all: against `y ~ U[0, 2v]` the expected payoff is
+
+        E[u(x, y)] = v * (2 * x / (2v) - 1) - x + E[y] = 0     for x in [0, 2v],
+
+    flat on the whole support and strictly decreasing (`-x`) above it, so the
+    unique equilibrium is uniform on `[0, 2 * value]` with value 0 -- the
+    standard complete-information result (Baye, Kovenock & de Vries, 1996). A
+    finite mixture can only approximate it, and how *well* it approximates it as
+    `K` grows is the measurement this game exists to supply.
+
+    **`sharpness` trades the exact equilibrium for a gradient.** With the hard
+    rule the payoff is piecewise constant in the contest term, so a method
+    reading exact payoff gradients (`baselines/sisa.py`) sees only the `-a1 + a2`
+    part and every bid looks equally bad; with `tanh` it sees "outbid them by a
+    little more". But the smoothed game's equilibrium is *not* uniform -- it is
+    only nearby -- so a run with `sharpness` set is no longer being measured
+    against the analytic strategy below. Default to the hard rule, and reach for
+    `sharpness` only when a method needs the directional information (the same
+    trade `ContinuousBlottoGame` and `ContinuousSequentialBlotto` make).
+    """
+
+    def __init__(self, value: float = 0.5, high: float = 1.0, sharpness: float | None = None):
+        if value <= 0:
+            raise ValueError(f"value must be positive, got {value}")
+        if high < 2 * value:
+            raise ValueError(
+                f"high={high} cuts off the equilibrium support [0, {2 * value}]; "
+                f"use high >= 2 * value"
+            )
+        if sharpness is not None and sharpness <= 0:
+            raise ValueError(f"sharpness must be positive when given, got {sharpness}")
+        self.value = value
+        self.high = high
+        self.sharpness = sharpness
+        self._space = box(jnp.zeros(1), high * jnp.ones(1))
+
+    def action_space(self, player: int) -> ActionSpace:
+        return self._space
+
+    def payoff(self, action_1: chex.Array, action_2: chex.Array) -> chex.Array:
+        margin = action_1[..., 0] - action_2[..., 0]
+        contest = jnp.sign(margin) if self.sharpness is None else jnp.tanh(self.sharpness * margin)
+        return self.value * contest - margin
+
+    def nash_strategy(self, num_atoms: int = 256):
+        """The analytic Nash, discretized: uniform on `[0, 2 * value]`.
+
+        Returns `(support, weights)` in the `(num_atoms, 1)` / `(num_atoms,)`
+        layout `baselines.common.GridOracle` consumes. The atoms are quantile
+        midpoints, so the discretization is unbiased and its exploitability
+        falls like `1 / num_atoms` -- what remains is the discretization, not the
+        strategy. Exact only for `sharpness=None`; see the class docstring.
+        """
+        quantiles = (jnp.arange(num_atoms, dtype=jnp.float32) + 0.5) / num_atoms
+        support = (2 * self.value * quantiles)[:, None]
+        return support, jnp.full((num_atoms,), 1.0 / num_atoms)
+
+
+class CircleGame(ZeroSumGame):
+    """Rock-paper-scissors made continuous: a cyclic kernel on the unit circle.
+
+    Actions are angles in `[0, 1)` (turns, not radians), and the payoff depends
+    only on the *difference* of the two angles through an odd, periodic kernel:
+
+        payoff(a1, a2) = sum_{k=1}^{K} coefficients[k] * sin(2 * pi * k * (a1 - a2))
+
+    Every action beats some actions and loses to others, cyclically, with no
+    action dominant -- so the game has no pure equilibrium and, being
+    antisymmetric, has value 0. The uniform distribution on the circle is always
+    an equilibrium: all of the kernel's Fourier coefficients vanish under it, so
+    every reply is worth exactly 0.
+
+    **What it is a benchmark for.** It is the mixing/cycling test rather than a
+    capacity test: the last iterate of an unregularized method cycles here (the
+    dynamics rotate), while the average converges, so it separates the two
+    families for a reason that has nothing to do with how a strategy is
+    represented.
+
+    **It is not a test that finite support is insufficient, and the docstring
+    should not be read as one.** A kernel with `K` harmonics is killed by any
+    `M`-point uniform grid on the circle with `M > K` -- those atoms annihilate
+    harmonics `1..K` exactly -- so an `M`-component mixture can hit the
+    equilibrium on the nose. `harmonics` is therefore a knob on *how much*
+    support a method needs: `harmonics=3` (the default) rules out every
+    2- and 3-atom strategy but is solved exactly by 4 evenly spaced atoms. For a
+    game whose equilibrium genuinely admits no finite support, use
+    `AllPayAuctionGame` or `GlicksbergGrossGame`.
+
+    **The wrap-around is real and the policy cannot see it.** `0.02` and `0.98`
+    are neighbours on the circle but sit at opposite ends of the action box, so a
+    Gaussian component straddling the seam is split in two, and a mixture will
+    generally use an extra component there. That is a genuine property of putting
+    a periodic game in a box policy, not an artifact to correct for.
+    """
+
+    def __init__(self, harmonics: int = 3, coefficients: tuple[float, ...] | None = None):
+        if harmonics < 1:
+            raise ValueError(f"harmonics must be >= 1, got {harmonics}")
+        if coefficients is None:
+            # Decaying, so the first harmonic dominates the landscape and the
+            # higher ones are what a too-small support fails to cancel.
+            coefficients = tuple(2.0 ** -k for k in range(harmonics))
+        if len(coefficients) != harmonics:
+            raise ValueError(
+                f"coefficients has {len(coefficients)} entries, expected {harmonics}"
+            )
+        self.harmonics = harmonics
+        self.coefficients = jnp.asarray(coefficients, dtype=jnp.float32)
+        self._orders = jnp.arange(1, harmonics + 1, dtype=jnp.float32)
+        self._space = box(jnp.zeros(1), jnp.ones(1))
+
+    def action_space(self, player: int) -> ActionSpace:
+        return self._space
+
+    def payoff(self, action_1: chex.Array, action_2: chex.Array) -> chex.Array:
+        difference = action_1[..., 0] - action_2[..., 0]
+        waves = jnp.sin(2 * jnp.pi * self._orders * difference[..., None])
+        return jnp.sum(self.coefficients * waves, axis=-1)
+
+    def nash_strategy(self, num_atoms: int = 256):
+        """An exact Nash: `num_atoms` evenly spaced points on the circle.
+
+        Exact rather than approximate whenever `num_atoms > harmonics` (see the
+        class docstring), which is the one place in this module where the
+        discretized reference strategy carries no discretization error at all.
+        """
+        if num_atoms <= self.harmonics:
+            raise ValueError(
+                f"num_atoms={num_atoms} does not cancel {self.harmonics} harmonics; "
+                f"need num_atoms > harmonics"
+            )
+        support = ((jnp.arange(num_atoms, dtype=jnp.float32) + 0.5) / num_atoms)[:, None]
+        return support, jnp.full((num_atoms,), 1.0 / num_atoms)
+
+
+class GlicksbergGrossGame(ZeroSumGame):
+    """The Glicksberg-Gross game: a rational kernel with a known, *diffuse* Nash.
+
+        payoff(x, y) = (1 + x)(1 + y)(1 - x y) / (1 + x y)^2     on [0, 1]^2
+
+    Glicksberg & Gross (1953). The classical example of a continuous game whose
+    unique equilibrium is *not* supported on finitely many points: both players
+    draw from the distribution with
+
+        CDF     F(t) = (4 / pi) * arctan(sqrt(t)),        t in [0, 1]
+        density f(t) = 2 / (pi * sqrt(t) * (1 + t))
+
+    and the value of the game is `4 / pi ~ 1.2732`. It is used as a benchmark for
+    exactly this reason in the continuous-action equilibrium-finding literature
+    (Martin & Sandholm, IJCAI 2023 and 2024), which is what makes it comparable
+    outside this repo.
+
+    Two features worth having in a comparison set:
+
+    * **The kernel is symmetric, the game is not.** `payoff(x, y) == payoff(y, x)`,
+      yet player 0 maximizes it and player 1 minimizes it, so the two players face
+      genuinely different problems -- and both nonetheless play the same `F`.
+      The equilibrium condition is correspondingly strong: `E_{t~F}[u(x, t)]` is
+      *constant* at `4 / pi` over the whole of `[0, 1]`, not merely on a support,
+      which is what `tests/test_continuum_games.py` checks.
+    * **The density is unbounded at 0** (`f(t) ~ 1 / sqrt(t)`), which no finite
+      Gaussian mixture and no coarse grid represents well. A method's residual
+      exploitability here is a statement about its representation, not about its
+      optimizer.
+
+    Sampling is exact and needs no rejection: substituting `t = s^2` turns `F`
+    into a Cauchy-shaped density on `s`, so `s = tan(pi * q / 4)` for `q ~ U[0, 1]`
+    and `t = s^2` -- which is what `nash_strategy` uses.
+    """
+
+    # The game's value, `4 / pi`. Named because every check here compares to it.
+    VALUE = 4.0 / jnp.pi
+
+    def __init__(self):
+        self._space = box(jnp.zeros(1), jnp.ones(1))
+
+    def action_space(self, player: int) -> ActionSpace:
+        return self._space
+
+    def payoff(self, action_1: chex.Array, action_2: chex.Array) -> chex.Array:
+        x, y = action_1[..., 0], action_2[..., 0]
+        product = x * y
+        return (1 + x) * (1 + y) * (1 - product) / jnp.square(1 + product)
+
+    def nash_strategy(self, num_atoms: int = 256):
+        """The analytic Nash, discretized at quantile midpoints of `F`.
+
+        `F^{-1}(q) = tan(pi * q / 4)^2`, evaluated at `(i + 1/2) / num_atoms`.
+        Quantile midpoints rather than an even grid because the density blows up
+        at 0: an even grid would need to resolve a singularity, while quantiles
+        put atoms where the mass is by construction.
+        """
+        quantiles = (jnp.arange(num_atoms, dtype=jnp.float32) + 0.5) / num_atoms
+        support = jnp.square(jnp.tan(jnp.pi * quantiles / 4))[:, None]
+        return support, jnp.full((num_atoms,), 1.0 / num_atoms)

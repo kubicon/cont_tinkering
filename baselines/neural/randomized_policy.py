@@ -20,9 +20,25 @@ smoothing:
 
     grad_i u_i(theta)  ~  [u_i(theta_i + sigma z_i, theta_-i) - u_i(theta_i - sigma z_i, theta_-i)] z_i / (2 sigma)
 
-the central-difference (antithetic) pseudo-gradient, one perturbation per player per
-iteration -- hence *simultaneous pseudo-gradient*, and hence `2n` utility evaluations
-for `n` players. `jpspg.py` is the follow-up that makes that count constant.
+the central-difference (antithetic) pseudo-gradient -- hence *simultaneous
+pseudo-gradient*, and hence `2n` utility evaluations per perturbation for `n` players.
+`jpspg.py` is the follow-up that makes that count constant.
+
+**How many perturbations.** `perturbation_batch` of them, averaged, and the number is
+not a detail. A single draw `z` is a *random direction* in a `d`-dimensional parameter
+space, so it is nearly orthogonal to the gradient it is estimating: at the `d ~ 5e3` of a
+64x64 policy, one antithetic pair has cosine `~0.02` with the true pseudo-gradient, and
+the resulting step is ~99% noise. Both papers average -- IJCAI'25 runs `batch_size = 256`
+-- and their published reference implementation's `pgrad(f, scale, batch_size=2)` default
+is one pair, i.e. *not* the setting their experiments use. Running at 2 is the reason
+this pair of baselines did not converge in `experiments/one_shot_neural/`; it is a
+budget-allocation error, not a bug in the estimator. Note that the two papers pair `N`
+with different optimizers, and the pairing is the point: IJCAI'23 takes `N = 1` and
+answers it with plain SGD at `lr = 1e-6` for ~1e8 steps (the *trajectory* averages the
+noise), while IJCAI'25 takes `batch = 256` and answers it with AdaBelief at `1e-4`.
+`N = 1` *with* AdaBelief is the one combination neither paper runs: an adaptive optimizer
+rescales each coordinate by its own believed deviation, so a pure-noise gradient does not
+shrink -- it becomes a random walk at the full learning rate.
 
 This is the honest counterweight to the mixture head: it gives up the density (and with
 it the magnet, the trust region, and every regularizer this repo's method is built on)
@@ -80,6 +96,14 @@ class RandomizedPolicyHyperparams:
     max_grad_norm: float = 0.0        # 0 disables clipping; the pseudo-gradient is noisy, not large
     sigma: float = 0.1                # smoothing radius of the pseudo-gradient
     utility_samples: int = 256        # action pairs per utility evaluation
+    # Perturbations drawn per iteration -- the papers' `batch_size`, and the single
+    # setting that decides whether the estimator carries any signal at all. One
+    # antithetic pair (`2`) is the reference implementation's *default*, not the setting
+    # its experiments run: `g = (u+ - u-)/(2 sigma) * z` has cosine ~0.02 with the true
+    # pseudo-gradient at `d ~ 5e3` parameters, because a random direction in `R^d` is
+    # nearly orthogonal to the gradient. JPSPG's experiments use 256, which is what
+    # brings the estimate above the noise floor; see the module docstring.
+    perturbation_batch: int = 256
     antithetic: bool = True
     dynamics: str = "simultaneous"    # simultaneous | extragradient | optimistic
 
@@ -110,10 +134,15 @@ class RandomizedPolicy(nn.Module):
 
     @nn.compact
     def __call__(self, obs: chex.Array, noise: chex.Array) -> chex.Array:
+        # He initialization, as both papers specify. Flax's default is `lecun_normal`
+        # (variance `1/fan_in`); He is `2/fan_in`, so the default starts the network a
+        # factor `sqrt(2)` per layer quieter -- and a quiet network barely propagates
+        # `noise`, which is the one input that makes this policy mixed rather than pure.
+        dense = lambda dim, **kw: nn.Dense(dim, kernel_init=nn.initializers.he_normal(), **kw)
         x = jnp.concatenate([obs, noise], axis=-1)
         for dim in self.hidden_dims:
-            x = Activation(kind=self.activation)(nn.Dense(dim)(x))
-        raw = nn.Dense(self.action_dim, name="action_head")(x)
+            x = Activation(kind=self.activation)(dense(dim)(x))
+        raw = dense(self.action_dim, name="action_head")(x)
         # Squashed rather than clipped: a clip would give the whole outside of the box
         # zero gradient, and a zeroth-order estimator cannot route around that.
         return self.low + (self.high - self.low) * 0.5 * (jnp.tanh(raw) + 1.0)
@@ -181,32 +210,80 @@ def build_utility_fn(game: ZeroSumGame, policy: RandomizedPolicy,
     return utility
 
 
+def noise_batch(key: chex.PRNGKey, tree, batch: int, antithetic: bool) -> chex.ArrayTree:
+    """`batch` parameter-space perturbations stacked on a leading axis.
+
+    Antithetic sampling draws `batch // 2` normals and mirrors them, so the stack is
+    `[z_1..z_p, -z_1..-z_p]` -- exactly the reference implementation's
+    `jnp.concatenate([z, -z])`, which turns the weighted sum below into the
+    centred-difference stencil without ever forming the difference explicitly.
+    """
+    draws = batch // 2 if antithetic else batch
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    keys = jax.random.split(key, len(leaves))
+
+    def draw(leaf_key, leaf):
+        z = jax.random.normal(leaf_key, (draws,) + leaf.shape, leaf.dtype)
+        return jnp.concatenate([z, -z]) if antithetic else z
+
+    return jax.tree_util.tree_unflatten(
+        treedef, [draw(k, leaf) for k, leaf in zip(keys, leaves)])
+
+
+def batch_utility_keys(key: chex.PRNGKey, batch: int, antithetic: bool) -> chex.Array:
+    """One key per perturbation, shared within each antithetic pair.
+
+    Sharing it is the common-random-numbers trick: `u(x + sigma z)` and `u(x - sigma z)`
+    differ only in the perturbation, not in which action pairs were sampled. Across
+    *different* pairs the keys differ, so the batch still averages over game randomness.
+    """
+    draws = batch // 2 if antithetic else batch
+    keys = jax.random.split(key, draws)
+    return jnp.concatenate([keys, keys]) if antithetic else keys
+
+
+def contract_noise(noise, values: chex.Array, scale: float) -> chex.ArrayTree:
+    """`scale * sum_k values[k] * noise[k]`, the pseudo-gradient's weighted sum.
+
+    The cast keeps each leaf's dtype: the utility estimate is float64 (the metric grid
+    needs x64) while the parameters are float32, and an uncast product would silently
+    promote the whole parameter tree and break the `scan` carry's type agreement.
+    """
+    return jax.tree_util.tree_map(
+        lambda z: (jnp.tensordot(values, z, (0, 0)) * scale).astype(z.dtype), noise)
+
+
+def perturb(base, noise):
+    """`base + noise`, broadcasting the unbatched parameters over the leading batch axis."""
+    return jax.tree_util.tree_map(lambda b, z: b + z, base, noise)
+
+
 def spg_pseudo_gradients(utility, params, key: chex.PRNGKey, sigma: float,
-                         antithetic: bool = True) -> tuple[tuple, int]:
+                         antithetic: bool = True, batch: int = 2) -> tuple[tuple, int]:
     """Simultaneous pseudo-gradient: perturb **one player at a time** (IJCAI 2023).
 
-    Returns `(gradients, evaluations)`; `evaluations` is what `jpspg.py` improves on --
-    it grows linearly in the number of players, `2n` with antithetic sampling.
+    `batch` perturbations are drawn per player and averaged, which is the paper's
+    `1/(2n sigma) sum_k (u(x + sigma z_k) - u(x - sigma z_k)) z_k`. Returns
+    `(gradients, evaluations)`; `evaluations` is what `jpspg.py` improves on -- it grows
+    linearly in the number of players, `n * batch` here.
     """
     gradients, evaluations = [], 0
     for player in (0, 1):
         key, noise_key, utility_key = jax.random.split(key, 3)
-        noise = tree_normal(noise_key, params[player])
-        sign = 1.0 if player == 0 else -1.0     # player 1's utility is the negated payoff
+        noise = noise_batch(noise_key, params[player], batch, antithetic)
+        perturbed = perturb(params[player], tree_scale(noise, sigma))
+        other = params[1 - player]
 
-        plus = list(params)
-        plus[player] = tree_add_scaled(params[player], noise, sigma)
-        u_plus = sign * utility(tuple(plus), utility_key)
-        evaluations += 1
-        if antithetic:
-            minus = list(params)
-            minus[player] = tree_add_scaled(params[player], noise, -sigma)
-            u_minus = sign * utility(tuple(minus), utility_key)
-            evaluations += 1
-            coefficient = (u_plus - u_minus) / (2.0 * sigma)
-        else:
-            coefficient = u_plus / sigma
-        gradients.append(tree_scale(noise, coefficient))
+        def evaluate(own, utility_sub_key, player=player, other=other):
+            profile = (own, other) if player == 0 else (other, own)
+            return utility(profile, utility_sub_key)
+
+        values = jax.vmap(evaluate)(
+            perturbed, batch_utility_keys(utility_key, batch, antithetic))
+        # Player 1's utility is the negated payoff.
+        sign = 1.0 if player == 0 else -1.0
+        gradients.append(contract_noise(noise, values, sign / (batch * sigma)))
+        evaluations += batch
     return tuple(gradients), evaluations
 
 
@@ -279,7 +356,8 @@ def run_pseudo_gradient(
     opt_states = tuple(optimizer.init(params[player]) for player in (0, 1))
 
     def estimate(current, estimate_key):
-        return estimator(utility, current, estimate_key, hyperparams.sigma, hyperparams.antithetic)
+        return estimator(utility, current, estimate_key, hyperparams.sigma,
+                         hyperparams.antithetic, hyperparams.perturbation_batch)
 
     def step(carry, step_key):
         params, opt_states, previous = carry
@@ -290,8 +368,9 @@ def run_pseudo_gradient(
             # original point using the gradient measured there (Korpelevich).
             lookahead = tuple(
                 tree_add_scaled(params[i], gradients[i], hyperparams.learning_rate) for i in (0, 1))
-            direction, raw, extra = estimate(lookahead, apply_key)
+            direction, extra = estimate(lookahead, apply_key)
             evaluations += extra
+            raw = direction
         else:
             direction, raw, evaluations = _apply_dynamics(
                 hyperparams.dynamics, estimate, params, step_key, previous)
@@ -377,8 +456,10 @@ def hyperparams_from_config(game: ZeroSumGame, config, args) -> RandomizedPolicy
         high=tuple(float(x) for x in hi),
         learning_rate=args.lr,
         optimizer=args.optimizer,
+        max_grad_norm=args.max_grad_norm,
         sigma=args.sigma,
         utility_samples=args.utility_samples,
+        perturbation_batch=args.perturbation_batch,
         antithetic=not args.no_antithetic,
         dynamics=args.dynamics,
     )
@@ -392,8 +473,14 @@ def add_arguments(ap) -> None:
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--optimizer", default="adabelief", help="see training.optimizers.OPTIMIZERS")
     ap.add_argument("--noise-dim", type=int, default=8, help="latent noise fed to the policy")
+    ap.add_argument("--max-grad-norm", type=float, default=0.0,
+                    help="clip the pseudo-gradient to this global norm; 0 disables clipping")
     ap.add_argument("--utility-samples", type=int, default=256,
                     help="action pairs averaged per utility evaluation")
+    ap.add_argument("--perturbation-batch", type=int, default=256,
+                    help="perturbations drawn and averaged per iteration (the papers' "
+                         "`batch_size`; JPSPG's experiments use 256, its reference "
+                         "implementation defaults to 2)")
     ap.add_argument("--no-antithetic", action="store_true",
                     help="single-point estimator instead of the central difference")
     ap.add_argument("--dynamics", choices=("simultaneous", "extragradient", "optimistic"),
@@ -431,6 +518,7 @@ def main() -> None:
     print(f"solver  : simultaneous pseudo-gradient  sigma={hyperparams.sigma}  "
           f"lr={hyperparams.learning_rate}  {hyperparams.optimizer}  "
           f"{'antithetic' if hyperparams.antithetic else 'single-point'}  "
+          f"batch={hyperparams.perturbation_batch}  "
           f"dynamics={hyperparams.dynamics}\n")
 
     meta = {"algorithm": "randomized_policy_spg", "config": args.config,

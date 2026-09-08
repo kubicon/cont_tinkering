@@ -2,6 +2,9 @@
 
     python experiments/one_shot_neural/score.py --out data/one_shot_neural
     python experiments/one_shot_neural/score.py --out data/one_shot_neural --grid 1601 --overwrite
+    python experiments/one_shot_neural/score.py --out data/one_shot_neural --game two_point --plot
+    python experiments/one_shot_neural/score.py --out data/one_shot_neural --game two_point --plot-only
+    python experiments/one_shot_neural/score.py --out data/one_shot_neural --plot   # every game
 
 Training and measurement are deliberately separated. The runs write strategies, wall-time
 and payoff-evaluation counts; this computes exploitability for all of them with **one**
@@ -20,6 +23,11 @@ clock -- come from the same data.
 Where a checkpoint stored a second iterate (the mixture method's Polyak average, the
 discretized policy's averaged weights), that is scored too and reported as `target_expl`:
 for those methods the averaged iterate is the one their theory is about.
+
+`--plot` / `--plot-only` draw those two axes for one `--game`, or, when `--game` is
+omitted, for every game present in the tree: mean exploitability across seeds with a
+95% CI band, one curve per method. Budget on the primary plot is `payoff_evals`
+(the shared cost unit), not iteration count.
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ import argparse
 import json
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -134,6 +143,121 @@ def summary_table(rows: list[dict]) -> str:
     return header + "\n".join(lines)
 
 
+def _xy(scores: list[dict], x_key: str, y_key: str = "expl") -> tuple[np.ndarray, np.ndarray] | None:
+    """Extract a monotone (x, y) series, dropping points that lack either coordinate."""
+    xs, ys = [], []
+    for row in scores:
+        x, y = row.get(x_key), row.get(y_key)
+        if x is None or y is None:
+            continue
+        xs.append(float(x))
+        ys.append(float(y))
+    if len(xs) < 2:
+        return None
+    order = np.argsort(xs)
+    return np.asarray(xs)[order], np.asarray(ys)[order]
+
+
+def _mean_ci95(series: list[tuple[np.ndarray, np.ndarray]],
+               n_grid: int = 200) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Interpolate seed curves onto a shared x-grid; return x, mean, lo, hi (95% CI).
+
+    With one seed the band collapses to the mean. With n>=2 the interval is the
+    normal approx mean ± 1.96 * sem across seeds at each grid point.
+    """
+    if not series:
+        return None
+    x_lo = max(s[0][0] for s in series)
+    x_hi = min(s[0][-1] for s in series)
+    if not np.isfinite(x_lo) or not np.isfinite(x_hi) or x_hi <= x_lo:
+        return None
+    grid = np.linspace(x_lo, x_hi, n_grid)
+    stacked = np.vstack([np.interp(grid, x, y) for x, y in series])
+    mean = stacked.mean(axis=0)
+    n = stacked.shape[0]
+    if n < 2:
+        return grid, mean, mean, mean
+    sem = stacked.std(axis=0, ddof=1) / np.sqrt(n)
+    half = 1.96 * sem
+    return grid, mean, mean - half, mean + half
+
+
+def plot_game(curves: dict, game: str, out_path: Path,
+              methods: list[str] | None = None) -> Path:
+    """Two panels for one game: exploitability vs payoff budget, and vs wall-time.
+
+    Seeds are summarized as mean with a 95% CI band. Always plots the live strategy
+    (`expl`), not the Polyak-averaged `target_expl` some methods also store.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    by_method: dict[str, list[dict]] = defaultdict(list)
+    for entry in curves.values():
+        meta = entry["meta"]
+        if meta.get("game") != game:
+            continue
+        method = meta.get("method")
+        if methods and method not in methods:
+            continue
+        by_method[method].append(entry)
+
+    if not by_method:
+        raise SystemExit(f"no scored runs for game {game!r} in curves")
+
+    method_names = sorted(by_method)
+    cmap = plt.get_cmap("tab10")
+    colors = {m: cmap(i % 10) for i, m in enumerate(method_names)}
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4), sharey=True)
+    panels = (
+        (axes[0], "payoff_evals", "payoff evaluations (budget)"),
+        (axes[1], "wall_time", "wall-time (s)"),
+    )
+
+    for ax, x_key, xlabel in panels:
+        for method in method_names:
+            series = []
+            for entry in by_method[method]:
+                pair = _xy(entry["scores"], x_key, "expl")
+                if pair is not None:
+                    series.append(pair)
+            band = _mean_ci95(series)
+            if band is None:
+                continue
+            x, mean, lo, hi = band
+            color = colors[method]
+            ax.fill_between(x, lo, hi, color=color, alpha=0.18, linewidth=0)
+            ax.plot(x, mean, color=color, label=method, linewidth=1.8)
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("exploitability")
+        ax.set_title(f"{game}: expl vs {x_key if x_key != 'payoff_evals' else 'budget'}")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, frameon=False)
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_games(curves: dict, out_root: Path, game: str | None = None,
+               methods: list[str] | None = None) -> list[Path]:
+    """Plot `game`, or every game present in `curves` when `game` is None."""
+    if game:
+        games = [game]
+    else:
+        games = sorted({entry["meta"].get("game") for entry in curves.values()
+                        if entry["meta"].get("game")})
+        if not games:
+            raise SystemExit("no scored runs to plot")
+    return [plot_game(curves, tag, out_root / f"{tag}_curves.png", methods=methods)
+            for tag in games]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -141,12 +265,29 @@ def main() -> None:
     ap.add_argument("--grid", type=int, default=801,
                     help="deviation grid for the metric; finer than the runs' own is fine "
                          "and costs only this pass")
+    ap.add_argument("--game", default=None,
+                    help="game tag to plot; with --plot / --plot-only and no --game, "
+                         "every game in the output tree is plotted")
     ap.add_argument("--games", nargs="+", default=None, help="score only these game tags")
-    ap.add_argument("--methods", nargs="+", default=None, help="score only these methods")
+    ap.add_argument("--methods", nargs="+", default=None, help="score / plot only these methods")
     ap.add_argument("--overwrite", action="store_true", help="rescore runs that have scores.json")
+    ap.add_argument("--plot", action="store_true",
+                    help="after scoring, plot exploitability curves for --game")
+    ap.add_argument("--plot-only", action="store_true",
+                    help="skip scoring; plot --game from an existing curves.json")
     args = ap.parse_args()
 
     out_root = Path(args.out)
+
+    if args.plot_only:
+        curves_path = out_root / "curves.json"
+        if not curves_path.exists():
+            raise SystemExit(f"no {curves_path}; run scoring first or drop --plot-only")
+        curves = json.loads(curves_path.read_text())
+        for path in plot_games(curves, out_root, args.game, methods=args.methods):
+            print(f"plot -> {path}")
+        return
+
     runs = find_runs(out_root)
     if not runs:
         raise SystemExit(f"no runs under {out_root} (looked for */*/*/meta.json)")
@@ -187,6 +328,10 @@ def main() -> None:
     print(f"\nscored {len(rows)} runs in {time.monotonic() - started:.1f}s on a "
           f"{args.grid}-point grid")
     print(f"curves -> {out_root / 'curves.json'}   summary -> {out_root / 'summary.md'}")
+
+    if args.plot:
+        for path in plot_games(curves, out_root, args.game, methods=args.methods):
+            print(f"plot -> {path}")
 
 
 if __name__ == "__main__":

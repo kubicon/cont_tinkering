@@ -1,4 +1,5 @@
 from .base import ZeroSumGame
+from .examples import AllPayAuctionGame, CircleGame, GlicksbergGrossGame
 from .leduc import ContinuousLeducHoldem, LeducState
 from .kuhn_best_response import (
     KuhnStrategy,
@@ -26,6 +27,9 @@ from .spaces import (
 
 __all__ = [
     "ZeroSumGame",
+    "AllPayAuctionGame",
+    "CircleGame",
+    "GlicksbergGrossGame",
     "SequentialZeroSumGame",
     "TERMINAL",
     "ContinuousKuhnPoker",

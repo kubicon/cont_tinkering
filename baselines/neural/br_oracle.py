@@ -218,11 +218,15 @@ def train_best_response(
 ) -> BestResponse:
     """Train `player`'s policy against `opponent` with the repo's own PPO trainer.
 
-    `init_params` warm-starts from a previous best response -- NFSP's best-response net
-    is meant to be *continuously* improved rather than restarted every round. Note that
-    only the parameters carry over: `MixturePPOTrainer` builds its own optimizer state,
-    so Adam's moments restart with each call (the same limitation
-    `MixturePPOTrainer.load` documents).
+    `init_params` warm-starts from a previous policy. **No caller here uses it, and an
+    iterated caller should not**: with the regularizers stripped, the Gaussian scale is
+    this policy's only source of exploration, so a warm start from a converged (hence
+    near-deterministic) policy turns the oracle into local ascent around wherever it
+    last stopped. `nfsp`'s docstring has the measurement. It stays available for
+    resuming a single interrupted best response, where the init is not a converged
+    policy from a different opponent. Note also that only the parameters carry over:
+    `MixturePPOTrainer` builds its own optimizer state, so Adam's moments restart with
+    each call (the same limitation `MixturePPOTrainer.load` documents).
     """
     trainer = MixturePPOTrainer(game, hyperparams, opponent.sample_fn, perspective=player, seed=seed)
     if init_params is not None:

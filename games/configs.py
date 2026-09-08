@@ -18,7 +18,9 @@ import jax.numpy as jnp
 
 from .base import ZeroSumGame
 from .examples import (
+    AllPayAuctionGame,
     AsymmetricWellGame,
+    CircleGame,
     ContinuousBlottoGame,
     ContinuousMatchingPennies,
     ContinuousMatchingPenniesShifted,
@@ -26,6 +28,7 @@ from .examples import (
     CurvaturePumpGame,
     DecoyWellGame,
     ForsakenGame,
+    GlicksbergGrossGame,
     MultiDimDecoyWellGame,
     MultiPointGame,
     QuadraticAsymmetricGame,
@@ -273,6 +276,36 @@ class SequentialBlottoConfig:
         )
 
 
+@dataclasses.dataclass
+class AllPayAuctionConfig:
+    value: float = 0.5
+    high: float = 1.0
+    sharpness: float | None = None   # null keeps the hard rule, and the exact equilibrium
+
+    def build(self) -> ZeroSumGame:
+        return AllPayAuctionGame(value=self.value, high=self.high, sharpness=self.sharpness)
+
+
+@dataclasses.dataclass
+class CircleConfig:
+    harmonics: int = 3
+    coefficients: tuple[float, ...] | None = None   # null -> 2^-k, decaying
+
+    def build(self) -> ZeroSumGame:
+        return CircleGame(
+            harmonics=self.harmonics,
+            coefficients=tuple(self.coefficients) if self.coefficients is not None else None,
+        )
+
+
+@dataclasses.dataclass
+class GlicksbergGrossConfig:
+    """No parameters: the game, its equilibrium and its value are all fixed."""
+
+    def build(self) -> ZeroSumGame:
+        return GlicksbergGrossGame()
+
+
 GAME_CONFIGS: dict[str, type] = {
     "matching_pennies": MatchingPenniesConfig,
     "matching_pennies_shifted": MatchingPenniesShiftedConfig,
@@ -285,6 +318,9 @@ GAME_CONFIGS: dict[str, type] = {
     "curvature_pump": CurvaturePumpConfig,
     "forsaken": ForsakenConfig,
     "decoy_well": DecoyWellConfig,
+    "all_pay_auction": AllPayAuctionConfig,
+    "circle": CircleConfig,
+    "glicksberg_gross": GlicksbergGrossConfig,
     "multidim_decoy_well": MultiDimDecoyWellConfig,
     "kuhn": KuhnConfig,
     "leduc": LeducConfig,

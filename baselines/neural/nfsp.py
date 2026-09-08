@@ -11,13 +11,12 @@ Both are reported here, because "NFSP converged" is a statement about `pi` only.
 What is reused, and what is a deviation:
 
   * the best response is `br_oracle.train_best_response`, i.e. the repo's own PPO
-    trainer against a fixed opponent sampler, warm-started from the previous round's
-    `beta` so it improves continuously rather than restarting. **Deviation**: the paper
-    uses DQN with a circular replay buffer; this is PPO on fresh on-policy rollouts.
-    The structure NFSP actually rests on -- best response to the opponent's average,
-    supervised imitation of one's own best responses -- is unchanged, and PPO is what
-    this repo has; a DQN oracle would be a different implementation, not a different
-    algorithm.
+    trainer against a fixed opponent sampler, restarted from a fresh initialization
+    each round (see below). **Deviation**: the paper uses DQN with a circular replay
+    buffer; this is PPO on fresh on-policy rollouts. The structure NFSP actually rests
+    on -- best response to the opponent's average, supervised imitation of one's own
+    best responses -- is unchanged, and PPO is what this repo has; a DQN oracle would
+    be a different implementation, not a different algorithm.
   * the average policy is a `MixtureActorCritic` fit by maximum likelihood to a
     reservoir of the best response's own actions (`--average-head mixture`), which is
     the paper's supervised-learning step. `--average-head reservoir` skips the network
@@ -30,13 +29,34 @@ its own capacity (`--average-components`, default 8) rather than the config's
 `network.num_components`: handicapping NFSP's function approximator the same way the
 method under test is handicapped would be measuring the wrong thing.
 
-**The best-response budget is the knob that matters.** Measured on `configs/two_point.yaml`
-against the exact Nash (whose exact best-response value is 0.000, since every deviation is
-worthless at an equilibrium), the PPO oracle reaches -0.005 after ~1000 iterations and only
--0.72 after 400 -- so a round whose "best response" is 100 iterations long is running
-fictitious play on something that is not a best response, and the average it converges to
-is not the fictitious-play average. `--br-steps 50 --br-epochs 20` is 1000 iterations per
-round and is the default for that reason; treat lowering it as changing the algorithm.
+**Why the best response is not warm-started.** The obvious optimization -- start each
+round's `beta` from the previous round's, so it improves continuously rather than
+relearning from scratch -- is what the paper's DQN oracle effectively does, and it is
+wrong for this one. DQN keeps exploring however peaked its Q-net gets, because
+epsilon-greedy is external to the network; an on-policy Gaussian policy explores only
+through its own scale, `br_hyperparams` zeroes `gaussian_entropy_coef` (see
+`br_oracle`'s docstring for why a best response must be unregularized), and so within a
+few rounds `beta` collapses to a scale of ~0.01 and can never re-widen. Every subsequent
+"best response" is then local gradient ascent from last round's answer.
+
+Measured on `configs/circle.yaml`, against the round-39 opponent of a warm-started run
+and on the default budget, the warm-started oracle reaches +0.356 where the exact grid
+best response is +0.703; cold-started on the same opponent and budget it reaches +0.700.
+Over a run this is fatal rather than merely lossy: the per-round best responses drift by
+a few hundredths instead of leaping across the action space, the reservoir becomes a
+narrow smear rather than the sweep fictitious play averages over, and exploitability
+plateaus (~1.4 on `circle`, against PSRO's ~0.000 out of the same oracle -- the absence
+of a warm start being the only structural difference between the two).
+
+**The best-response budget, by contrast, is not the binding knob.** Measured on
+`configs/two_point.yaml` against the exact Nash (whose exact best-response value is
+0.000, since every deviation is worthless at an equilibrium), the cold-started PPO
+oracle reaches -0.005 after ~1000 iterations and only -0.72 after 400, so a round whose
+"best response" is 100 iterations long is running fictitious play on something that is
+not a best response. `--br-steps 50 --br-epochs 20` is 1000 iterations per round and is
+the default for that reason; treat lowering it as changing the algorithm. But raising it
+does not rescue a warm-started run -- the 1000 iterations above were enough to be exact
+from a cold start and left a 0.35 gap from a warm one.
 
 Usage:
     python -m baselines.neural.nfsp configs/two_point.yaml --rounds 30
@@ -230,10 +250,11 @@ def run_nfsp(
                                               round_keys[4 + player]))
 
         for player in (0, 1):
+            # Cold-started on purpose: see "Why the best response is not warm-started"
+            # in the module docstring.
             response = bo.train_best_response(
                 game, player, opponents[1 - player], br_hp[player],
                 steps=br_steps, epochs=br_epochs, seed=seed + round_index,
-                init_params=br_policies[player]["params"] if br_policies[player] else None,
             )
             br_policies[player] = {"kind": "br", "network": response.network,
                                    "params": response.params, "mean_reward": response.mean_reward}

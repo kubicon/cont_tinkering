@@ -115,11 +115,40 @@ def test_joint_perturbation_matches_separate_at_half_the_cost():
 
 
 def test_single_point_estimator_is_cheaper_than_the_central_difference():
+    """`batch` counts *evaluations*, so one antithetic pair costs what two single-point
+    draws cost. Halving the batch is what makes the single-point stencil the cheap one."""
     params = ({"w": jnp.zeros(2)}, {"w": jnp.zeros(2)})
     utility = _quadratic_utility(jnp.zeros(2), jnp.zeros(2))
-    _, antithetic = spg_pseudo_gradients(utility, params, jax.random.PRNGKey(0), 0.1, True)
-    _, single = spg_pseudo_gradients(utility, params, jax.random.PRNGKey(0), 0.1, False)
+    _, antithetic = spg_pseudo_gradients(utility, params, jax.random.PRNGKey(0), 0.1, True, 2)
+    _, single = spg_pseudo_gradients(utility, params, jax.random.PRNGKey(0), 0.1, False, 1)
     assert (antithetic, single) == (4, 2)
+
+
+@pytest.mark.parametrize("estimator", [spg_pseudo_gradients, jpspg_pseudo_gradients])
+def test_perturbation_batch_sharpens_the_estimate(estimator):
+    """The papers' `batch_size`. A single draw is a random direction in parameter space
+    and is nearly orthogonal to the gradient; averaging `batch` of them is the only thing
+    that makes a *single* iteration informative, which is why the reference
+    implementation's default of 2 does not reproduce the papers' experiments."""
+    centre_0, centre_1 = jnp.array([1.0, -2.0]), jnp.array([-0.5, 0.5])
+    params = ({"w": jnp.zeros(8)}, {"w": jnp.zeros(8)})
+    utility = _quadratic_utility(jnp.zeros(8).at[:2].set(centre_0[:2]) * 0 + 1.0,
+                                 jnp.zeros(8) - 0.5)
+    truth = -2.0 * (params[0]["w"] - 1.0)
+
+    def mean_cosine(batch):
+        keys = jax.random.split(jax.random.PRNGKey(4), 64)
+        return float(np.mean([
+            _cosine(estimator(utility, params, k, 0.05, True, batch)[0][0]["w"], truth)
+            for k in keys]))
+
+    single, batched = mean_cosine(2), mean_cosine(256)
+    assert batched > single + 0.2
+    assert batched > 0.9
+
+    # And the evaluation count scales with the batch, so the gain is paid for.
+    _, evaluations = estimator(utility, params, jax.random.PRNGKey(0), 0.05, True, 64)
+    assert evaluations == (64 if estimator is jpspg_pseudo_gradients else 128)
 
 
 def test_tree_normal_matches_the_parameter_structure():
@@ -151,7 +180,7 @@ def test_pseudo_gradient_run_produces_a_history_and_checkpoints(game, oracle, tm
 
     hyperparams = RandomizedPolicyHyperparams(
         action_dim=1, hidden_dims=(32,), noise_dim=4, low=(-2.0,), high=(2.0,),
-        utility_samples=64)
+        utility_samples=64, perturbation_batch=2)
     writer = RunWriter(tmp_path / "spg", {"algorithm": "randomized_policy_spg"})
     result = run_pseudo_gradient(game, oracle, hyperparams, spg_pseudo_gradients,
                                  iterations=20, log_every=10, samples=256, writer=writer)

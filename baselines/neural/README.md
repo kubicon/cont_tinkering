@@ -78,6 +78,17 @@ So the defaults are 1000 iterations per round for NFSP and 2000 for PSRO. A too-
 oracle is visible in the output: `rl_gap` collapses toward zero while `expl` stays high.
 (`tests/test_neural_baselines.py` pins the converged end of this.)
 
+The table above is a *cold-started* oracle, and only a cold-started one behaves this way.
+**Neither solver warm-starts its best-response net from the previous round**, and neither
+should: with the regularizers zeroed (below), the Gaussian scale is the policy's only
+exploration, so a warm start from last round's converged — hence near-deterministic —
+policy makes each round local ascent around wherever it last stopped, and no iteration
+budget fixes it. Measured on `configs/circle.yaml` against a fixed opponent at the default
+1000 iterations: cold start reaches `+0.700` against an exact best response of `+0.703`;
+warm start reaches `+0.356`. NFSP warm-started until it was removed, which is why its
+`circle` exploitability sat near `1.4` while PSRO — the same oracle, cold-started — reached
+`0.000`.
+
 ## Deviations worth knowing
 
 * **NFSP uses PPO, not DQN**, for its best response (this repo has PPO; the paper's
@@ -91,7 +102,9 @@ oracle is visible in the output: `rl_gap` collapses toward zero while `expl` sta
   under test.
 * **Best responses are unregularized.** `br_hyperparams` zeroes the magnet/TRPO/entropy
   coefficients the config carries — a best response pulled toward its own past understates
-  the opponent's exploitability, which would flatter whatever is calling the oracle.
+  the opponent's exploitability, which would flatter whatever is calling the oracle. The
+  cost is that the oracle has no exploration beyond its own scale, hence no warm starts
+  (above).
 * **PSRO's payoff matrix is Monte-Carlo.** Each member's action sample is drawn once and
   kept, so entries do not drift between rounds and the LP is not chasing resampling noise.
 
@@ -115,6 +128,18 @@ regardless of `n`). For two players that is 4 vs 2 — a factor of two here, not
 order-of-magnitude the paper reports for many-player games. `utility_evaluations` is
 logged for that reason: comparing these two by iteration count flatters the joint one.
 
-Defaults follow the papers: AdaBelief, `alpha = 1e-4`, `sigma = 0.1` — which means these
-runs need *many* iterations (a few hundred barely move the exploitability). The dynamics
-their appendix runs are all available: `--dynamics simultaneous|extragradient|optimistic`.
+Defaults follow the papers: AdaBelief, `alpha = 1e-4`, `sigma = 0.1`,
+`--perturbation-batch 256` — which means these runs need *many* iterations (a few hundred
+barely move the exploitability). The dynamics their appendix runs are all available:
+`--dynamics simultaneous|extragradient|optimistic`.
+
+**`--perturbation-batch` is the one that decides whether these converge at all.** It is
+the papers' `batch_size`: how many perturbations are drawn and averaged per iteration.
+A single draw is a random direction in `R^d`, so at the `d ~ 5e3` of a 64x64 policy it
+has cosine `~0.02` with the pseudo-gradient it estimates — the step is ~99% noise.
+IJCAI'25's experiments use 256; the authors' published reference implementation
+*defaults* to 2, and this repo inherited that default, which is why both methods sat at
+their starting exploitability across `experiments/one_shot_neural/`. The budget also has
+to go on the right axis: at a fixed payoff-evaluation budget, moving samples out of
+`--utility-samples` into `--perturbation-batch` improves the gradient's alignment ~4-5x,
+because the utility estimate was already far more precise than the direction was.

@@ -36,12 +36,24 @@ sys.path.insert(0, str(HERE))              # this directory, for `run_cell`
 
 from run_cell import METHODS  # noqa: E402 -- same directory, added to sys.path below
 
-# The one-shot games with genuinely mixed equilibria; `idealized_decoy_well` is the
-# counterexample config, which is the interesting cell of any comparison here.
+# The one-shot games with genuinely mixed equilibria, in two groups.
+#
+# The first three have a Nash on *finitely many* points, so a K-component mixture can
+# represent it exactly and what is being measured is whether the algorithm finds it;
+# `idealized_decoy_well` is the counterexample config, the interesting cell there.
+#
+# The last three have a Nash the mixture head cannot represent exactly at all: uniform
+# on an interval (the all-pay auction), a density unbounded at 0 (Glicksberg-Gross), or
+# one needing more atoms than the kernel has harmonics (the circle). Their residual
+# exploitability is a statement about the representation rather than the optimizer,
+# which is the axis the finite-support games cannot measure.
 DEFAULT_GAMES = (
     "configs/two_point.yaml",
     "configs/multi_point.yaml",
     "configs/idealized_decoy_well.yaml",
+    "configs/all_pay_auction.yaml",
+    "configs/circle.yaml",
+    "configs/glicksberg_gross.yaml",
 )
 
 RUN_CELL = HERE / "run_cell.py"
