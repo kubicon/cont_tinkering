@@ -1,4 +1,5 @@
 from .base import ZeroSumGame
+from .discretized import DiscretizedSequentialGame, base_game, discretize, linear_action_grid
 from .examples import AllPayAuctionGame, CircleGame, GlicksbergGrossGame
 from .leduc import ContinuousLeducHoldem, LeducState
 from .kuhn_best_response import (
@@ -32,6 +33,10 @@ __all__ = [
     "GlicksbergGrossGame",
     "SequentialZeroSumGame",
     "TERMINAL",
+    "DiscretizedSequentialGame",
+    "base_game",
+    "discretize",
+    "linear_action_grid",
     "ContinuousKuhnPoker",
     "ContinuousSequentialBlotto",
     "BlottoState",

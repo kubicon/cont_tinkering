@@ -192,6 +192,15 @@ class RunWriter:
             return
         save_checkpoint(self.directory / "params" / name, hyperparams, params)
 
+    def save_arrays(self, name: str, **arrays) -> None:
+        """A bundle of plain arrays as `<name>.npz` -- what a strategy that is *not* a
+        single network needs saved beside `params/`: a PSRO population's meta-weights and
+        its empirical payoff matrix, say, which the parameters alone do not determine."""
+        if self.directory is None:
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        np.savez(self.directory / f"{name}.npz", **{k: np.asarray(v) for k, v in arrays.items()})
+
     def finish(self, extra: dict | None = None) -> dict:
         meta = {**self.meta, **(extra or {})}
         if self.directory is None:

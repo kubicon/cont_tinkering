@@ -345,7 +345,14 @@ def sample_mixture_component(
     component = jax.random.categorical(component_key, jnp.where(mask, logits, MASKED_LOGIT))
     index = gaussian_component_index(component, num_atoms)
     mean = means[index]
-    raw_action = gaussian_sample(mean, scale_trils[index], jax.random.normal(noise_key, mean.shape))
+    # `dtype=mean.dtype` rather than the default: under `jax_enable_x64` (which
+    # `baselines.common` turns on process-wide) a bare `normal` draws float64, and
+    # a policy whose observation is float32 -- Leduc's is, Kuhn's is not -- would
+    # then produce a float64 action against float32 parameters, which the loss
+    # rejects when it solves against `scale_tril`.
+    raw_action = gaussian_sample(
+        mean, scale_trils[index], jax.random.normal(noise_key, mean.shape, dtype=mean.dtype)
+    )
     return component, raw_action
 
 

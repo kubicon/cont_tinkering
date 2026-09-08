@@ -32,6 +32,7 @@ from games.kuhn_best_response import (
     best_response_value_second,
     game_value,
 )
+from games.discretized import DiscretizedSequentialGame
 from games.sequential_examples import KIND_CALL, KIND_PASSIVE, ContinuousKuhnPoker
 
 from .actor_critic import masked_log_softmax
@@ -120,6 +121,81 @@ def strategy_from_network(
     open_check, open_bet = jax.vmap(at_open)(cards)
     call = jax.vmap(jax.vmap(at_faced, in_axes=(None, 0)), in_axes=(0, None))(cards, grid)
     return KuhnStrategy(open_check=open_check, open_bet=open_bet, call=call)
+
+
+def discrete_strategy_from_network(
+    game: DiscretizedSequentialGame,
+    network: MixtureActorCritic,
+    params,
+    player: int,
+    grid: chex.Array,
+) -> KuhnStrategy:
+    """`strategy_from_network` for a policy playing a *discretized* Kuhn.
+
+    Only one of the two decisions changes. The bet-size distribution is now a
+    plain categorical over the grid the game offers -- no clipped mixture, no
+    CDFs -- and it is reported on the caller's evaluation grid by putting each
+    action's probability on the nearest point of it, so the tables mean the same
+    thing they do for a continuous policy and the same best-response arithmetic
+    reads them. (Snapping is exact whenever the evaluation grid contains the
+    action grid, which it does at any sane resolution, and otherwise costs half
+    an evaluation cell -- the approximation the continuous reader already makes.)
+
+    The response to a bet does *not* change: a discretized player still observes
+    the real size it is facing (see `games.discretized`), so `call` is queried
+    across the full evaluation grid exactly as before. That is what keeps the
+    exploitability computed from these tables honest about the grid's cost --
+    the best response may bet between the points, and it will.
+    """
+    base = game.game
+    if not isinstance(base, ContinuousKuhnPoker):
+        raise ValueError(f"expected a discretized Kuhn game, got one wrapping {type(base).__name__}")
+    open_node, faced_node = base.decision_nodes(player)
+    open_mask = expand_kind_mask(
+        game.discretize_kind_mask(base.infoset_action_mask(open_node)), network.num_components)
+    faced_mask = expand_kind_mask(
+        game.discretize_kind_mask(base.infoset_action_mask(faced_node)), network.num_components)
+    cards = jnp.arange(base.num_cards)
+
+    # Bet size is action coordinate 0, and the action grid is one point per kind
+    # from `base_atoms` onwards.
+    sizes = game.grid(player)[:, 0]
+    column = jnp.argmin(jnp.abs(grid[None, :] - sizes[:, None]), axis=-1)  # (num_grid,)
+    first_bet, last_bet = game.base_atoms, game.base_atoms + game.num_grid
+
+    def at_open(card: chex.Array) -> tuple[chex.Array, chex.Array]:
+        logits, _, _, _ = network.apply(
+            params, base.infoset_observation(card, open_node, 0.0))
+        probs = jnp.exp(masked_log_softmax(logits, open_mask))
+        # Joint, like the continuous reader's: these already carry "and it bet at all".
+        sizes_row = jnp.zeros(grid.shape[0]).at[column].add(probs[first_bet:last_bet])
+        return probs[KIND_PASSIVE], sizes_row
+
+    def at_faced(card: chex.Array, bet: chex.Array) -> chex.Array:
+        logits, _, _, _ = network.apply(
+            params, base.infoset_observation(card, faced_node, bet))
+        return jnp.exp(masked_log_softmax(logits, faced_mask))[KIND_CALL]
+
+    open_check, open_bet = jax.vmap(at_open)(cards)
+    call = jax.vmap(jax.vmap(at_faced, in_axes=(None, 0)), in_axes=(0, None))(cards, grid)
+    return KuhnStrategy(open_check=open_check, open_bet=open_bet, call=call)
+
+
+def strategy_from_policy(
+    game,
+    network: MixtureActorCritic,
+    params,
+    player: int,
+    grid: chex.Array,
+) -> KuhnStrategy:
+    """The right reader for whichever Kuhn `game` is -- continuous or discretized.
+
+    One dispatch point, so a caller measuring a run never has to know which
+    action set the policy it was handed was trained on.
+    """
+    if isinstance(game, DiscretizedSequentialGame):
+        return discrete_strategy_from_network(game, network, params, player, grid)
+    return strategy_from_network(game, network, params, player, grid)
 
 
 def evaluate_networks(

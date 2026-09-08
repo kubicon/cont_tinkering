@@ -33,6 +33,8 @@ Lipschitz constant.
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import chex
 import jax.numpy as jnp
 
@@ -264,3 +266,67 @@ def analytic_equilibrium(game: ContinuousKuhnPoker, alpha: float = 1.0 / 6.0) ->
     first = strategy(bet=[alpha, 0.0, 3.0 * alpha], call=[0.0, alpha + 1.0 / 3.0, 1.0])
     second = strategy(bet=[1.0 / 3.0, 0.0, 1.0], call=[0.0, 1.0 / 3.0, 1.0])
     return first, second
+
+
+def mix_strategies(
+    strategies: Sequence[KuhnStrategy], weights: Sequence[float], player: int
+) -> KuhnStrategy:
+    """The single behavioral strategy realization-equivalent to *playing one of
+    `strategies` at random*, with probability `weights[k]`, for the whole hand.
+
+    This is what a population method's meta-strategy actually is: PSRO draws one
+    population member per episode and sticks with it, which is a **mixed**
+    strategy over behavioral ones and not itself behavioral -- averaging the
+    tables entry by entry is a different (and strictly weaker) object, because it
+    forgets that the member playing at the second decision is the same member
+    that played at the first.
+
+    Kuhn's theorem is what makes the conversion possible, and the tree is small
+    enough that it is one line of arithmetic: at each infoset, mix the members'
+    local probabilities in proportion to `weight * (the member's own reach into
+    that infoset)`. Chance and the opponent contribute the same factor to every
+    member, so they cancel out of the ratio and only the player's *own* actions
+    matter:
+
+      * every opening infoset is reached before its owner has acted at all, so
+        there the weights are just `weights`;
+      * player 0's second infoset (`NODE_P0_AFTER_CHECK_BET`) is reached only
+        after that member checked, so its weight carries `open_check[card]`;
+      * player 1 never acts twice on a line -- its two infosets sit under player
+        0's check and player 0's bet respectively -- so its reach is `weights`
+        at both.
+
+    An infoset no member reaches (every member always bets, so none of them can
+    face a bet after checking) has total weight zero; the mixture's behavior
+    there is arbitrary, and the uniform-over-members average is used so the
+    result stays a valid strategy rather than a division by zero.
+    """
+    if player not in (0, 1):
+        raise ValueError(f"player must be 0 or 1, got {player}")
+    if len(strategies) != len(weights):
+        raise ValueError(f"{len(strategies)} strategies but {len(weights)} weights")
+    if not strategies:
+        raise ValueError("need at least one strategy to mix")
+
+    w = jnp.asarray(weights, dtype=jnp.float32)
+    total = jnp.sum(w)
+    if not bool(total > 0):
+        raise ValueError("weights must sum to something positive")
+    w = w / total
+
+    open_check = jnp.stack([s.open_check for s in strategies])  # (K, c)
+    open_bet = jnp.stack([s.open_bet for s in strategies])      # (K, c, M)
+    call = jnp.stack([s.call for s in strategies])              # (K, c, M)
+
+    # The reach of each member into its owner's *second* decision, per card.
+    reach = w[:, None] * (open_check if player == 0 else jnp.ones_like(open_check))
+    normalizer = jnp.sum(reach, axis=0)  # (c,)
+    unreached = normalizer <= 0.0
+    safe = jnp.where(unreached, 1.0, normalizer)
+    call_weights = jnp.where(unreached[None, :], w[:, None], reach / safe[None, :])
+
+    return KuhnStrategy(
+        open_check=jnp.einsum("k,kc->c", w, open_check),
+        open_bet=jnp.einsum("k,kcm->cm", w, open_bet),
+        call=jnp.einsum("kc,kcm->cm", call_weights, call),
+    )

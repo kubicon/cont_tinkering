@@ -103,7 +103,11 @@ def ppo_update(
             hyperparams.entropy_coef,
         )
         state = state.apply_gradients(grads=grads)
-        return state, metrics
+        # The norm *before* clipping (`clip_by_global_norm` lives in the
+        # optimizer, so this is what it sees): the diagnostic worth having, since
+        # a run whose gradients are permanently above `max_grad_norm` is one
+        # whose effective learning rate is set by the clip and not by the config.
+        return state, {**metrics, "grad_norm": optax.global_norm(grads)}
 
     state, metrics = jax.lax.scan(epoch_step, state, xs=None, length=hyperparams.num_epochs)
     metrics = jax.tree_util.tree_map(jnp.mean, metrics)

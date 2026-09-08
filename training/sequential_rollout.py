@@ -164,13 +164,24 @@ def collect_sequential_batch(
     magnet_params_1,
     key: chex.PRNGKey,
     num_envs: int,
+    param_axes: tuple = (None, None, None, None),
 ) -> tuple[Episode, chex.Array]:
     """`num_envs` independent episodes: `sample_episode` `vmap`ed over rng keys.
 
     The env axis lands in front of the time axis, so the returned `Episode`'s
     fields are `(num_envs, max_steps, ...)` and `payoff` is `(num_envs,)`.
+
+    `param_axes` gives the `in_axes` of the four parameter arguments, in order.
+    The default maps none of them: one strategy per player, shared by the whole
+    batch, which is what self-play and a single frozen opponent need. Passing
+    `0` for a player's two entries instead makes that player's parameters a
+    *stacked* pytree with a leading `num_envs` axis -- one strategy per episode,
+    which is how a mixture over policies is played: the member is drawn at the
+    start of the episode and held for all of it (a mixed strategy), rather than
+    re-drawn at every decision (which would be a different, behavioral, object).
+    See `baselines.neural.sequential_oracle`.
     """
     keys = jax.random.split(key, num_envs)
-    return jax.vmap(sample_episode, in_axes=(None, None, None, None, 0))(
+    return jax.vmap(sample_episode, in_axes=(*param_axes, 0))(
         params_0, magnet_params_0, params_1, magnet_params_1, keys
     )

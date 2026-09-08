@@ -19,6 +19,12 @@ A sequential run reports exploitability only where an *exact* best response
 exists (Kuhn). For the games where it does not, `best_response.py` trains one
 instead and reports a lower bound; it reads the same config schema.
 
+For a game tree there is also `train_sequential.py`, which runs this same
+self-play trainer *and* the two sequential baselines (NFSP, PSRO) off the same
+config, under one metric, recording what each run cost in wall time and
+environment steps -- the entry point to use when the three are being compared
+rather than one of them run on its own.
+
 Example:
   python train.py configs/blotto.yaml
   python train.py configs/kuhn.yaml
