@@ -55,10 +55,14 @@ it is still recorded in the run's own config and in its `meta.json`.
     python rci_scripts/generate_sequential_sweep.py \\
         --games configs/kuhn_solvers.yaml --solvers nfsp psro --seeds 0 1 2
     bash scripts/sequential_sweep/run_all.sh                         # submit
+    python rci_scripts/generate_sequential_sweep_score.py            # score jobs
+    bash scripts/sequential_sweep/run_all_score.sh                   # after training
 
 `manifest.json` beside the scripts maps each run name to its game, solver, seed
 and full set of overrides, which is what an analysis script should read rather
-than parsing the directory names back apart.
+than parsing the directory names back apart. Offline exploitability scoring is
+``generate_sequential_sweep_score.py``: one SLURM job per run, reading this
+manifest and calling ``score_sequential_sweep.py``.
 """
 
 from __future__ import annotations
