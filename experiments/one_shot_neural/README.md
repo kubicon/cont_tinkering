@@ -20,8 +20,18 @@ python experiments/one_shot_neural/run_all.py --max-parallel 4 --budget 2000000
 python experiments/one_shot_neural/score.py --out data/one_shot_neural --grid 801
 ```
 
-Methods: `mixture` (this repo's Gaussian-mixture MMD — the method under test),
-`mmd_discrete`, `nfsp`, `psro`, `spg`, `jpspg`, `sisa`.
+Methods in the default grid: `mixture` (this repo's Gaussian-mixture MMD — the method
+under test), `mmd_discrete`, `nfsp`, `psro`, `rpn_pathwise`, `sisa`.
+
+`spg` and `jpspg` are still implemented and still runnable, but are **opt-in** — ask for
+them by name (`run_all.py --methods spg jpspg`). `rpn_pathwise` carries the randomized
+policy network in the grid instead: the same implicit policy `a = f(o, z)` those two train
+by a zeroth-order pseudo-gradient, trained by the *exact* pathwise gradient
+(`baselines/neural/randomized_policy_pathwise.py`). Read the swap for what it is — a
+change of question, not an upgrade. `rpn_pathwise` differentiates the payoff and so
+assumes a strictly stronger access model; `spg`/`jpspg` assume only that the payoff can be
+*evaluated*. Run them alongside it whenever the cost of that assumption is the thing being
+measured, which is what the `access_model` column exists to keep visible.
 
 ## The games
 
@@ -159,6 +169,16 @@ python experiments/one_shot_neural/run_all.py --methods spg jpspg --overwrite
 
 or send the new runs to a fresh `--out` tree. The already-stored `data/one_shot_neural`
 spg/jpspg runs are paper-default runs; the collapse described above is what they show.
+Those runs stay reproducible: both methods remain registered in `run_cell.py`
+(`OPTIONAL_METHODS`) with this block of settings intact, so dropping them from the default
+grid changed what runs by default and nothing about what they do when asked for.
+
+`rpn_pathwise` does **not** inherit this block. Its defaults are its own
+(`Settings.rpn_*`): OGD at `lr = 1e-2` with `optimism = 1.0` rather than AdaBelief, and a
+`batch` that is the only sampling in the update, because the gradient itself is exact and
+there is no perturbation batch to average on top of it. `sigma` in particular does not
+transfer — that variant squashes with a `sigmoid` rather than a scaled `tanh`, and the
+`2.0` tuned for the latter is badly wrong for the former.
 
 `run_all.py` caps each cell's thread pool (`--threads-per-cell`, by default the core count
 divided by `--max-parallel`) so that parallel cells do not measure contention with each
@@ -168,9 +188,13 @@ other.
 
 Plot exploitability against `payoff_evals` (the primary axis) and against `wall_time` (the
 secondary one) from the same `curves.json`. Keep the `access_model` column in any table:
-`sisa` uses exact payoff gradients, `spg`/`jpspg` assume only a black-box payoff, and the
-PPO-based methods sit in between — putting them on one axis without saying so implies a
-fairness that is not there. Use several seeds and show median with an IQR band; these are
+`sisa` uses exact payoff gradients, `rpn_pathwise` differentiates the payoff through the
+policy, `spg`/`jpspg` assume only a black-box payoff, and the PPO-based methods sit in
+between — putting them on one axis without saying so implies a fairness that is not there.
+`rpn_pathwise` beside `spg`/`jpspg` is a *controlled* pair — same policy, same games, only
+the gradient differs — so a gap between them prices the black-box assumption and nothing
+else; `rpn_pathwise` beside `mixture` is not, and should be read as an upper bound on what
+the implicit representation can do rather than as a like-for-like result. Use several seeds and show median with an IQR band; these are
 stochastic and single-seed curves do not reproduce.
 
 ## Wall-time-matched re-run of SPG / JPSPG (`run_walltime_matched.py`)

@@ -6,6 +6,7 @@ from typing import Callable
 
 import chex
 import flax.linen as nn
+import jax
 import jax.numpy as jnp
 
 ACTIVATIONS: dict[str, Callable[[chex.Array], chex.Array]] = {
@@ -17,6 +18,10 @@ ACTIVATIONS: dict[str, Callable[[chex.Array], chex.Array]] = {
     "gelu": nn.gelu,
     "silu": nn.silu,
     "swish": nn.swish,
+    # Used by the exact-gradient randomized policy network
+    # (`baselines/neural/randomized_policy_pathwise.py`), which is the activation the
+    # reference implementation of that variant uses.
+    "mish": jax.nn.mish,
     "sigmoid": nn.sigmoid,
     "tanh": jnp.tanh,
     "softplus": nn.softplus,

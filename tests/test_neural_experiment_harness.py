@@ -141,7 +141,24 @@ def test_budget_warning_fires_when_one_unit_overspends(run_cell):
 
 
 def test_access_model_is_recorded_for_every_method(run_cell):
-    """A comparison that hides which methods get exact gradients is not a fair one."""
-    assert set(run_cell.ACCESS_MODEL) == set(run_cell.METHODS)
+    """A comparison that hides which methods get exact gradients is not a fair one.
+
+    Keyed on `ALL_METHODS`, not the default grid: `OPTIONAL_METHODS` are still runnable
+    by name, so a run of one still has to carry its access model into `meta.json`.
+    """
+    assert set(run_cell.ACCESS_MODEL) == set(run_cell.ALL_METHODS)
     assert "exact" in run_cell.ACCESS_MODEL["sisa"]
     assert "zeroth order" in run_cell.ACCESS_MODEL["jpspg"]
+    assert "pathwise" in run_cell.ACCESS_MODEL["rpn_pathwise"]
+
+
+def test_every_runnable_method_is_wired_end_to_end(run_cell):
+    """The grid and the opt-in pair must both be priceable and runnable -- a method in
+    `ALL_METHODS` with no runner or no cost formula fails only once a cell is launched."""
+    assert set(run_cell.RUNNERS) == set(run_cell.ALL_METHODS)
+    assert not set(run_cell.METHODS) & set(run_cell.OPTIONAL_METHODS)
+    settings = run_cell.Settings()
+    for method in run_cell.ALL_METHODS:
+        plan = run_cell.plan_units(method, 20_000_000, settings, 256)
+        assert plan["evals_per_unit"] > 0, method
+        assert plan.get("iterations", plan.get("rounds")) >= 1, method

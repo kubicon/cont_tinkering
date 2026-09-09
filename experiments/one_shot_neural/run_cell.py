@@ -52,12 +52,27 @@ from baselines.neural import mmd_discrete as mmd_module  # noqa: E402
 from baselines.neural import nfsp as nfsp_module  # noqa: E402
 from baselines.neural import psro as psro_module  # noqa: E402
 from baselines.neural import randomized_policy as spg_module  # noqa: E402
+from baselines.neural import randomized_policy_pathwise as rpn_pathwise_module  # noqa: E402
 from baselines.neural.common import RunWriter, empirical_strategy, load_run  # noqa: E402
 from training.hyperparams import build_hyperparams  # noqa: E402
 from training.mixture import sample_mixture_actions  # noqa: E402
 from training.mixture_trainer import MixtureSelfPlayPPOTrainer  # noqa: E402
 
-METHODS = ("mixture", "mmd_discrete", "nfsp", "psro", "spg", "jpspg", "sisa")
+# The default grid: what `run_all.py` runs when `--methods` is not given.
+METHODS = ("mixture", "mmd_discrete", "nfsp", "psro", "rpn_pathwise", "sisa")
+
+# Still implemented and still runnable -- `--method spg`, or `run_all.py --methods spg
+# jpspg` -- just no longer part of the default grid. `rpn_pathwise` carries the
+# randomized policy network there instead, because it is the variant of that method under
+# test here. Keeping these two registered is not sentiment: `ablate_jpspg.py` and
+# `run_walltime_matched.py` drive them through this script, and the runs already in
+# `data/one_shot_neural*/` stay reproducible from the code that produced them. Note they
+# answer a *different* question than `rpn_pathwise` (a black-box payoff rather than a
+# differentiable one), so dropping them from the grid drops that question from the default
+# comparison -- put them back whenever it is the one being asked.
+OPTIONAL_METHODS = ("spg", "jpspg")
+
+ALL_METHODS = METHODS + OPTIONAL_METHODS
 
 # What each method assumes it can do to the game. Recorded in `meta.json` and printed by
 # the summary, because a comparison that hides it is not a fair one: exact gradients are
@@ -70,6 +85,10 @@ ACCESS_MODEL = {
     "psro": "sampled payoffs, policy gradients",
     "spg": "black-box payoff (zeroth order)",
     "jpspg": "black-box payoff (zeroth order)",
+    # The same policy as spg/jpspg differentiated exactly, so it is the *control* for
+    # those two rather than a rival to them: a gap measures what the black-box access
+    # model costs, and this side of it is the strictly stronger assumption.
+    "rpn_pathwise": "sampled payoffs, pathwise (reparametrization) gradients",
     "sisa": "exact payoff gradients",
 }
 
@@ -121,6 +140,22 @@ class Settings:
     average_components: int = 8
     payoff_samples: int = 256
     meta_solver: str = "nash"
+    # rpn_pathwise. The reference implementation's defaults for that variant, which are
+    # its own and not the pseudo-gradient block's above -- notably OGD rather than
+    # AdaBelief, and a batch that is the *only* sampling in the update because the
+    # gradient itself is exact.
+    rpn_lr: float = 1e-3
+    rpn_optimizer: str = "optimistic"
+    rpn_optimism: float = 1.0
+    rpn_max_grad_norm: float = 1.0
+    rpn_batch_size: int = 128
+    rpn_noise_dim: int = 16
+    rpn_activation: str = "mish"
+    rpn_normalization: str = "rms_norm"
+    # 0 keeps the exact gradient; > 0 switches this method to the zeroth-order estimator
+    # with everything else held fixed, which is the controlled comparison against spg.
+    rpn_smooth: int = 0
+    rpn_smooth_scale: float = 0.1
     # sisa
     atoms: int = 8
     lr_support: float = 1e-2
@@ -137,6 +172,8 @@ def plan_units(method: str, budget: int, settings: Settings, batch_size: int) ->
       spg, jpspg              `utility_samples` per utility evaluation, and
                               `perturbation_batch` evaluations (joint) or twice that
                               (separate) per iteration
+      rpn_pathwise            `batch` per player's exact gradient, both players  `2 batch`
+                              (`smooth + 1` times that when the zeroth-order fallback is on)
       sisa                    two payoff matrices and two Jacobian passes  `4 n^2`
       nfsp                    two best responses per round               `2 * br_iters * batch`
       psro                    the same, plus every *new* population pair's outer product
@@ -156,6 +193,10 @@ def plan_units(method: str, budget: int, settings: Settings, batch_size: int) ->
         if settings.dynamics == "extragradient":
             per *= 2
         return {"iterations": max(int(budget // per), 1), "evals_per_unit": per}
+    if method == "rpn_pathwise":
+        per = rpn_pathwise_module.payoff_evals_per_iteration(
+            settings.rpn_batch_size, settings.rpn_smooth)
+        return {"iterations": max(int(budget // per), 1), "evals_per_unit": per}
     if method == "sisa":
         per = 4 * settings.atoms ** 2
         return {"iterations": max(int(budget // per), 1), "evals_per_unit": per}
@@ -174,7 +215,7 @@ def plan_units(method: str, budget: int, settings: Settings, batch_size: int) ->
             rounds += 1
         return {"rounds": max(rounds, 1), "evals_per_unit": per_round,
                 "matrix_evals_per_pair": matrix}
-    raise ValueError(f"unknown method {method!r} (choices: {METHODS})")
+    raise ValueError(f"unknown method {method!r} (choices: {ALL_METHODS})")
 
 
 def budget_warning(method: str, plan: dict, settings: Settings, budget: int) -> str | None:
@@ -336,6 +377,26 @@ def run_pseudo_gradient(method: str):
     return run
 
 
+def run_rpn_pathwise(game, oracle, config, plan, settings, seed, writer, score):
+    class _Args:
+        noise_dim = settings.rpn_noise_dim
+        activation = settings.rpn_activation
+        normalization = settings.rpn_normalization
+        optimizer = settings.rpn_optimizer
+        lr = settings.rpn_lr
+        optimism = settings.rpn_optimism
+        max_grad_norm = settings.rpn_max_grad_norm
+        batch_size = settings.rpn_batch_size
+        smooth = settings.rpn_smooth
+        smooth_scale = settings.rpn_smooth_scale
+
+    hyperparams = rpn_pathwise_module.hyperparams_from_config(game, config, _Args())
+    return rpn_pathwise_module.run_pathwise(
+        game, oracle, hyperparams, iterations=plan["iterations"],
+        log_every=plan["log_every"], samples=settings.samples, seed=seed,
+        writer=writer, score=score)
+
+
 def run_nfsp(game, oracle, config, plan, settings, seed, writer, score):
     return nfsp_module.run_nfsp(
         game, oracle, config, rounds=plan["rounds"], br_steps=settings.br_steps,
@@ -368,6 +429,7 @@ RUNNERS = {
     "psro": run_psro,
     "spg": run_pseudo_gradient("spg"),
     "jpspg": run_pseudo_gradient("jpspg"),
+    "rpn_pathwise": run_rpn_pathwise,
     "sisa": run_sisa,
 }
 
@@ -457,7 +519,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--game", required=True, help="path to a config in configs/")
-    ap.add_argument("--method", required=True, choices=METHODS)
+    ap.add_argument("--method", required=True, choices=ALL_METHODS)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--budget", type=int, default=2_000_000,
                     help="payoff evaluations this cell may spend")

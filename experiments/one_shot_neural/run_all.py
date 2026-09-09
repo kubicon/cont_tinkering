@@ -18,6 +18,11 @@ computes exploitability. Score the whole tree afterwards with `score.py`.
 Running one method at a time is the normal way to use this: `--methods psro` (or
 `--games`, or `--seeds`) filters the grid, and repeated invocations accumulate into the
 same output tree.
+
+`--methods` defaults to `run_cell.METHODS`, the grid. `run_cell.OPTIONAL_METHODS` (`spg`,
+`jpspg`) are registered and runnable but not in it, so they have to be named:
+
+    python experiments/one_shot_neural/run_all.py --methods spg jpspg
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))   # repo root
 sys.path.insert(0, str(HERE))              # this directory, for `run_cell`
 
-from run_cell import METHODS  # noqa: E402 -- same directory, added to sys.path below
+from run_cell import ALL_METHODS, METHODS  # noqa: E402 -- same directory, added to sys.path below
 
 # The one-shot games with genuinely mixed equilibria, in two groups.
 #
@@ -87,7 +92,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--games", nargs="+", default=list(DEFAULT_GAMES))
-    ap.add_argument("--methods", nargs="+", default=list(METHODS))
+    # Defaults to the grid; `OPTIONAL_METHODS` (spg, jpspg) have to be asked for by name.
+    ap.add_argument("--methods", nargs="+", default=list(METHODS), choices=list(ALL_METHODS),
+                    metavar="METHOD")
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--budget", type=int, default=2_000_000,
                     help="payoff evaluations per cell -- the common currency; see run_cell.py")
