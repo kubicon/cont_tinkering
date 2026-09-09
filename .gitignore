@@ -23,3 +23,12 @@ uv.lock
 *.pkl
 *.xdv
 *.json
+*.npz
+*.msgpack
+*.png
+*.jsonl
+
+scripts/
+configs/num_components/
+configs/one_shot_neural/
+configs/sequential_sweep/
