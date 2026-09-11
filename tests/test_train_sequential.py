@@ -229,8 +229,9 @@ def test_every_solver_writes_the_same_cost_columns(solver, tmp_path):
     assert [row["episodes"] for row in log.history] == sorted(row["episodes"] for row in log.history)
     assert log.history[-1]["env_steps"] > 0
     assert log.history[-1]["iterations"] > 0
-    # The loss and the gradient norm are there to be plotted beside the cost.
-    keys = set(log.history[-1])
+    # The loss and the gradient norm are there to be plotted beside the cost --
+    # on the rows that trained: PSRO's last row is a meta-solve with no oracle.
+    keys = set().union(*log.history)
     assert any("loss" in k for k in keys)
     assert any("grad_norm" in k for k in keys)
 

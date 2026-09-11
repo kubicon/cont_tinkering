@@ -10,6 +10,7 @@ import chex
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from games.base import ZeroSumGame
 from games.spaces import MASKED_LOGIT
@@ -57,6 +58,44 @@ def _spread_bias_init(low: chex.Array, high: chex.Array, num_components: int) ->
         return values.reshape(shape).astype(dtype)
 
     return init_fn
+
+
+def bucket_bounds(
+    low: chex.Array, high: chex.Array, num_components: int
+) -> tuple[chex.Array, chex.Array]:
+    """`(lows, highs)`, each `(num_components, d)`: the box cut into one bucket per component.
+
+    The buckets are a regular grid, `n` equal slices per axis with `n ** d ==
+    num_components`, components in row-major order over it -- so for the usual
+    one-dimensional bet size, component `k` owns the `k`-th of `num_components`
+    equal intervals of `[low, high]`, exactly the cells `_spread_bias_init`
+    centers the unbucketed means in.
+    """
+    action_dim = low.shape[0]
+    per_axis = round(num_components ** (1.0 / action_dim))
+    if per_axis ** action_dim != num_components:
+        raise ValueError(
+            f"bucket_means needs num_components to be a perfect {action_dim}-th power "
+            f"(one grid of buckets over the {action_dim}-d box), got {num_components}"
+        )
+    cells = np.stack(
+        np.unravel_index(np.arange(num_components), (per_axis,) * action_dim), axis=-1
+    )  # (num_components, d) grid index of each component's bucket
+    width = (high - low) / per_axis
+    lows = low[None, :] + cells * width[None, :]
+    return lows, lows + width[None, :]
+
+
+def component_boxes(network: "MixtureActorCritic") -> tuple[chex.Array, chex.Array]:
+    """`(lows, highs)`, each `(num_components, d)`: where each component's mean lives.
+
+    Its bucket under `bucket_means`, the whole action box for every component
+    otherwise. Also what exploration draws from: see `sample_mixture_component`.
+    """
+    if network.bucket_means:
+        return bucket_bounds(network.low, network.high, network.num_components)
+    shape = (network.num_components, network.action_dim)
+    return jnp.broadcast_to(network.low, shape), jnp.broadcast_to(network.high, shape)
 
 
 def _sigma_bounds(
@@ -155,6 +194,12 @@ class MixtureActorCritic(nn.Module):
     # built-in ones (see `_sigma_bounds`).
     sigma_min: float | None = None
     sigma_max: float | None = None
+    # Give each component a fixed bucket of the box (see `bucket_bounds`) and
+    # keep its mean inside it: `mean = lo_k + (hi_k - lo_k) * sigmoid(raw)`,
+    # starting at the bucket's center. Moving bet mass between regions of the
+    # box is then a change of component weights -- which the categorical head
+    # makes non-locally -- rather than a Gaussian mean crossing the box.
+    bucket_means: bool = False
 
     @nn.compact
     def __call__(
@@ -174,10 +219,19 @@ class MixtureActorCritic(nn.Module):
         means_flat = nn.Dense(
             self.num_components * self.action_dim,
             kernel_init=nn.initializers.zeros,
-            bias_init=_spread_bias_init(self.low, self.high, self.num_components),
+            # Bucketed: a zero raw output is `sigmoid(0) = 1/2`, the bucket's center.
+            bias_init=(
+                nn.initializers.zeros if self.bucket_means
+                else _spread_bias_init(self.low, self.high, self.num_components)
+            ),
             name="means_head",
         )(torso)
         means = means_flat.reshape(self.num_components, self.action_dim)
+        if self.bucket_means:
+            # Inside the box by construction, so `clip_means`' projection below
+            # is the identity and its box penalty is exactly zero.
+            lows, highs = bucket_bounds(self.low, self.high, self.num_components)
+            means = lows + (highs - lows) * jax.nn.sigmoid(means)
         if self.clip_means and project_means:
             means = project_means_to_box(means, self.low, self.high)
 
@@ -383,6 +437,12 @@ def sample_mixture_component(
     probability -- check vs bet, which component -- is untouched. The loss
     corrects for it from `Episode.behavior_eps`; see `behavior_gaussian_log_prob`.
     `None` (the default) is the plain policy, with the same rng stream as before.
+
+    `low`/`high` may also be `(num_components, d)` -- one box per component, as
+    `component_boxes` gives -- and the uniform is then drawn on the drawn
+    component's own box. Under `bucket_means` that keeps exploration local to
+    the bucket: an explored size arrives with the hand composition the policy
+    bets into *that* region, rather than the policy's overall betting mix.
     """
     if explore_eps is None:
         component_key, noise_key = jax.random.split(key)
@@ -400,6 +460,7 @@ def sample_mixture_component(
         mean, scale_trils[index], jax.random.normal(noise_key, mean.shape, dtype=mean.dtype)
     )
     if explore_eps is not None:
+        low, high = component_box(low, high, index)
         uniform = jax.random.uniform(
             uniform_key, mean.shape, dtype=mean.dtype,
             minval=low.astype(mean.dtype), maxval=high.astype(mean.dtype),
@@ -407,6 +468,16 @@ def sample_mixture_component(
         explore = jax.random.uniform(coin_key) < explore_eps
         raw_action = jnp.where(explore, uniform, raw_action)
     return component, raw_action
+
+
+def component_box(
+    low: chex.Array, high: chex.Array, index: chex.Array
+) -> tuple[chex.Array, chex.Array]:
+    """The `(d,)` box of Gaussian component `index`: row `index` of a per-component
+    `(num_components, d)` box, or a shared `(d,)` box as it is."""
+    if low.ndim == 2:
+        return low[index], high[index]
+    return low, high
 
 
 def behavior_gaussian_log_prob(
@@ -661,7 +732,8 @@ def mixture_ppo_loss_from_outputs(
 
     **Off-policy samples.** When `episode.behavior_eps` is set, the continuous
     action was drawn from the exploring behavior policy `mu` (see
-    `sample_mixture_component`) and `low`/`high` must give the box it explored.
+    `sample_mixture_component`) and `low`/`high` must give the box it explored
+    -- shared `(d,)`, or per component `(num_components, d)`.
     The categorical factor was sampled on-policy and is untouched. The Gaussian
     factor uses the decoupled PPO objective: the same clipped surrogate in
     `r = pi_new / pi_old`, weighted by `w = pi_old / mu` -- so the trust region
@@ -702,8 +774,14 @@ def mixture_ppo_loss_from_outputs(
     else:
         if low is None or high is None:
             raise ValueError("an exploring episode needs the policy's box (low, high) to score it")
+        # The box the uniform was drawn on: the drawn component's own, when
+        # `low`/`high` are per component (see `component_boxes`).
+        explored_low, explored_high = component_box(
+            low, high, gaussian_component_index(episode.component, num_atoms)
+        )
         behavior_log_prob = behavior_gaussian_log_prob(
-            old_gaussian_log_prob, episode.raw_action, episode.behavior_eps, low, high
+            old_gaussian_log_prob, episode.raw_action, episode.behavior_eps,
+            explored_low, explored_high,
         )
         is_weight = jnp.exp(old_gaussian_log_prob - behavior_log_prob)
         # `w * min(r A, clip(r) A)`, with `w * r = pi_new / mu` formed directly and
@@ -833,12 +911,13 @@ def mixture_ppo_loss(
     means, mean_box_penalty = projected_means_and_penalty(
         network, raw_means, mean_box_penalty_coef
     )
+    lows, highs = component_boxes(network)
     return mixture_ppo_loss_from_outputs(
         logits, means, scale_trils, value_pred, network.num_atoms, episode, advantage,
         clip_eps, value_coef, category_entropy_coef, gaussian_entropy_coef,
         trpo_category_kl_coef, trpo_gaussian_kl_coef,
         magnet_category_kl_coef, magnet_gaussian_kl_coef, mean_box_penalty,
-        low=network.low, high=network.high,
+        low=lows, high=highs,
     )
 
 
@@ -960,4 +1039,5 @@ def build_mixture_network(hyperparams: MixturePPOHyperparams) -> MixtureActorCri
         max_correlation=hyperparams.max_correlation,
         sigma_min=hyperparams.sigma_min,
         sigma_max=hyperparams.sigma_max,
+        bucket_means=hyperparams.bucket_means,
     )

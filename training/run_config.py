@@ -73,6 +73,14 @@ class NetworkConfig:
     # Best responses built from this config inherit the same bounds.
     sigma_min: float | None = None
     sigma_max: float | None = None
+    # Cut the action box into `num_components` equal buckets (a regular grid,
+    # so a perfect d-th power of components in d dims) and keep each component's
+    # mean inside its own, starting at the center. Shifting bet mass across the
+    # box is then a component-weight change, and every region keeps a component
+    # -- and, with `ppo.explore_eps`, bucket-local exploration -- of its own.
+    # Pair with a `sigma_min` of about a quarter bucket width so each component
+    # keeps covering its bucket. See `training.mixture.MixtureActorCritic`.
+    bucket_means: bool = False
     clip_means: bool = False  # constrain the mean head to the action box; see `MixtureActorCritic`
     # Pulls a mean that drifts out of the box back to its edge; only bites with
     # `clip_means` on. See `training.mixture.mean_box_excess`.
@@ -112,7 +120,8 @@ class PPOConfig:
     # `self_play` only (`discrete_mmd` never draws a Gaussian, so it is inert
     # there). With probability `explore_eps` a drawn
     # Gaussian sample (a bet size) is replaced by a uniform draw on the action
-    # box; the check/bet choice itself is untouched. Each player's loss
+    # box (on the drawn component's bucket under `network.bucket_means`); the
+    # check/bet choice itself is untouched. Each player's loss
     # importance-weights its own exploratory actions back to its policy, while
     # the opponent's exploration is left in: that is what teaches a player how
     # to answer sizes the opponent's policy never plays. Evaluation and

@@ -30,6 +30,7 @@ from games.spaces import HybridAction
 from .mixture import (
     Episode,
     MixtureActorCritic,
+    component_boxes,
     component_to_kind,
     expand_kind_mask,
     sample_mixture_component,
@@ -88,7 +89,8 @@ def build_episode_sampler(
 
     `explore_eps[p]` makes player `p` act from its exploring behavior policy:
     each continuous action it draws is, with that probability, replaced by a
-    uniform draw on its network's box (see `sample_mixture_component`). Any
+    uniform draw on its network's box -- or, under `bucket_means`, on the drawn
+    component's bucket (see `sample_mixture_component`). Any
     nonzero entry records `Episode.behavior_eps`, which switches the loss to its
     importance-weighted form for that player's own decisions. The default
     `(0.0, 0.0)` samples the policies themselves -- what every best response,
@@ -136,11 +138,11 @@ def build_episode_sampler(
             magnet_logits, magnet_means, magnet_scale_trils = magnet
 
             if exploring:
-                # The acting player's rate and box; a padding step's choice is
-                # irrelevant, since the loss weights it to zero.
+                # The acting player's rate and per-component boxes; a padding
+                # step's choice is irrelevant, since the loss weights it to zero.
                 eps = jnp.where(is_first, explore_eps[0], explore_eps[1])
                 low, high = select_by_player(
-                    is_first, (networks[0].low, networks[0].high), (networks[1].low, networks[1].high)
+                    is_first, component_boxes(networks[0]), component_boxes(networks[1])
                 )
                 component, raw_action = sample_mixture_component(
                     logits, means, scale_trils, mask, num_atoms, sample_key,

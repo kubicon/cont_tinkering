@@ -178,7 +178,15 @@ SOLVER_ALIASES: dict[str, str] = {
 SOLVERS: dict[str, dict[str, object]] = {
     # The method under test. `steps * epochs` is the whole budget and the entropy
     # bonus is what keeps the mixture from collapsing onto one bet size early.
+    # Each of the 4 components is confined to its own quarter of the bet range
+    # (mean started at the bucket's center), and exploration is drawn inside the
+    # sampled component's bucket, so off-path sizes stay reachable by a
+    # component-weight change instead of a mean crossing the box. The sigma
+    # floor is ~ a quarter of Kuhn's bucket width (1.75 / 4 / 4), so a component
+    # keeps covering its bucket rather than collapsing to a point.
     "self_play": {
+        "network.bucket_means": True,
+        "network.sigma_min": 0.1,
         "ppo.batch_size": 512
     },
     # Soft-Actor-Critic ablation of self_play: one Gaussian, no KL / magnet

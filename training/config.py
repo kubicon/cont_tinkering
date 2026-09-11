@@ -99,9 +99,13 @@ class MixturePPOHyperparams(PPOHyperparams):
     # `training.gaussian.SIGMA_MIN` below, the action box's width above.
     sigma_min: float | None = None
     sigma_max: float | None = None
+    # One fixed bucket of `[low, high]` per component, its mean kept inside it
+    # and started at its center; see `training.mixture.MixtureActorCritic`.
+    bucket_means: bool = False
     # Off-policy exploration of the continuous action (sequential self-play
     # only): with this probability a drawn Gaussian sample is replaced by a
-    # uniform draw on `[low, high]`, and the loss importance-weights it back to
+    # uniform draw on `[low, high]` (the drawn component's bucket under
+    # `bucket_means`), and the loss importance-weights it back to
     # the policy (see `training.mixture.sample_mixture_component`). 0 disables it.
     explore_eps: float = 0.0
 

@@ -62,7 +62,7 @@ from .br_oracle import br_hyperparams  # noqa: F401  (re-exported: the sequentia
 # -- i.e. for one to be substitutable for the other inside a compiled rollout.
 ARCHITECTURE_FIELDS = (
     "action_dim", "hidden_dims", "activation", "normalization", "num_components",
-    "num_atoms", "full_covariance", "scale_parameterization", "clip_means",
+    "num_atoms", "full_covariance", "scale_parameterization", "clip_means", "bucket_means",
 )
 
 
