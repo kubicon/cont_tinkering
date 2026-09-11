@@ -34,6 +34,7 @@ from .gaussian import (
     scale_param_size,
     scale_tril_from_log_diag,
 )
+from .vtrace import vtrace
 
 SCALE_PARAMETERIZATIONS = ("linear", "log")
 
@@ -375,6 +376,11 @@ class Episode:
     # loss then scores exactly as before; set, it switches the loss to its
     # importance-weighted form (see `behavior_gaussian_log_prob`).
     behavior_eps: chex.Array | None = None
+    # `()` float per decision, sequential rollouts only: player 0's reward for
+    # this row's transition, the terminal payoff included on the episode's last
+    # decision (see `training.sequential_rollout`). What `training.vtrace`
+    # bootstraps from; `reward` is its Monte Carlo sum. `None` on one-shot batches.
+    step_reward: chex.Array | None = None
 
 
 
@@ -500,6 +506,47 @@ def behavior_gaussian_log_prob(
     return jnp.logaddexp(
         jnp.log1p(-explore_eps) + gaussian_log_prob, jnp.log(explore_eps) + log_uniform
     )
+
+
+def hybrid_action_log_prob(
+    logits: chex.Array,
+    means: chex.Array,
+    scale_trils: chex.Array,
+    mask: chex.Array,
+    component: chex.Array,
+    raw_action: chex.Array,
+    num_atoms: int,
+    explore_eps: chex.Array | None = None,
+    low: chex.Array | None = None,
+    high: chex.Array | None = None,
+) -> chex.Array:
+    """`log p(a)` of the hybrid action played, marginalized over the Gaussian that drew it.
+
+    The game only ever sees the action: an atom, or a continuous value. Which
+    Gaussian component produced a continuous value is the sampler's internal
+    coin, so the action's probability sums over it --
+    `sum_k P(k) N_k(raw_action)` over the Gaussian entries -- and a ratio of
+    two such densities is the lower-variance importance weight of the two
+    (`mixture_log_probs` keeps the component-level factors the PPO heads use).
+
+    With `explore_eps` this is the *exploring* behavior's density instead: the
+    component is drawn as the policy says, then its sample is replaced by a
+    uniform draw on `[low, high]` with probability `eps` (see
+    `sample_mixture_component`), so the continuous density becomes
+    `(1 - eps) sum_k P(k) N_k(x) + eps P(continuous) U(x)`. Atoms are never
+    touched by exploration.
+    """
+    log_probs = masked_log_softmax(logits, mask)
+    per_component = jax.vmap(gaussian_log_prob, in_axes=(None, 0, 0))(raw_action, means, scale_trils)
+    continuous = jax.nn.logsumexp(log_probs[num_atoms:] + per_component)
+    if explore_eps is not None:
+        inside = jnp.all((raw_action >= low) & (raw_action <= high))
+        log_uniform = jnp.where(inside, -jnp.sum(jnp.log(high - low)), -jnp.inf)
+        continuous = jnp.logaddexp(
+            jnp.log1p(-explore_eps) + continuous,
+            jnp.log(explore_eps) + jax.nn.logsumexp(log_probs[num_atoms:]) + log_uniform,
+        )
+    return jnp.where(component >= num_atoms, continuous, log_probs[component])
 
 
 def _sample_mixture_one(
@@ -931,6 +978,11 @@ def build_mixture_ppo_loss_fn(
     magnet_gaussian_kl_coef: float,
     mean_box_penalty_coef: float = 0.0,
     shared_obs: bool = False,
+    advantage_estimator: str = "monte_carlo",
+    gamma: float = 1.0,
+    vtrace_lambda: float = 0.95,
+    vtrace_rho_bar: float = 1.0,
+    vtrace_c_bar: float = 1.0,
 ):
     """`player`'s PPO loss over a whole `Episode` batch, one-shot or sequential alike.
 
@@ -963,9 +1015,28 @@ def build_mixture_ppo_loss_fn(
     -- so it is purely a saving, but it is silently *wrong* if the
     observations actually differ, hence off by default (and never right for a
     sequential game, whose whole point is a per-infoset observation).
+
+    `advantage_estimator` picks where the advantage and the value target come from:
+
+      * `"monte_carlo"` -- the recorded return, `reward - value`, with the value
+        head regressed on `reward`. No bootstrapping; what every run did before.
+      * `"vtrace"` -- V-trace over the player's own decisions (`training.vtrace`),
+        recomputed at every epoch from the *current* parameters: `V` is the
+        current value head and `rho = pi / mu` is the current policy's marginal
+        action probability over the behavior policy's (the recorded sampling-time
+        policy, with its `explore_eps` exploration if any; see
+        `hybrid_action_log_prob`). The PPO surrogate gets the V-trace advantage
+        and the value head regresses on `v_s`. Sequential batches only -- a
+        one-shot batch has no time axis to bootstrap along.
     """
     if player not in (0, 1):
         raise ValueError(f"player must be 0 or 1, got {player}")
+    if advantage_estimator not in ("monte_carlo", "vtrace"):
+        raise ValueError(
+            f"advantage_estimator must be 'monte_carlo' or 'vtrace', got {advantage_estimator!r}"
+        )
+    if advantage_estimator == "vtrace" and shared_obs:
+        raise ValueError("advantage_estimator='vtrace' needs per-decision observations; shared_obs is one-shot only")
 
     coefs = (
         category_entropy_coef, gaussian_entropy_coef,
@@ -982,6 +1053,9 @@ def build_mixture_ppo_loss_fn(
         entropy_coef: float,
     ) -> tuple[chex.Array, dict[str, chex.Array]]:
         del entropy_coef
+
+        if advantage_estimator == "vtrace":
+            return vtrace_loss(params, network, batch, clip_eps, value_coef)
 
         weight = player_weight(batch, player)
         # Normalized over the player's own decisions, across the whole batch:
@@ -1018,6 +1092,79 @@ def build_mixture_ppo_loss_fn(
         metrics = jax.tree_util.tree_map(lambda m: masked_mean(m, flat_weight), metrics)
         if batch.actor.ndim > 1:
             metrics["decisions_per_episode"] = jnp.mean(jnp.sum(weight, axis=-1))
+        return loss, metrics
+
+    def vtrace_loss(params, network, batch, clip_eps, value_coef):
+        if batch.actor.ndim != 2 or batch.step_reward is None:
+            raise ValueError(
+                "advantage_estimator='vtrace' needs a sequential (num_envs, max_steps) batch with "
+                "step_reward recorded; see training.sequential_rollout"
+            )
+        weight = player_weight(batch, player)
+        flat = flatten_batch_axes(batch)
+        flat_weight = weight.reshape(-1)
+        low, high = network.low, network.high
+
+        # One forward pass per decision; the V-trace targets and the loss both read it.
+        logits, raw_means, scale_trils, value_pred = jax.vmap(
+            lambda obs: network.apply(params, obs, project_means=False)
+        )(flat.obs)
+        means, mean_box_penalty = jax.vmap(
+            lambda raw: projected_means_and_penalty(network, raw, mean_box_penalty_coef)
+        )(raw_means)
+
+        # `log pi(a) - log mu(a)`: the current policy against the one that sampled.
+        target_log_prob = jax.vmap(
+            hybrid_action_log_prob, in_axes=(0, 0, 0, 0, 0, 0, None)
+        )(logits, means, scale_trils, flat.action_mask, flat.component, flat.raw_action,
+          network.num_atoms)
+        if flat.behavior_eps is None:
+            behavior_log_prob = jax.vmap(
+                hybrid_action_log_prob, in_axes=(0, 0, 0, 0, 0, 0, None)
+            )(flat.logits, flat.means, flat.scale_trils, flat.action_mask, flat.component,
+              flat.raw_action, network.num_atoms)
+        else:
+            behavior_log_prob = jax.vmap(
+                hybrid_action_log_prob, in_axes=(0, 0, 0, 0, 0, 0, None, 0, None, None)
+            )(flat.logits, flat.means, flat.scale_trils, flat.action_mask, flat.component,
+              flat.raw_action, network.num_atoms, flat.behavior_eps, low, high)
+        log_rhos = (target_log_prob - behavior_log_prob).reshape(weight.shape)
+
+        sign = 1.0 if player == 0 else -1.0
+        targets = vtrace(
+            own=weight > 0,
+            rewards=sign * batch.step_reward,
+            values=value_pred.reshape(weight.shape),
+            log_rhos=log_rhos,
+            gamma=gamma,
+            lambda_=vtrace_lambda,
+            rho_bar=vtrace_rho_bar,
+            c_bar=vtrace_c_bar,
+        )
+        targets = jax.tree_util.tree_map(jax.lax.stop_gradient, targets)
+        flat_advantage = normalized_advantage(targets.pg_advantage, weight).reshape(-1)
+        # The value head regresses on `reward`; here that is the V-trace target.
+        scored = flat.replace(reward=targets.vs.reshape(-1))
+
+        def per_sample(logits, means, scale_trils, value_pred, episode, adv, penalty):
+            return mixture_ppo_loss_from_outputs(
+                logits, means, scale_trils, value_pred, network.num_atoms, episode, adv,
+                clip_eps, value_coef, *coefs, penalty, low=low, high=high,
+            )
+
+        per_sample_loss, metrics = jax.vmap(per_sample)(
+            logits, means, scale_trils, value_pred, scored, flat_advantage, mean_box_penalty
+        )
+        loss = masked_mean(per_sample_loss, flat_weight)
+        metrics = jax.tree_util.tree_map(lambda m: masked_mean(m, flat_weight), metrics)
+        metrics["decisions_per_episode"] = jnp.mean(jnp.sum(weight, axis=-1))
+        # How off-policy the batch is: the untruncated ratio and how often it is cut.
+        raw_rho = jnp.exp(jnp.minimum(log_rhos, 20.0)).reshape(-1)
+        metrics["vtrace_rho"] = masked_mean(raw_rho, flat_weight)
+        metrics["vtrace_rho_clip_frac"] = masked_mean(
+            (raw_rho > vtrace_rho_bar).astype(jnp.float32), flat_weight
+        )
+        metrics["vtrace_target"] = masked_mean(targets.vs.reshape(-1), flat_weight)
         return loss, metrics
 
     return loss_fn

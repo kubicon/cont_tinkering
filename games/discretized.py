@@ -172,6 +172,9 @@ class DiscretizedSequentialGame(SequentialZeroSumGame):
     def payoff(self, state: State) -> chex.Array:
         return self.game.payoff(state)
 
+    def reward(self, state: State, action: HybridAction, next_state: State) -> chex.Array:
+        return self.game.reward(state, self.base_action(state, action), next_state)
+
     def _step(self, state: State, action: HybridAction, key: chex.PRNGKey) -> State:
         """Translate a grid kind back into the wrapped game's continuous action."""
         return self.game.step(state, self.base_action(state, action), key)

@@ -17,6 +17,7 @@ import dataclasses
 import jax.numpy as jnp
 
 from .base import ZeroSumGame
+from .disk_sumo import DiskSumo
 from .examples import (
     AllPayAuctionGame,
     AsymmetricWellGame,
@@ -29,6 +30,7 @@ from .examples import (
     DecoyWellGame,
     ForsakenGame,
     GlicksbergGrossGame,
+    SilentDuelGame,
     MultiDimDecoyWellGame,
     MultiPointGame,
     QuadraticAsymmetricGame,
@@ -277,6 +279,38 @@ class SequentialBlottoConfig:
 
 
 @dataclasses.dataclass
+class DiskSumoConfig:
+    """Two disks pushing each other out of a ring -- a sequential game with physics.
+
+    Each control step is two decisions (see `games.disk_sumo`), so a bout is up
+    to `2 * horizon` decisions long, all sharing one terminal payoff. There is no
+    exact best response; measure checkpoints with `best_response.py`.
+    """
+
+    horizon: int = 50
+    ring_radius: float = 1.0
+    disk_radius: float = 0.15
+    start_distance: float = 0.6
+    start_jitter: float = 0.05
+    random_orientation: bool = True
+    egocentric: bool = True
+    dt: float = 0.1
+    substeps: int = 10
+    mass: float = 1.0
+    max_force: float = 1.0
+    drag: float = 1.0
+    stiffness: float = 100.0
+    contact_damping: float = 5.0
+    # Timeout tie-breaker weight on the distance-from-centre gap; 0 is pure sumo.
+    margin_weight: float = 0.0
+    # Dense potential-based shaping on the same distance gap; 0 is terminal-only.
+    shaping_weight: float = 0.0
+
+    def build(self) -> SequentialZeroSumGame:
+        return DiskSumo(**dataclasses.asdict(self))
+
+
+@dataclasses.dataclass
 class AllPayAuctionConfig:
     value: float = 0.5
     high: float = 1.0
@@ -306,6 +340,15 @@ class GlicksbergGrossConfig:
         return GlicksbergGrossGame()
 
 
+@dataclasses.dataclass
+class SilentDuelConfig:
+    exponent: float = 1.0
+    sharpness: float | None = None   # null keeps the hard rule, and the exact equilibrium
+
+    def build(self) -> ZeroSumGame:
+        return SilentDuelGame(exponent=self.exponent, sharpness=self.sharpness)
+
+
 GAME_CONFIGS: dict[str, type] = {
     "matching_pennies": MatchingPenniesConfig,
     "matching_pennies_shifted": MatchingPenniesShiftedConfig,
@@ -321,8 +364,10 @@ GAME_CONFIGS: dict[str, type] = {
     "all_pay_auction": AllPayAuctionConfig,
     "circle": CircleConfig,
     "glicksberg_gross": GlicksbergGrossConfig,
+    "silent_duel": SilentDuelConfig,
     "multidim_decoy_well": MultiDimDecoyWellConfig,
     "kuhn": KuhnConfig,
     "leduc": LeducConfig,
     "sequential_blotto": SequentialBlottoConfig,
+    "disk_sumo": DiskSumoConfig,
 }
