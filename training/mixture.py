@@ -533,18 +533,22 @@ def hybrid_action_log_prob(
     component is drawn as the policy says, then its sample is replaced by a
     uniform draw on `[low, high]` with probability `eps` (see
     `sample_mixture_component`), so the continuous density becomes
-    `(1 - eps) sum_k P(k) N_k(x) + eps P(continuous) U(x)`. Atoms are never
-    touched by exploration.
+    `(1 - eps) sum_k P(k) N_k(x) + eps sum_k P(k) U_k(x)`, where `U_k` is the
+    uniform on component `k`'s box -- one shared box (`(d,)`) or its own
+    bucket (`(num_components, d)`, as `component_boxes` gives). With a shared
+    box the second sum is `eps P(continuous) U(x)`. Atoms are never touched by
+    exploration.
     """
     log_probs = masked_log_softmax(logits, mask)
     per_component = jax.vmap(gaussian_log_prob, in_axes=(None, 0, 0))(raw_action, means, scale_trils)
     continuous = jax.nn.logsumexp(log_probs[num_atoms:] + per_component)
     if explore_eps is not None:
-        inside = jnp.all((raw_action >= low) & (raw_action <= high))
-        log_uniform = jnp.where(inside, -jnp.sum(jnp.log(high - low)), -jnp.inf)
+        lows, highs = jnp.broadcast_to(low, means.shape), jnp.broadcast_to(high, means.shape)
+        inside = jnp.all((raw_action >= lows) & (raw_action <= highs), axis=-1)
+        log_uniform = jnp.where(inside, -jnp.sum(jnp.log(highs - lows), axis=-1), -jnp.inf)
         continuous = jnp.logaddexp(
             jnp.log1p(-explore_eps) + continuous,
-            jnp.log(explore_eps) + jax.nn.logsumexp(log_probs[num_atoms:]) + log_uniform,
+            jnp.log(explore_eps) + jax.nn.logsumexp(log_probs[num_atoms:] + log_uniform),
         )
     return jnp.where(component >= num_atoms, continuous, log_probs[component])
 
@@ -1103,7 +1107,8 @@ def build_mixture_ppo_loss_fn(
         weight = player_weight(batch, player)
         flat = flatten_batch_axes(batch)
         flat_weight = weight.reshape(-1)
-        low, high = network.low, network.high
+        # Per component: under `bucket_means` exploration is bucket-local.
+        low, high = component_boxes(network)
 
         # One forward pass per decision; the V-trace targets and the loss both read it.
         logits, raw_means, scale_trils, value_pred = jax.vmap(
