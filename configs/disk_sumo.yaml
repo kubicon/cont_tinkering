@@ -46,25 +46,26 @@ game:
 
 network:
   policy: gaussian_mixture  # the only policy a sequential game supports
-  hidden_dims: [64, 64]
+  hidden_dims: [128, 128]
   activation: gelu
   normalization: rms_norm
-  num_components: 3
+  num_components: 4
   # Per-component covariance. The action is 2-D, so a full covariance can tilt a
   # component's ellipse; diagonal keeps it axis-aligned.
   full_covariance: false
   scale_parameterization: log   # "log" or "linear"
   max_correlation: 0.0          # full_covariance + log only; 0 = unbounded
-  sigma_min: null               # null = built-in floor (1e-3)
+  sigma_min: 0.1               # null = built-in floor (1e-3)
   sigma_max: null               # null = box width
-  # Confine each component to its own bucket of the box (num_components must be
-  # a perfect square in 2-D: 1, 4, 9, ...). Pair with sigma_min ~ bucket/4.
-  bucket_means: false
+  # Confine each component to its own bucket of the box (equal-area boxes, any
+  # num_components; a regular grid for 1, 4, 9, ...). Pair with sigma_min ~
+  # bucket/4, a bucket being ~ box width / sqrt(num_components) across.
+  bucket_means: true
   clip_means: true        # keep the means in the [-1, 1]^2 force box
   mean_box_penalty_coef: 1.0    # pulls drifted means back to the box edge
 
 optimizer:
-  learning_rate: 0.003
+  learning_rate: 0.0003
   max_grad_norm: 0.5
   optimizer: adam         # see training/optimizers.py for the choices
   weight_decay: 0.0       # only used by adamw / muon
@@ -75,7 +76,7 @@ ppo:
   batch_size: 512
   ppo_epochs: 1
   target_tau: 0.001
-  magnet_interval: 300
+  magnet_interval: 4000
 
   # With this probability a sampled force is replaced by a uniform draw on the
   # box (on the component's bucket under `network.bucket_means`); V-trace
@@ -103,7 +104,7 @@ ppo:
 
 train:
   mode: self_play         # the only mode a sequential game supports
-  steps: 40               # outer steps: each logs and writes a checkpoint
-  epochs: 400             # training iterations per outer step
+  steps: 100               # outer steps: each logs and writes a checkpoint
+  epochs: 4000             # training iterations per outer step
   checkpoint_dir: data/disk_sumo
   seed: 0

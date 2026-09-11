@@ -56,8 +56,30 @@ def test_two_dimensional_buckets_form_a_grid():
     cells = {(float(lo[0]), float(lo[1])) for lo in lows}
     assert cells == {(0.0, 0.0), (0.0, 0.5), (0.5, 0.0), (0.5, 0.5)}
     np.testing.assert_allclose(highs - lows, 0.5)
-    with pytest.raises(ValueError, match="perfect"):
-        bucket_bounds(jnp.zeros(2), jnp.ones(2), 3)
+
+
+@pytest.mark.parametrize("action_dim, num_components", [
+    (2, 2), (2, 3), (2, 5), (2, 7), (2, 8), (3, 2), (3, 5), (3, 27),
+])
+def test_any_number_of_buckets_tiles_the_box_in_equal_volumes(action_dim, num_components):
+    low, high = jnp.full(action_dim, -1.0), jnp.full(action_dim, 1.0)
+    lows, highs = bucket_bounds(low, high, num_components)
+    assert lows.shape == highs.shape == (num_components, action_dim)
+    assert bool(jnp.all((lows >= low) & (highs <= high) & (highs > lows)))
+    # Equal volumes adding up to the box's, and no two buckets overlap: a tiling.
+    volumes = jnp.prod(highs - lows, axis=-1)
+    np.testing.assert_allclose(volumes, 2.0 ** action_dim / num_components, rtol=1e-5)
+    overlap = jnp.prod(jnp.clip(
+        jnp.minimum(highs[:, None], highs[None]) - jnp.maximum(lows[:, None], lows[None]), 0.0,
+    ), axis=-1)
+    np.testing.assert_allclose(overlap - jnp.diag(volumes), 0.0, atol=1e-6)
+
+
+def test_three_buckets_in_two_dimensions():
+    lows, highs = bucket_bounds(jnp.zeros(2), jnp.ones(2), 3)
+    # Two side by side over the first two thirds of axis 0, one across the rest.
+    np.testing.assert_allclose(lows, [[0.0, 0.0], [0.0, 0.5], [2 / 3, 0.0]], atol=1e-6)
+    np.testing.assert_allclose(highs, [[2 / 3, 0.5], [2 / 3, 1.0], [1.0, 1.0]], atol=1e-6)
 
 
 def test_means_start_at_bucket_centers():

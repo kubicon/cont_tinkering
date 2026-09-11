@@ -61,30 +61,47 @@ def _spread_bias_init(low: chex.Array, high: chex.Array, num_components: int) ->
     return init_fn
 
 
+def _unit_buckets(num_buckets: int, action_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    """`(lows, highs)`, each `(num_buckets, action_dim)`: `[0, 1]^d` cut into equal-volume boxes.
+
+    The first axis is cut into `round(num_buckets ** (1 / d))` slabs, the
+    buckets dealt out among them as evenly as possible (the extra ones to the
+    first slabs), each slab as thick as its share of the buckets; every slab is
+    then cut the same way along the remaining axes.
+    """
+    if action_dim == 1:
+        edges = np.arange(num_buckets + 1) / num_buckets
+        return edges[:-1, None], edges[1:, None]
+    num_slabs = min(num_buckets, max(1, round(num_buckets ** (1.0 / action_dim))))
+    counts = [
+        num_buckets // num_slabs + (i < num_buckets % num_slabs) for i in range(num_slabs)
+    ]
+    edges = np.concatenate([[0], np.cumsum(counts)]) / num_buckets
+    lows, highs = [], []
+    for count, slab_lo, slab_hi in zip(counts, edges[:-1], edges[1:]):
+        sub_lows, sub_highs = _unit_buckets(count, action_dim - 1)
+        lows.append(np.concatenate([np.full((count, 1), slab_lo), sub_lows], axis=1))
+        highs.append(np.concatenate([np.full((count, 1), slab_hi), sub_highs], axis=1))
+    return np.concatenate(lows), np.concatenate(highs)
+
+
 def bucket_bounds(
     low: chex.Array, high: chex.Array, num_components: int
 ) -> tuple[chex.Array, chex.Array]:
     """`(lows, highs)`, each `(num_components, d)`: the box cut into one bucket per component.
 
-    The buckets are a regular grid, `n` equal slices per axis with `n ** d ==
-    num_components`, components in row-major order over it -- so for the usual
-    one-dimensional bet size, component `k` owns the `k`-th of `num_components`
-    equal intervals of `[low, high]`, exactly the cells `_spread_bias_init`
-    centers the unbucketed means in.
+    Any `num_components` works: the buckets are equal-volume boxes tiling the
+    box (see `_unit_buckets`), components in row-major order over them. When
+    `num_components` is a perfect `d`-th power, `n ** d`, they are the regular
+    grid of `n` equal slices per axis -- so for the usual one-dimensional bet
+    size, component `k` owns the `k`-th of `num_components` equal intervals of
+    `[low, high]`, exactly the cells `_spread_bias_init` centers the
+    unbucketed means in. Otherwise the buckets are uneven in shape (e.g. 3 in
+    2-D: two side by side over two thirds of the box, one across the rest).
     """
-    action_dim = low.shape[0]
-    per_axis = round(num_components ** (1.0 / action_dim))
-    if per_axis ** action_dim != num_components:
-        raise ValueError(
-            f"bucket_means needs num_components to be a perfect {action_dim}-th power "
-            f"(one grid of buckets over the {action_dim}-d box), got {num_components}"
-        )
-    cells = np.stack(
-        np.unravel_index(np.arange(num_components), (per_axis,) * action_dim), axis=-1
-    )  # (num_components, d) grid index of each component's bucket
-    width = (high - low) / per_axis
-    lows = low[None, :] + cells * width[None, :]
-    return lows, lows + width[None, :]
+    unit_lows, unit_highs = _unit_buckets(num_components, low.shape[0])
+    width = (high - low)[None, :]
+    return low[None, :] + unit_lows * width, low[None, :] + unit_highs * width
 
 
 def component_boxes(network: "MixtureActorCritic") -> tuple[chex.Array, chex.Array]:
