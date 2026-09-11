@@ -11,8 +11,11 @@ step between sampling and the loss.
 
 The episode's payoff to player 0 is returned *alongside* the `Episode` rather
 than stored in it: it is one number for the whole trajectory, not a per-decision
-field, and `Episode.reward` already carries it on every row, signed for whoever
-acted there.
+field. Per row, `Episode.step_reward` holds player 0's reward for that row's
+transition (the game's optional dense `reward`, plus the terminal payoff on the
+last decision), and `Episode.reward` the Monte Carlo return from that row on,
+signed for whoever acted there -- with a terminal-only game, the leaf value on
+every row. `training.vtrace` bootstraps from `step_reward` instead.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from games.sequential import SequentialZeroSumGame, select_by_player
+from games.sequential import TERMINAL, SequentialZeroSumGame, select_by_player
 from games.spaces import HybridAction
 
 from .mixture import (
@@ -161,16 +164,18 @@ def build_episode_sampler(
                     is_first, spaces[0].box.clip(raw_action), spaces[1].box.clip(raw_action)
                 )
 
-            next_state = game.step(
-                state, HybridAction(kind=action_kind, value=action_value), transition_key
-            )
+            action = HybridAction(kind=action_kind, value=action_value)
+            next_state = game.step(state, action, transition_key)
+            step_reward = jnp.where(
+                actor == TERMINAL, 0.0, game.reward(state, action, next_state)
+            ).astype(jnp.float32)
             record = dict(
                 actor=actor, obs=obs, action_mask=mask,
                 logits=logits, means=means, scale_trils=scale_trils,
                 magnet_logits=magnet_logits, magnet_means=magnet_means,
                 magnet_scale_trils=magnet_scale_trils, component=component,
                 raw_action=raw_action, action_kind=action_kind,
-                action_value=action_value, value=value,
+                action_value=action_value, value=value, step_reward=step_reward,
             )
             if exploring:
                 record["behavior_eps"] = eps
@@ -180,10 +185,21 @@ def build_episode_sampler(
         step_keys = jax.random.split(scan_key, game.max_steps)
         final_state, record = jax.lax.scan(step, game.initial_state(init_key), step_keys)
 
-        # Terminal-only payoff, so every decision in the episode shares one
-        # return: the leaf value, signed for whoever made that decision.
-        payoff = game.payoff(final_state)
-        reward = jnp.where(record["actor"] == 0, payoff, -payoff)
+        # The terminal payoff is credited to the last real decision: the row
+        # whose transition ended the episode. (Decisions are a prefix of the
+        # scan -- once terminal, a state stays terminal.)
+        # `payoff` is the episode's total to player 0: dense rewards plus leaf.
+        terminal_payoff = game.payoff(final_state)
+        payoff = jnp.sum(record["step_reward"]) + terminal_payoff
+        num_decisions = jnp.sum(record["actor"] != TERMINAL)
+        last_decision = jax.nn.one_hot(num_decisions - 1, game.max_steps, dtype=jnp.float32)
+        record["step_reward"] = record["step_reward"] + last_decision * terminal_payoff
+
+        # The Monte Carlo return of each decision: player 0's rewards-to-go from
+        # that row on, signed for whoever made it. With no per-step rewards this
+        # is the one leaf value, shared by every decision in the episode.
+        to_go = jnp.cumsum(record["step_reward"][::-1])[::-1]
+        reward = jnp.where(record["actor"] == 0, to_go, -to_go)
         return Episode(**record, reward=reward), payoff
 
     return sample_episode

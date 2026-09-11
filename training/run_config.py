@@ -119,6 +119,20 @@ class PPOConfig:
     # checkpoints are the policy alone. Best responses never explore. 0 disables.
     explore_eps: float = 0.0
 
+    # Advantage estimator. "monte_carlo" regresses on the episode's return and
+    # never bootstraps; "vtrace" (sequential games only) bootstraps along each
+    # player's own decisions with V-trace, importance-weighting its own
+    # (possibly exploring) actions back to the current policy -- the opponent's
+    # moves, exploration included, are treated as environment. `gamma` discounts
+    # per own decision (1 keeps the zero-sum objective); `vtrace_lambda` < 1 is
+    # what reduces the variance; `vtrace_rho_bar` / `vtrace_c_bar` truncate the
+    # importance weights in the TD errors and in the traces.
+    advantage: str = "monte_carlo"
+    gamma: float = 1.0
+    vtrace_lambda: float = 0.95
+    vtrace_rho_bar: float = 1.0
+    vtrace_c_bar: float = 1.0
+
     # Entropy bonus, split per head.
     category_entropy_coef: float = 0.1
     gaussian_entropy_coef: float = 0.1
@@ -333,6 +347,25 @@ def _build_dataclass(cls: type, data: dict) -> Any:
     return cls(**data)
 
 
+ADVANTAGES = ("monte_carlo", "vtrace")
+
+
+def _check_advantage(ppo: PPOConfig) -> PPOConfig:
+    """Coerce the V-trace constants to floats and reject impossible ones."""
+    if ppo.advantage not in ADVANTAGES:
+        raise ValueError(f"unknown ppo.advantage {ppo.advantage!r}, choices: {list(ADVANTAGES)}")
+    values = {name: float(getattr(ppo, name))
+              for name in ("gamma", "vtrace_lambda", "vtrace_rho_bar", "vtrace_c_bar")}
+    if not 0.0 < values["gamma"] <= 1.0:
+        raise ValueError(f"ppo.gamma must lie in (0, 1], got {values['gamma']}")
+    if not 0.0 <= values["vtrace_lambda"] <= 1.0:
+        raise ValueError(f"ppo.vtrace_lambda must lie in [0, 1], got {values['vtrace_lambda']}")
+    for name in ("vtrace_rho_bar", "vtrace_c_bar"):
+        if values[name] <= 0.0:
+            raise ValueError(f"ppo.{name} must be positive, got {values[name]}")
+    return dataclasses.replace(ppo, **values)
+
+
 def _check_sigma_bounds(network: NetworkConfig) -> NetworkConfig:
     """Coerce `sigma_min` / `sigma_max` to floats and reject impossible bounds.
 
@@ -386,6 +419,7 @@ def run_config_from_dict(raw: dict) -> RunConfig:
     if not 0.0 <= float(ppo.explore_eps) < 1.0:
         raise ValueError(f"ppo.explore_eps must lie in [0, 1), got {ppo.explore_eps}")
     ppo = dataclasses.replace(ppo, explore_eps=float(ppo.explore_eps))
+    ppo = _check_advantage(ppo)
 
     train = _build_dataclass(TrainConfig, raw.get("train", {}) or {})
     if train.solver not in SOLVERS:

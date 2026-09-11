@@ -135,10 +135,14 @@ def test_recorded_players_match_an_independent_replay_of_the_tree():
 
 
 def test_reward_is_the_terminal_payoff_signed_for_whoever_acted():
-    """No bootstrapping: every decision in an episode shares the one leaf value."""
+    """Terminal-only game: every decision in an episode shares the one leaf value.
+
+    (Padding rows carry no return; they are weighted out of every loss.)
+    """
     _, _, _, _, batch, payoff = _setup()
+    live = batch.actor != TERMINAL
     expected = jnp.where(batch.actor == 0, payoff[:, None], -payoff[:, None])
-    np.testing.assert_allclose(batch.reward, expected, rtol=1e-6)
+    np.testing.assert_allclose(batch.reward[live], expected[live], rtol=1e-6)
 
 
 def test_only_legal_kinds_are_ever_played():

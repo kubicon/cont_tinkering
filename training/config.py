@@ -104,6 +104,15 @@ class MixturePPOHyperparams(PPOHyperparams):
     # uniform draw on `[low, high]`, and the loss importance-weights it back to
     # the policy (see `training.mixture.sample_mixture_component`). 0 disables it.
     explore_eps: float = 0.0
+    # Where the advantage comes from (see `training.mixture.build_mixture_ppo_loss_fn`):
+    # "monte_carlo" (the recorded return, no bootstrapping) or "vtrace"
+    # (sequential games only; `training.vtrace`). `gamma` discounts per own
+    # decision; `vtrace_lambda` < 1 is what buys the variance reduction.
+    advantage: str = "monte_carlo"
+    gamma: float = 1.0
+    vtrace_lambda: float = 0.95
+    vtrace_rho_bar: float = 1.0
+    vtrace_c_bar: float = 1.0
 
     # Target/magnet parameter tracking (see `training.mixture_trainer.MixtureTrainState`).
     target_tau: float = 0.005  # Polyak-averaging coefficient for `target_params`.

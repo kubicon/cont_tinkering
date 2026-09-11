@@ -1,0 +1,303 @@
+"""Checks for `training.vtrace` and the `advantage="vtrace"` branch of the mixture loss.
+
+Three layers. The associative-scan recurrence against a plain Python loop; the
+V-trace targets against a direct transcription of Espeholt et al.'s definition
+on the player's own decisions (compacted out of the interleaved rows), plus its
+two textbook limits -- Monte Carlo at `lambda = 1` on-policy, TD(0) at
+`lambda = 0`; and the loss itself, which on-policy with `lambda = 1` has to
+reproduce the Monte Carlo loss *exactly*, gradients included.
+"""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from games.disk_sumo import DiskSumo
+from games.sequential import TERMINAL
+from games.sequential_examples import ContinuousKuhnPoker
+from training.config import MixturePPOHyperparams
+from training.mixture import (
+    build_mixture_network,
+    build_mixture_ppo_loss_fn,
+    hybrid_action_log_prob,
+)
+from training.run_config import run_config_from_dict
+from training.sequential_rollout import build_episode_sampler, collect_sequential_batch
+from training.vtrace import reverse_linear_recurrence, vtrace
+
+NUM_ENVS = 64
+
+
+# ---- the recurrence ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape", [(9,), (4, 13), (2, 3, 16)])
+def test_reverse_linear_recurrence_matches_a_loop(shape):
+    rng = np.random.default_rng(0)
+    a, b = rng.normal(size=shape), rng.normal(size=shape)
+    expected = np.zeros(shape)
+    acc = np.zeros(shape[:-1])
+    for t in reversed(range(shape[-1])):
+        acc = b[..., t] + a[..., t] * acc
+        expected[..., t] = acc
+    got = reverse_linear_recurrence(jnp.asarray(a), jnp.asarray(b))
+    np.testing.assert_allclose(np.asarray(got), expected, rtol=1e-5, atol=1e-5)
+
+
+# ---- the targets -------------------------------------------------------------
+
+
+def _reference(own, rewards, values, log_rhos, gamma, lambda_, rho_bar, c_bar):
+    """V-trace straight from the definition, on one episode's own decisions."""
+    T = len(own)
+    idx = [t for t in range(T) if own[t]]
+    vs, adv = np.zeros(T), np.zeros(T)
+    if not idx:
+        return vs, adv
+    bounds = idx[1:] + [T]
+    seg = [rewards[s:e].sum() for s, e in zip(idx, bounds)]
+    V = [values[s] for s in idx] + [0.0]
+    ratio = [np.exp(log_rhos[s]) for s in idx]
+    rho = [min(rho_bar, r) for r in ratio]
+    c = [lambda_ * min(c_bar, r) for r in ratio]
+    n = len(idx)
+    v = [0.0] * (n + 1)  # v[n] = 0: nothing past the last decision
+    for k in reversed(range(n)):
+        delta = rho[k] * (seg[k] + gamma * V[k + 1] - V[k])
+        v[k] = V[k] + delta + gamma * c[k] * (v[k + 1] - V[k + 1])
+    for k, s in enumerate(idx):
+        vs[s] = v[k]
+        adv[s] = seg[k] + gamma * v[k + 1] - V[k]
+    return vs, adv
+
+
+def _random_inputs(seed, num_envs=5, T=17):
+    rng = np.random.default_rng(seed)
+    own = rng.random((num_envs, T)) < 0.5
+    # Padding at the end, as a finished episode has.
+    for row in own:
+        row[rng.integers(T // 2, T + 1):] = False
+    rewards = rng.normal(size=(num_envs, T))
+    values = rng.normal(size=(num_envs, T))
+    log_rhos = rng.normal(scale=0.7, size=(num_envs, T))
+    return own, rewards, values, log_rhos
+
+
+@pytest.mark.parametrize("gamma,lambda_,rho_bar,c_bar", [
+    (1.0, 0.95, 1.0, 1.0), (0.9, 0.7, 1.0, 1.0), (1.0, 1.0, 2.0, 0.5), (0.99, 0.0, 1.0, 1.0),
+])
+def test_vtrace_matches_the_definition_on_interleaved_rows(gamma, lambda_, rho_bar, c_bar):
+    own, rewards, values, log_rhos = _random_inputs(seed=1)
+    out = vtrace(jnp.asarray(own), jnp.asarray(rewards), jnp.asarray(values), jnp.asarray(log_rhos),
+                 gamma=gamma, lambda_=lambda_, rho_bar=rho_bar, c_bar=c_bar)
+    for e in range(own.shape[0]):
+        vs, adv = _reference(own[e], rewards[e], values[e], log_rhos[e], gamma, lambda_, rho_bar, c_bar)
+        np.testing.assert_allclose(np.asarray(out.vs[e]), vs, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(np.asarray(out.pg_advantage[e]), adv, rtol=1e-5, atol=1e-5)
+
+
+def test_on_policy_lambda_one_is_the_monte_carlo_return():
+    own, rewards, values, _ = _random_inputs(seed=2)
+    out = vtrace(jnp.asarray(own), jnp.asarray(rewards), jnp.asarray(values),
+                 jnp.zeros(own.shape), gamma=1.0, lambda_=1.0)
+    to_go = np.cumsum(rewards[:, ::-1], axis=1)[:, ::-1]
+    np.testing.assert_allclose(np.asarray(out.vs), np.where(own, to_go, 0.0), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        np.asarray(out.pg_advantage), np.where(own, to_go - values, 0.0), rtol=1e-5, atol=1e-5
+    )
+
+
+def test_lambda_zero_is_one_step_td():
+    own = np.array([[True, False, True, False, True, False, False]])
+    rewards = np.array([[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0]])
+    values = np.array([[1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]])
+    out = vtrace(jnp.asarray(own), jnp.asarray(rewards), jnp.asarray(values),
+                 jnp.zeros(own.shape), gamma=0.5, lambda_=0.0)
+    # R + gamma * V(next own), the opponent's rows' rewards folded into R.
+    expected = [0.3 + 0.5 * 2.0, 0.7 + 0.5 * 3.0, 1.1 + 0.0]
+    np.testing.assert_allclose(np.asarray(out.vs[0, [0, 2, 4]]), expected, rtol=1e-6)
+
+
+def test_truncation_caps_the_importance_weights():
+    own, rewards, values, _ = _random_inputs(seed=3)
+    out = vtrace(jnp.asarray(own), jnp.asarray(rewards), jnp.asarray(values),
+                 jnp.full(own.shape, 5.0), rho_bar=1.5)
+    np.testing.assert_allclose(np.asarray(out.rho), np.where(own, 1.5, 0.0), rtol=1e-6)
+
+
+# ---- the action probability ----------------------------------------------------
+
+
+def test_hybrid_log_prob_sums_over_components_and_ignores_eps_on_atoms():
+    logits = jnp.array([0.3, -0.2, 0.5, 0.1])  # 2 atoms, 2 Gaussians
+    mask = jnp.array([True, True, True, True])
+    means = jnp.array([[0.2], [0.8]])
+    scale_trils = jnp.array([[[0.1]], [[0.3]]])
+    x = jnp.array([0.5])
+    low, high = jnp.array([0.0]), jnp.array([1.0])
+    probs = jax.nn.softmax(logits)
+    normal = jax.scipy.stats.norm.pdf(0.5, means[:, 0], scale_trils[:, 0, 0])
+    expected = jnp.log(jnp.sum(probs[2:] * normal))
+    for component in (2, 3):  # whichever Gaussian drew it, the action's probability is the same
+        got = hybrid_action_log_prob(logits, means, scale_trils, mask, component, x, 2)
+        np.testing.assert_allclose(float(got), float(expected), rtol=1e-5)
+    eps = 0.3
+    explored = hybrid_action_log_prob(logits, means, scale_trils, mask, 2, x, 2, jnp.array(eps), low, high)
+    mixed = (1 - eps) * jnp.exp(expected) + eps * jnp.sum(probs[2:]) * 1.0
+    np.testing.assert_allclose(float(explored), float(jnp.log(mixed)), rtol=1e-5)
+    atom = hybrid_action_log_prob(logits, means, scale_trils, mask, 1, x, 2, jnp.array(eps), low, high)
+    np.testing.assert_allclose(float(atom), float(jnp.log(probs[1])), rtol=1e-5)
+
+
+# ---- the rollout's rewards -------------------------------------------------------
+
+
+def _hyperparams(game, **overrides) -> MixturePPOHyperparams:
+    space = game.action_space(0)
+    base = dict(
+        action_dim=space.box.low.shape[0],
+        hidden_dims=(16,),
+        num_components=2,
+        num_atoms=space.num_atoms,
+        low=tuple(float(v) for v in space.box.low),
+        high=tuple(float(v) for v in space.box.high),
+        num_envs=NUM_ENVS,
+        num_epochs=1,
+        category_entropy_coef=0.05,
+        gaussian_entropy_coef=0.05,
+        trpo_category_kl_coef=0.05,
+        trpo_gaussian_kl_coef=0.05,
+        magnet_category_kl_coef=0.2,
+        magnet_gaussian_kl_coef=0.2,
+    )
+    return MixturePPOHyperparams(**{**base, **overrides})
+
+
+def _batch(game, explore_eps=(0.0, 0.0), seed=0):
+    hyperparams = _hyperparams(game)
+    networks = (build_mixture_network(hyperparams), build_mixture_network(hyperparams))
+    init_0, init_1, state_key, batch_key = jax.random.split(jax.random.PRNGKey(seed), 4)
+    dummy = game.initial_state(state_key)
+    params = (
+        networks[0].init(init_0, game.observation(0, dummy)),
+        networks[1].init(init_1, game.observation(1, dummy)),
+    )
+    sampler = build_episode_sampler(game, *networks, explore_eps=explore_eps)
+    batch, payoff = collect_sequential_batch(
+        sampler, params[0], params[0], params[1], params[1], batch_key, NUM_ENVS
+    )
+    return networks, params, batch, payoff
+
+
+def _sumo():
+    return DiskSumo(horizon=15, shaping_weight=0.5, margin_weight=0.3)
+
+
+def test_step_rewards_sum_to_the_payoff_and_the_monte_carlo_return_is_their_tail():
+    game = _sumo()
+    _, _, batch, payoff = _batch(game)
+    step = np.asarray(batch.step_reward)
+    np.testing.assert_allclose(step.sum(axis=1), np.asarray(payoff), rtol=1e-5, atol=1e-6)
+    assert np.all(step[np.asarray(batch.actor) == TERMINAL] == 0.0)
+    to_go = np.cumsum(step[:, ::-1], axis=1)[:, ::-1]
+    actor = np.asarray(batch.actor)
+    live = actor != TERMINAL
+    expected = np.where(actor == 0, to_go, -to_go)
+    np.testing.assert_allclose(np.asarray(batch.reward)[live], expected[live], rtol=1e-5, atol=1e-6)
+
+
+def test_sumo_shaping_telescopes_into_the_return():
+    """Undiscounted, the dense shaping is `w * (phi(s_T) - phi(s_0))` on top of the payoff."""
+    game = _sumo()
+    unshaped = DiskSumo(horizon=15, shaping_weight=0.0, margin_weight=0.3)
+    policy = (game.random_action_fn(0), game.random_action_fn(1))
+    for seed in range(4):
+        key = jax.random.PRNGKey(seed)
+        final, total = game.play_episode(policy, key)
+        _, leaf = unshaped.play_episode(policy, key)
+        start = game.initial_state(jax.random.split(key)[0])
+        shaping = 0.5 * (game.potential(final) - game.potential(start))
+        assert float(total) == pytest.approx(float(leaf + shaping), abs=1e-5)
+
+
+# ---- the loss ----------------------------------------------------------------------
+
+
+def _loss_fn(player, advantage, **kwargs):
+    return build_mixture_ppo_loss_fn(
+        player, 0.05, 0.05, 0.05, 0.05, 0.2, 0.2, advantage_estimator=advantage, **kwargs
+    )
+
+
+@pytest.mark.parametrize("make_game", [ContinuousKuhnPoker, _sumo])
+@pytest.mark.parametrize("player", [0, 1])
+def test_on_policy_lambda_one_vtrace_is_exactly_the_monte_carlo_loss(make_game, player):
+    game = make_game()
+    networks, params, batch, _ = _batch(game)
+    args = (params[player], networks[player], batch, 0.1, 0.5, 0.0)
+    mc_fn = jax.value_and_grad(_loss_fn(player, "monte_carlo"), has_aux=True)
+    vt_fn = jax.value_and_grad(_loss_fn(player, "vtrace", gamma=1.0, vtrace_lambda=1.0), has_aux=True)
+    (mc_loss, mc_metrics), mc_grads = mc_fn(*args)
+    (vt_loss, vt_metrics), vt_grads = vt_fn(*args)
+    np.testing.assert_allclose(float(vt_loss), float(mc_loss), rtol=1e-4, atol=1e-6)
+    for g_mc, g_vt in zip(jax.tree_util.tree_leaves(mc_grads), jax.tree_util.tree_leaves(vt_grads)):
+        np.testing.assert_allclose(np.asarray(g_vt), np.asarray(g_mc), rtol=1e-3, atol=1e-5)
+    # Sampled by these very parameters: every importance ratio is one.
+    assert float(vt_metrics["vtrace_rho"]) == pytest.approx(1.0, abs=1e-4)
+
+
+@pytest.mark.parametrize("make_game", [ContinuousKuhnPoker, _sumo])
+def test_an_exploring_batch_is_importance_weighted(make_game):
+    game = make_game()
+    networks, params, batch, _ = _batch(game, explore_eps=(0.3, 0.3))
+    loss_fn = jax.value_and_grad(_loss_fn(0, "vtrace"), has_aux=True)
+    (loss, metrics), grads = loss_fn(params[0], networks[0], batch, 0.1, 0.5, 0.0)
+    assert np.isfinite(float(loss))
+    assert all(np.all(np.isfinite(np.asarray(g))) for g in jax.tree_util.tree_leaves(grads))
+    # Exploration moves the ratio off one, and the truncation bites somewhere.
+    assert float(metrics["vtrace_rho_clip_frac"]) > 0.0
+
+
+def test_vtrace_ignores_whatever_sits_on_rows_that_are_not_the_players():
+    """The current value and policy are evaluated on every row; only own rows may count."""
+    game = _sumo()
+    networks, params, batch, _ = _batch(game)
+    fn = _loss_fn(0, "vtrace")
+    base, _ = fn(params[0], networks[0], batch, 0.1, 0.5, 0.0)
+    not_mine = (batch.actor != 0)[..., None]
+    corrupted = batch.replace(obs=jnp.where(not_mine, 50.0, batch.obs))
+    again, _ = fn(params[0], networks[0], corrupted, 0.1, 0.5, 0.0)
+    assert float(again) == pytest.approx(float(base), rel=1e-6)
+
+
+def test_vtrace_on_a_one_shot_batch_is_rejected():
+    game = ContinuousKuhnPoker()
+    networks, params, batch, _ = _batch(game)
+    flat = jax.tree_util.tree_map(lambda x: x.reshape((-1,) + x.shape[2:]), batch)
+    with pytest.raises(ValueError, match="sequential"):
+        _loss_fn(0, "vtrace")(params[0], networks[0], flat, 0.1, 0.5, 0.0)
+
+
+# ---- config ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ppo", [
+    dict(advantage="gae"), dict(advantage="vtrace", gamma=0.0), dict(advantage="vtrace", vtrace_lambda=1.5),
+    dict(advantage="vtrace", vtrace_rho_bar=0.0),
+])
+def test_bad_vtrace_settings_are_rejected(ppo):
+    with pytest.raises(ValueError):
+        run_config_from_dict({"game": {"name": "disk_sumo"}, "ppo": ppo})
+
+
+def test_vtrace_settings_reach_the_hyperparams():
+    import train
+    config = run_config_from_dict({
+        "game": {"name": "disk_sumo"},
+        "ppo": {"advantage": "vtrace", "gamma": 0.99, "vtrace_lambda": 0.8},
+    })
+    hyperparams = train.build_hyperparams(config.game.build(), 0, config)
+    assert (hyperparams.advantage, hyperparams.gamma, hyperparams.vtrace_lambda) == ("vtrace", 0.99, 0.8)

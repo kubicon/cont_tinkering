@@ -35,6 +35,8 @@ def _config(path: str = "configs/kuhn_classic.yaml", policy_override: str | None
         "configs/leduc_classic.yaml",
         "configs/sequential_blotto.yaml",
         "configs/sequential_blotto_br.yaml",
+        "configs/disk_sumo.yaml",
+        "configs/disk_sumo_br.yaml",
     ],
 )
 def test_the_shipped_sequential_configs_load_and_build(path):
@@ -44,11 +46,11 @@ def test_the_shipped_sequential_configs_load_and_build(path):
 
 def test_the_trees_are_registered_alongside_the_one_shot_games():
     """One registry, two kinds of game -- `train.py` tells them apart by type."""
-    assert {"kuhn", "leduc", "sequential_blotto"} <= set(GAME_CONFIGS)
+    assert {"kuhn", "leduc", "sequential_blotto", "disk_sumo"} <= set(GAME_CONFIGS)
     built = {name: cls().build() for name, cls in GAME_CONFIGS.items()}
     sequential = {n for n, g in built.items() if isinstance(g, SequentialZeroSumGame)}
     one_shot = {n for n, g in built.items() if isinstance(g, ZeroSumGame)}
-    assert sequential == {"kuhn", "leduc", "sequential_blotto"}
+    assert sequential == {"kuhn", "leduc", "sequential_blotto", "disk_sumo"}
     assert one_shot == set(GAME_CONFIGS) - sequential
     assert not (sequential & one_shot)  # nothing is both
 

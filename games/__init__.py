@@ -1,6 +1,7 @@
 from .base import ZeroSumGame
+from .disk_sumo import DiskSumo, DiskSumoState
 from .discretized import DiscretizedSequentialGame, base_game, discretize, linear_action_grid
-from .examples import AllPayAuctionGame, CircleGame, GlicksbergGrossGame
+from .examples import AllPayAuctionGame, CircleGame, GlicksbergGrossGame, SilentDuelGame
 from .leduc import ContinuousLeducHoldem, LeducState
 from .kuhn_best_response import (
     KuhnStrategy,
@@ -31,6 +32,7 @@ __all__ = [
     "AllPayAuctionGame",
     "CircleGame",
     "GlicksbergGrossGame",
+    "SilentDuelGame",
     "SequentialZeroSumGame",
     "TERMINAL",
     "DiscretizedSequentialGame",
@@ -40,6 +42,8 @@ __all__ = [
     "ContinuousKuhnPoker",
     "ContinuousSequentialBlotto",
     "BlottoState",
+    "DiskSumo",
+    "DiskSumoState",
     "ContinuousLeducHoldem",
     "KuhnStrategy",
     "analytic_equilibrium",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import chex
+import jax
 import jax.numpy as jnp
 
 from .base import ZeroSumGame
@@ -869,4 +870,139 @@ class GlicksbergGrossGame(ZeroSumGame):
         """
         quantiles = (jnp.arange(num_atoms, dtype=jnp.float32) + 0.5) / num_atoms
         support = jnp.square(jnp.tan(jnp.pi * quantiles / 4))[:, None]
+        return support, jnp.full((num_atoms,), 1.0 / num_atoms)
+
+
+class SilentDuelGame(ZeroSumGame):
+    """The classical silent duel: two duellists, one bullet each, *when* do you fire?
+
+    Both duellists start apart and walk toward each other over a normalized time
+    `t in [0, 1]`. Each carries a single bullet and chooses the instant to fire
+    it; hitting at time `t` has probability `accuracy(t) = t ** exponent`, which
+    is 0 at the start and a certainty at point-blank range. The duel is
+    **silent**: a shot is neither seen nor heard, so nobody learns anything
+    before the game is over and the two firing times are chosen independently --
+    which is why this is a one-shot game with a continuous action rather than an
+    extensive-form one. (Make the shots audible and the mixing disappears: the
+    noisy duel's equilibrium is the pure profile "both fire at `accuracy = 1/2`",
+    because a duellist who is heard to miss is then walked down and executed at
+    `t = 1`.)
+
+    The payoff is the survival difference, `+1` if only player 0 walks away:
+
+        x < y:  accuracy(x) - (1 - accuracy(x)) * accuracy(y)
+        x > y:  (1 - accuracy(y)) * accuracy(x) - accuracy(y)
+        x = y:  accuracy(x) - accuracy(y)                        (both fire at once)
+
+    -- fire first and you win outright with your hit probability, and otherwise
+    you have handed your opponent a free shot. The kernel is antisymmetric, so
+    the game is symmetric and its value is 0.
+
+    **Why it is in this comparison set.** It is the *timing* game, and its
+    tension is one no other game here has: the payoff is discontinuous across
+    the diagonal (the jump is `2 * accuracy(t) ** 2`, so it is worst near
+    point-blank), and moving your shot an instant earlier flips who shoots
+    first. Waiting raises your accuracy and your opponent's in lockstep, so
+    there is no best moment, only a distribution over moments -- and like
+    `AllPayAuctionGame` and `GlicksbergGrossGame`, no finite mixture is a Nash
+    at all. Unlike those two, the density is *unbounded in neither direction but
+    strongly skewed*, finite on a support bounded away from both endpoints, so
+    what it measures is whether a mixture can cover a sharply tilted density on
+    a strict subinterval without smearing mass into the (strictly losing) early
+    region.
+
+    **The equilibrium.** Any strictly increasing accuracy gives the same game
+    reparameterized -- substituting `u = accuracy(t)` maps it onto the
+    `exponent=1` duel exactly, since `accuracy` preserves the order of the two
+    firing times and the payoff depends on the times only through it. The
+    classical `exponent=1` solution (Karlin, *Mathematical Methods and Theory in
+    Games*, vol. 2) is the density `1 / (4 u ** 3)` on `[1/3, 1]`, so in general
+    both players draw
+
+        support  [3 ** (-1 / exponent), 1]
+        density  f(t) = exponent / (4 * t ** (2 * exponent + 1))
+        CDF      F(t) = (9 - t ** (-2 * exponent)) / 8
+
+    with value 0. Nobody fires before their accuracy reaches `1/3`; below that
+    the reply value is `(3 * accuracy(x) - 1) / 2 < 0`, strictly losing rather
+    than merely indifferent.
+
+    **`exponent` is the difficulty knob.** It squeezes the support toward
+    point-blank (`1/3 -> 0.58 -> 0.69` in `t` for `exponent = 1, 2, 3`) while
+    leaving the shape in `u`-space untouched, so it asks a fixed-`K` mixture to
+    resolve the same distribution in a shrinking window.
+
+    **`sharpness` trades the exact equilibrium for a gradient**, exactly as in
+    `AllPayAuctionGame` and `ContinuousBlottoGame`: who fires first becomes
+    `sigmoid(sharpness * (y - x))` rather than an indicator, blending the two
+    branches. The blend is consistent -- at `x == y` it returns the
+    simultaneous-fire payoff for any `sharpness`, and the hard rule is its
+    `sharpness -> inf` limit -- but the smoothed game's equilibrium is only
+    *near* the density above, so a run with `sharpness` set is no longer being
+    measured against it. Default to the hard rule.
+
+    **Measure it with `GridOracle`, not the gradient best response.** Under the
+    hard rule the jump is invisible to `ZeroSumGame.best_response`: against a
+    pure shot at `y`, ascent climbs the `x < y` branch, steps over the jump and
+    rides the `x > y` branch to `t = 1`, which is worth exactly 0 -- so it
+    reports the pure profile `(1/2, 1/2)` as unexploitable when firing an
+    instant earlier wins `1/4`. The grid oracle evaluates the kernel directly
+    and is what `tests/test_continuum_games.py` pins the equilibrium with.
+    """
+
+    def __init__(self, exponent: float = 1.0, sharpness: float | None = None):
+        if exponent <= 0:
+            raise ValueError(f"exponent must be positive, got {exponent}")
+        if sharpness is not None and sharpness <= 0:
+            raise ValueError(f"sharpness must be positive when given, got {sharpness}")
+        self.exponent = exponent
+        self.sharpness = sharpness
+        self._space = box(jnp.zeros(1), jnp.ones(1))
+
+    def action_space(self, player: int) -> ActionSpace:
+        return self._space
+
+    @property
+    def support_low(self) -> float:
+        """Earliest time anybody fires in equilibrium: where `accuracy` reaches `1/3`."""
+        return float(3.0 ** (-1.0 / self.exponent))
+
+    def accuracy(self, time: chex.Array) -> chex.Array:
+        """Probability that a shot fired at `time` hits."""
+        return time**self.exponent
+
+    def payoff(self, action_1: chex.Array, action_2: chex.Array) -> chex.Array:
+        x, y = action_1[..., 0], action_2[..., 0]
+        hit_1, hit_2 = self.accuracy(x), self.accuracy(y)
+
+        # Whoever fires first wins outright on a hit and concedes a free shot on
+        # a miss; the loser's bullet only matters if the first one missed.
+        first_is_1 = hit_1 - (1 - hit_1) * hit_2
+        first_is_2 = (1 - hit_2) * hit_1 - hit_2
+
+        if self.sharpness is None:
+            # Fired at the same instant: both shots are taken, so the payoff is
+            # the plain difference of hit probabilities (and hence 0 here, the
+            # two times being equal -- written out rather than hardcoded so the
+            # tie rule is visible).
+            simultaneous = hit_1 - hit_2
+            return jnp.where(x < y, first_is_1, jnp.where(x > y, first_is_2, simultaneous))
+
+        # `w` is a soft "player 0 fires first", and `w == 1/2` at `x == y`
+        # reproduces the tie rule above.
+        w = jax.nn.sigmoid(self.sharpness * (y - x))
+        return w * first_is_1 + (1 - w) * first_is_2
+
+    def nash_strategy(self, num_atoms: int = 256):
+        """The analytic Nash, discretized at quantile midpoints of `F`.
+
+        `F^{-1}(q) = (9 - 8 q) ** (-1 / (2 * exponent))`, evaluated at
+        `(i + 1/2) / num_atoms`. Quantile midpoints rather than an even grid for
+        the same reason as in `GlicksbergGrossGame`: the density is far heavier
+        at the early end of the support than at point-blank, and quantiles put
+        atoms where the mass is. Exact only for `sharpness=None`; see the class
+        docstring.
+        """
+        quantiles = (jnp.arange(num_atoms, dtype=jnp.float32) + 0.5) / num_atoms
+        support = ((9.0 - 8.0 * quantiles) ** (-1.0 / (2.0 * self.exponent)))[:, None]
         return support, jnp.full((num_atoms,), 1.0 / num_atoms)

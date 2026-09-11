@@ -78,6 +78,11 @@ def build_loss_fn(player: int, hyperparams: MixturePPOHyperparams, shared_obs: b
         hyperparams.magnet_gaussian_kl_coef,
         mean_box_penalty_coef=hyperparams.mean_box_penalty_coef,
         shared_obs=shared_obs,
+        advantage_estimator=hyperparams.advantage,
+        gamma=hyperparams.gamma,
+        vtrace_lambda=hyperparams.vtrace_lambda,
+        vtrace_rho_bar=hyperparams.vtrace_rho_bar,
+        vtrace_c_bar=hyperparams.vtrace_c_bar,
     )
 
 

@@ -86,10 +86,11 @@ def _validate_player(player: int) -> None:
 class SequentialZeroSumGame(abc.ABC):
     """A turn-taking, two-player, zero-sum, imperfect-information game.
 
-    Player 0's payoff is `payoff(terminal_state)`; player 1's is its negation,
-    exactly as in `ZeroSumGame`. Subclasses implement the eight abstract members
-    below; `is_terminal`, `num_kinds`, `step`, `play_episode` and
-    `random_action_fn` are generic machinery built on top of them.
+    Player 0's payoff is `payoff(terminal_state)`, plus the sum of the optional
+    per-transition `reward`s (zero unless a subclass overrides it); player 1's is
+    its negation, exactly as in `ZeroSumGame`. Subclasses implement the eight
+    abstract members below; `is_terminal`, `num_kinds`, `step`, `play_episode`
+    and `random_action_fn` are generic machinery built on top of them.
 
     The rollout contract, in the order a trainer uses it:
 
@@ -174,6 +175,21 @@ class SequentialZeroSumGame(abc.ABC):
     def payoff(self, state: State) -> chex.Array:
         """Player 0's scalar payoff. Only meaningful once `is_terminal(state)`."""
 
+    def reward(self, state: State, action: HybridAction, next_state: State) -> chex.Array:
+        """Player 0's scalar reward for the transition `state --action--> next_state`.
+
+        Optional dense reward on top of the terminal `payoff`: an episode is worth
+        `sum(reward over its transitions) + payoff(terminal state)` to player 0,
+        and minus that to player 1. The default is zero everywhere, which leaves
+        a game terminal-payoff-only.
+
+        Only ever consulted on *non-terminal* `state`s -- the rollouts mask the
+        padding steps a finished episode is carried through -- so it need not be
+        guarded against being called on one.
+        """
+        del state, action, next_state
+        return jnp.zeros((), dtype=jnp.float32)
+
     @abc.abstractmethod
     def _step(self, state: State, action: HybridAction, key: chex.PRNGKey) -> State:
         """Apply `action` at a *non-terminal* `state`, resolving any chance move with `key`.
@@ -227,7 +243,8 @@ class SequentialZeroSumGame(abc.ABC):
             if not callable(action_fn):
                 raise TypeError(f"action_fns[{player}] must be callable")
 
-        def body(state: State, step_key: chex.PRNGKey) -> tuple[State, None]:
+        def body(carry, step_key: chex.PRNGKey):
+            state, total = carry
             key_0, key_1, transition_key = jax.random.split(step_key, 3)
             player = self.current_player(state)
             action_0 = action_fns[0](
@@ -237,12 +254,16 @@ class SequentialZeroSumGame(abc.ABC):
                 self.observation(1, state), self.action_mask(1, state), key_1
             )
             action = select_by_player(player == 0, action_0, action_1)
-            return self.step(state, action, transition_key), None
+            next_state = self.step(state, action, transition_key)
+            reward = jnp.where(player == TERMINAL, 0.0, self.reward(state, action, next_state))
+            return (next_state, total + reward), None
 
         init_key, scan_key = jax.random.split(key)
         keys = jax.random.split(scan_key, self.max_steps)
-        final_state, _ = jax.lax.scan(body, self.initial_state(init_key), keys)
-        return final_state, self.payoff(final_state)
+        (final_state, total), _ = jax.lax.scan(
+            body, (self.initial_state(init_key), jnp.zeros((), dtype=jnp.float32)), keys
+        )
+        return final_state, total + self.payoff(final_state)
 
     def random_action_fn(self, player: int) -> ActionFn:
         """Uniform-random *legal* play for `player`; a baseline opponent and a test fixture."""
