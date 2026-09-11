@@ -70,7 +70,15 @@ def test_the_policy_reads_its_shape_off_the_game_and_the_shared_network_block(se
 
 def test_the_same_noise_gives_the_same_action_and_different_noise_does_not(setup):
     """Implicit, not stochastic: every bit of randomness enters through `z`."""
-    game, _, hyperparams, policy, params = setup
+    # Classic Kuhn fixes the bet size (`min_bet == max_bet`), so the size could
+    # not vary with `z` there; open the bet range to give it room to.
+    _, config, _, _, _ = setup
+    config = dataclasses.replace(
+        config, game=dataclasses.replace(config.game, min_bet=0.25, max_bet=2.0))
+    game = config.game.build()
+    hyperparams = rpn.hyperparams_from_config(game, config)
+    policy = rpn.build_policy(hyperparams)
+    params = rpn.initial_params(game, policy, hyperparams, seed=0)
     state = game.initial_state(jax.random.PRNGKey(0))
     obs, mask = game.observation(0, state), game.action_mask(0, state)
     action_fn = rpn.policy_action_fn(policy, params[0], hyperparams.noise_dim)

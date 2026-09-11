@@ -273,7 +273,9 @@ class DiskSumo(SequentialZeroSumGame):
         own = state.pos[player]
         opp = state.pos[1 - player]
 
-        local = self._space.box.clip(action.value)
+        # Keep the state's dtype: a float64 action (x64 on) would otherwise
+        # promote `pending`, `pos` and `vel`, and break the scans that carry them.
+        local = self._space.box.clip(action.value).astype(state.pos.dtype)
         local = local / jnp.maximum(jnp.linalg.norm(local), 1.0)
         force = self.max_force * (self._frame(own, opp).T @ local)
 
@@ -305,7 +307,9 @@ class DiskSumo(SequentialZeroSumGame):
         delta = opp - own
         distance = jnp.linalg.norm(delta)
         forward = jnp.where(
-            distance > _EPS, delta / jnp.maximum(distance, _EPS), jnp.array([1.0, 0.0])
+            distance > _EPS,
+            delta / jnp.maximum(distance, _EPS),
+            jnp.array([1.0, 0.0], dtype=delta.dtype),
         )
         left = jnp.stack([-forward[1], forward[0]])
         return jnp.stack([forward, left])
