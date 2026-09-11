@@ -37,7 +37,12 @@ def _build_self_play_train_step(
     networks: tuple[MixtureActorCritic, MixtureActorCritic],
     hyperparams: tuple[MixturePPOHyperparams, MixturePPOHyperparams],
 ):
-    sample_episode = build_episode_sampler(game, networks[0], networks[1])
+    # Each player explores at its own `explore_eps`; the loss reads the rate each
+    # decision was drawn under off the batch, so the two cannot disagree.
+    sample_episode = build_episode_sampler(
+        game, networks[0], networks[1],
+        explore_eps=(hyperparams[0].explore_eps, hyperparams[1].explore_eps),
+    )
     # `shared_obs` is never right here: a sequential game's whole point is a
     # per-infoset observation, so the forward pass stays inside the per-sample vmap.
     loss_fns = tuple(build_loss_fn(player, hyperparams[player]) for player in (0, 1))

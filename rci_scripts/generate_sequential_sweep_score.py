@@ -8,14 +8,14 @@ killed Leduc BR job takes nothing else with it -- plus ``run_all_score.sh`` to
 submit them.
 
 Kuhn scoring is exact and cheap; Leduc / sequential Blotto train an approximate
-best response per checkpoint. BR budget and the final evaluation length are
-hyperparameters of *this* generator (baked into every score script), not of the
-training sweep::
+best response per checkpoint. BR budget, the final evaluation length, and (for
+non-Kuhn) how many checkpoints to score are hyperparameters of *this*
+generator (baked into every score script), not of the training sweep::
 
     python rci_scripts/generate_sequential_sweep.py
     python rci_scripts/generate_sequential_sweep_score.py
     python rci_scripts/generate_sequential_sweep_score.py \\
-        --br-steps 100 --br-epochs 20 --episodes 50000 --time 24
+        --br-steps 100 --br-epochs 20 --episodes 50000 --n-checkpoints 10 --time 24
     bash scripts/sequential_sweep/run_all.sh          # train
     bash scripts/sequential_sweep/run_all_score.sh    # after (partial) training
 
@@ -40,8 +40,8 @@ LOG_DIR = "logs/sequential_sweep/score"
 MANIFEST = SCRIPTS_DIR / "manifest.json"
 SCORE = "rci_scripts/score_sequential_sweep.py"
 
-DEFAULT_BR_STEPS = 50
-DEFAULT_BR_EPOCHS = 20
+DEFAULT_BR_STEPS = 200
+DEFAULT_BR_EPOCHS = 100
 DEFAULT_EPISODES = 20_000
 DEFAULT_SEED = 0
 DEFAULT_TIME_H = 24
@@ -106,6 +106,7 @@ def write_score_job_script(
     episodes: int,
     exact_grid: int | None,
     seed: int,
+    n_checkpoints: int | None,
     overwrite: bool,
     no_target: bool,
     time_h: int,
@@ -124,6 +125,8 @@ def write_score_job_script(
     ]
     if exact_grid is not None:
         flags.append(f"--exact-grid {exact_grid}")
+    if n_checkpoints is not None:
+        flags.append(f"--n-checkpoints {n_checkpoints}")
     if overwrite:
         flags.append("--overwrite")
     if no_target:
@@ -168,6 +171,7 @@ def generate(
     episodes: int,
     exact_grid: int | None,
     seed: int,
+    n_checkpoints: int | None,
     overwrite: bool,
     no_target: bool,
     time_h: int,
@@ -192,6 +196,7 @@ def generate(
         "episodes": episodes,
         "exact_grid": exact_grid,
         "seed": seed,
+        "n_checkpoints": n_checkpoints,
         "overwrite": overwrite,
         "no_target": no_target,
         "time_h": time_h,
@@ -200,8 +205,11 @@ def generate(
     }
 
     if dry_run:
+        n_ck = (
+            f"  n_checkpoints={n_checkpoints}" if n_checkpoints is not None else ""
+        )
         print(f"{len(runs)} score jobs  BR {br_steps}x{br_epochs}  "
-              f"eval {episodes} episodes  wall {time_h}h\n")
+              f"eval {episodes} episodes  wall {time_h}h{n_ck}\n")
         for run in runs:
             print(f"  score__{run['name']}")
         return []
@@ -223,6 +231,7 @@ def generate(
             episodes=episodes,
             exact_grid=exact_grid,
             seed=seed,
+            n_checkpoints=n_checkpoints,
             overwrite=overwrite,
             no_target=no_target,
             time_h=time_h,
@@ -283,6 +292,12 @@ def main() -> None:
         help="RNG seed passed to score_sequential_sweep.py",
     )
     ap.add_argument(
+        "--n-checkpoints", type=int, default=None,
+        help="pass --n-checkpoints to score_sequential_sweep.py: for non-Kuhn "
+             "runs, score at most this many linearly spaced checkpoints "
+             "(always first+last; must be > 2). Kuhn ignores it. Default: all",
+    )
+    ap.add_argument(
         "--overwrite", action="store_true",
         help="pass --overwrite so existing exploitability.pkl files are recomputed",
     )
@@ -307,6 +322,8 @@ def main() -> None:
         help="print the score-job plan and write nothing",
     )
     args = ap.parse_args()
+    if args.n_checkpoints is not None and args.n_checkpoints <= 2:
+        raise SystemExit(f"--n-checkpoints must be > 2, got {args.n_checkpoints}")
 
     written = generate(
         games=args.games,
@@ -317,6 +334,7 @@ def main() -> None:
         episodes=args.episodes,
         exact_grid=args.exact_grid,
         seed=args.seed,
+        n_checkpoints=args.n_checkpoints,
         overwrite=args.overwrite,
         no_target=args.no_target,
         time_h=args.time_h,
@@ -333,6 +351,8 @@ def main() -> None:
     print(f"  scripts : {SCRIPTS_DIR.relative_to(REPO_ROOT)}")
     print(f"  scores  : {CHECKPOINT_ROOT}/{{run}}/exploitability.pkl")
     print(f"  BR      : {args.br_steps}x{args.br_epochs}, eval {args.episodes} episodes")
+    if args.n_checkpoints is not None:
+        print(f"  subsample: --n-checkpoints {args.n_checkpoints} (non-Kuhn only)")
     print(f"\nsubmit: bash {(SCRIPTS_DIR / 'run_all_score.sh').relative_to(REPO_ROOT)}")
 
 

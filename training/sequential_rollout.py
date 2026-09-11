@@ -78,12 +78,21 @@ def build_episode_sampler(
     game: SequentialZeroSumGame,
     network_0: MixtureActorCritic,
     network_1: MixtureActorCritic,
+    explore_eps: tuple[float, float] = (0.0, 0.0),
 ) -> Callable[..., tuple[Episode, chex.Array]]:
     """Bind the (static) game and networks; return a sampler for **one** episode.
 
     The returned function is `(params_0, magnet_params_0, params_1,
     magnet_params_1, key) -> (Episode, payoff)`, with a `(max_steps, ...)` time
     axis on every `Episode` field and a scalar `payoff` to player 0.
+
+    `explore_eps[p]` makes player `p` act from its exploring behavior policy:
+    each continuous action it draws is, with that probability, replaced by a
+    uniform draw on its network's box (see `sample_mixture_component`). Any
+    nonzero entry records `Episode.behavior_eps`, which switches the loss to its
+    importance-weighted form for that player's own decisions. The default
+    `(0.0, 0.0)` samples the policies themselves -- what every best response,
+    evaluator and baseline wants -- and leaves the rollout exactly as before.
     """
     _validate_players_match(game, (network_0, network_1))
 
@@ -92,6 +101,16 @@ def build_episode_sampler(
     num_atoms = network_0.num_atoms
     num_components = network_0.num_components
     shared_box = _same_box(*spaces)
+    explore_eps = tuple(float(eps) for eps in explore_eps)
+    for player, eps in enumerate(explore_eps):
+        if not 0.0 <= eps < 1.0:
+            raise ValueError(f"explore_eps[{player}] must lie in [0, 1), got {eps}")
+        if eps > 0.0 and not np.all(np.asarray(networks[player].high) > np.asarray(networks[player].low)):
+            raise ValueError(
+                f"explore_eps[{player}] > 0 needs a box of positive width to draw from, got "
+                f"low={networks[player].low}, high={networks[player].high}"
+            )
+    exploring = any(eps > 0.0 for eps in explore_eps)
 
     def sample_episode(params_0, magnet_params_0, params_1, magnet_params_1, key: chex.PRNGKey):
         params = (params_0, params_1)
@@ -116,9 +135,21 @@ def build_episode_sampler(
             )
             magnet_logits, magnet_means, magnet_scale_trils = magnet
 
-            component, raw_action = sample_mixture_component(
-                logits, means, scale_trils, mask, num_atoms, sample_key
-            )
+            if exploring:
+                # The acting player's rate and box; a padding step's choice is
+                # irrelevant, since the loss weights it to zero.
+                eps = jnp.where(is_first, explore_eps[0], explore_eps[1])
+                low, high = select_by_player(
+                    is_first, (networks[0].low, networks[0].high), (networks[1].low, networks[1].high)
+                )
+                component, raw_action = sample_mixture_component(
+                    logits, means, scale_trils, mask, num_atoms, sample_key,
+                    explore_eps=eps, low=low, high=high,
+                )
+            else:
+                component, raw_action = sample_mixture_component(
+                    logits, means, scale_trils, mask, num_atoms, sample_key
+                )
             action_kind = component_to_kind(component, num_atoms)
             # Only the continuous part is clipped here (the kind comes from the
             # masked categorical and is legal by construction). Each player's box
@@ -141,6 +172,8 @@ def build_episode_sampler(
                 raw_action=raw_action, action_kind=action_kind,
                 action_value=action_value, value=value,
             )
+            if exploring:
+                record["behavior_eps"] = eps
             return next_state, record
 
         init_key, scan_key = jax.random.split(key)

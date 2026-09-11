@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Callable
 
 import chex
@@ -58,12 +59,28 @@ def _spread_bias_init(low: chex.Array, high: chex.Array, num_components: int) ->
     return init_fn
 
 
+def _sigma_bounds(
+    low: chex.Array, high: chex.Array, sigma_min: float | None, sigma_max: float | None
+) -> tuple[float, chex.Array | float]:
+    """`(lo, hi)` bounds on a component's standard deviation, in sigma units.
+
+    `None` falls back to the built-in bounds -- `SIGMA_MIN` below, the box width
+    above -- and the default ceiling is raised to meet a custom floor, so a
+    floor set above a narrow box's width is honored rather than inverted.
+    """
+    lo = SIGMA_MIN if sigma_min is None else sigma_min
+    hi = jnp.maximum(_action_width(low, high), lo) if sigma_max is None else sigma_max
+    return lo, hi
+
+
 def _scale_bias_init(
     low: chex.Array,
     high: chex.Array,
     num_components: int,
     full_covariance: bool,
     scale_parameterization: str = "linear",
+    sigma_min: float | None = None,
+    sigma_max: float | None = None,
 ) -> Callable:
     """Bias initializer for `scale_head`, scaled to the action range.
 
@@ -71,15 +88,18 @@ def _scale_bias_init(
     deviation is one `num_components`-th of the box's half width, uncorrelated --
     written in whichever coordinate the head emits. Under `"log"` the diagonal
     carries `log std` and the off-diagonal stays at zero, which is exactly the
-    `S = 0` that makes `I + S` the identity.
+    `S = 0` that makes `I + S` the identity. That std is clipped into
+    `[sigma_min, sigma_max]`, so the raw head starts inside its own clamp.
     """
     action_dim = low.shape[0]
     slots = diagonal_slots(action_dim, full_covariance)
     size = scale_param_size(action_dim, full_covariance)
+    lo, hi = _sigma_bounds(low, high, sigma_min, sigma_max)
 
     def init_fn(key: chex.PRNGKey, shape: tuple[int, ...], dtype=jnp.float32) -> chex.Array:
         del key
         std = jnp.maximum(_action_width(low, high) / (2 * num_components), MIN_ACTION_WIDTH)
+        std = jnp.clip(std, lo, hi)
         diag = jnp.log(std) if scale_parameterization == "log" else std
         row = jnp.zeros((size,), dtype=dtype).at[slots].set(diag.astype(dtype))
         values = jnp.broadcast_to(row[None, :], (num_components, size))
@@ -131,6 +151,10 @@ class MixtureActorCritic(nn.Module):
     # "linear" or "log"; see `training.config.PPOHyperparams.scale_parameterization`.
     scale_parameterization: str = "linear"
     max_correlation: float = 0.0
+    # Std bounds in sigma units under either parameterization; `None` keeps the
+    # built-in ones (see `_sigma_bounds`).
+    sigma_min: float | None = None
+    sigma_max: float | None = None
 
     @nn.compact
     def __call__(
@@ -168,29 +192,30 @@ class MixtureActorCritic(nn.Module):
             kernel_init=nn.initializers.zeros,
             bias_init=_scale_bias_init(
                 self.low, self.high, self.num_components, self.full_covariance,
-                self.scale_parameterization,
+                self.scale_parameterization, self.sigma_min, self.sigma_max,
             ),
             name="scale_head",
         )(torso)
         scale_raw = scale_flat.reshape(self.num_components, scale_size)
-        # Floor on the conditional standard deviations, ceiling at the box width,
-        # in whichever coordinate the head emits. Straight-through either way, so
-        # a saturated component keeps receiving gradient.
+        # Floor and ceiling on the conditional standard deviations (`sigma_min`
+        # / `sigma_max`, defaulting to `SIGMA_MIN` / the box width), given in
+        # sigma units and applied in whichever coordinate the head emits.
+        # Straight-through either way, so a saturated component keeps
+        # receiving gradient.
+        sigma_lo, sigma_hi = _sigma_bounds(self.low, self.high, self.sigma_min, self.sigma_max)
         if self.scale_parameterization == "log":
             scale_tril = scale_tril_from_log_diag(
                 scale_raw,
                 self.action_dim,
                 self.full_covariance,
-                LOG_SIGMA_MIN,
-                jnp.log(_action_width(self.low, self.high)),
+                LOG_SIGMA_MIN if self.sigma_min is None else math.log(sigma_lo),
+                jnp.log(sigma_hi),
                 self.max_correlation,
             )
         else:
             scale_tril = pack_scale_tril(scale_raw, self.action_dim, self.full_covariance)
             # The projection onto the feasible set of factors.
-            scale_tril = clamp_scale_tril(
-                scale_tril, SIGMA_MIN, _action_width(self.low, self.high)
-            )
+            scale_tril = clamp_scale_tril(scale_tril, sigma_lo, sigma_hi)
 
         value = nn.Dense(1, name="value_head")(torso)
 
@@ -290,6 +315,12 @@ class Episode:
     action_value: chex.Array  # `raw_action` clipped to the action space; read by the game only on the continuous kind
     value: chex.Array
     reward: chex.Array
+    # `()` float per decision: the `explore_eps` its continuous action was drawn
+    # under (see `sample_mixture_component`). `None` -- the default, and what
+    # every non-exploring sampler leaves -- marks an on-policy rollout, which the
+    # loss then scores exactly as before; set, it switches the loss to its
+    # importance-weighted form (see `behavior_gaussian_log_prob`).
+    behavior_eps: chex.Array | None = None
 
 
 
@@ -338,10 +369,25 @@ def sample_mixture_component(
     mask: chex.Array,
     num_atoms: int,
     key: chex.PRNGKey,
+    explore_eps: chex.Array | None = None,
+    low: chex.Array | None = None,
+    high: chex.Array | None = None,
 ) -> tuple[chex.Array, chex.Array]:
     """Draw one `(component, raw_action)` from a masked hybrid mixture policy.
+
+    With `explore_eps`, the *behavior* policy is sampled instead: the component
+    is drawn exactly as the policy says, and then, with probability
+    `explore_eps`, the drawn Gaussian's sample is replaced by a uniform draw on
+    the box `[low, high]`. So for a Gaussian component `k` the continuous
+    action has density `(1 - eps) N_k(x) + eps U(x)` while every categorical
+    probability -- check vs bet, which component -- is untouched. The loss
+    corrects for it from `Episode.behavior_eps`; see `behavior_gaussian_log_prob`.
+    `None` (the default) is the plain policy, with the same rng stream as before.
     """
-    component_key, noise_key = jax.random.split(key)
+    if explore_eps is None:
+        component_key, noise_key = jax.random.split(key)
+    else:
+        component_key, noise_key, coin_key, uniform_key = jax.random.split(key, 4)
     component = jax.random.categorical(component_key, jnp.where(mask, logits, MASKED_LOGIT))
     index = gaussian_component_index(component, num_atoms)
     mean = means[index]
@@ -353,7 +399,36 @@ def sample_mixture_component(
     raw_action = gaussian_sample(
         mean, scale_trils[index], jax.random.normal(noise_key, mean.shape, dtype=mean.dtype)
     )
+    if explore_eps is not None:
+        uniform = jax.random.uniform(
+            uniform_key, mean.shape, dtype=mean.dtype,
+            minval=low.astype(mean.dtype), maxval=high.astype(mean.dtype),
+        )
+        explore = jax.random.uniform(coin_key) < explore_eps
+        raw_action = jnp.where(explore, uniform, raw_action)
     return component, raw_action
+
+
+def behavior_gaussian_log_prob(
+    gaussian_log_prob: chex.Array,
+    raw_action: chex.Array,
+    explore_eps: chex.Array,
+    low: chex.Array,
+    high: chex.Array,
+) -> chex.Array:
+    """`log((1 - eps) N_k(x) + eps U(x))`: the exploring sampler's density of `raw_action`.
+
+    `gaussian_log_prob` is `log N_k(x)` under the sampling-time policy, for the
+    component that was drawn. `U` is the uniform density on the box, zero
+    outside it (a Gaussian draw can land there; a uniform one cannot). Since the
+    categorical draw is unchanged, `N_k(x) / this` is the full importance
+    ratio of the sample, and it is bounded by `1 / (1 - eps)`.
+    """
+    inside = jnp.all((raw_action >= low) & (raw_action <= high))
+    log_uniform = jnp.where(inside, -jnp.sum(jnp.log(high - low)), -jnp.inf)
+    return jnp.logaddexp(
+        jnp.log1p(-explore_eps) + gaussian_log_prob, jnp.log(explore_eps) + log_uniform
+    )
 
 
 def _sample_mixture_one(
@@ -513,6 +588,8 @@ def mixture_ppo_loss_from_outputs(
     magnet_category_kl_coef: float,
     magnet_gaussian_kl_coef: float,
     mean_box_penalty: chex.Array = 0.0,
+    low: chex.Array | None = None,
+    high: chex.Array | None = None,
 ) -> tuple[chex.Array, dict[str, chex.Array]]:
     """Clipped-surrogate PPO loss plus KL penalties, for a single (unbatched) `Episode`,
     given the current policy's already-computed forward pass at `episode.obs`.
@@ -581,6 +658,21 @@ def mixture_ppo_loss_from_outputs(
     against the policy this update's rollout was collected with;
     `magnet_*_kl_coef * KL(current || magnet)` pulls towards the
     periodically-snapshotted magnet policy.
+
+    **Off-policy samples.** When `episode.behavior_eps` is set, the continuous
+    action was drawn from the exploring behavior policy `mu` (see
+    `sample_mixture_component`) and `low`/`high` must give the box it explored.
+    The categorical factor was sampled on-policy and is untouched. The Gaussian
+    factor uses the decoupled PPO objective: the same clipped surrogate in
+    `r = pi_new / pi_old`, weighted by `w = pi_old / mu` -- so the trust region
+    still acts around the sampling-time policy, and `w <= 1 / (1 - eps)` keeps
+    the weights bounded. The sampled-action entropy estimate `-log p(x)` gets
+    the same `w`, turning it back into an estimate under `pi_old`; without it a
+    uniform draw deep in a Gaussian's tail would dominate the bonus. The KLs are
+    closed forms over the components and need no correction. Only this
+    decision's own action is reweighted: the return still reflects the rest of
+    the behavior trajectory -- in particular the *opponent's* exploration,
+    which is exactly what the responder is meant to learn from.
     """
     mask = episode.action_mask
 
@@ -603,13 +695,34 @@ def mixture_ppo_loss_from_outputs(
         return jnp.minimum(unclipped, clipped)
 
     category_policy_loss = -clipped_surrogate(category_ratio)
-    gaussian_policy_loss = -is_gaussian * clipped_surrogate(gaussian_ratio)
+    if episode.behavior_eps is None:
+        # On-policy: the sample came from `pi_old` itself.
+        is_weight = jnp.ones(())
+        gaussian_surrogate = clipped_surrogate(gaussian_ratio)
+    else:
+        if low is None or high is None:
+            raise ValueError("an exploring episode needs the policy's box (low, high) to score it")
+        behavior_log_prob = behavior_gaussian_log_prob(
+            old_gaussian_log_prob, episode.raw_action, episode.behavior_eps, low, high
+        )
+        is_weight = jnp.exp(old_gaussian_log_prob - behavior_log_prob)
+        # `w * min(r A, clip(r) A)`, with `w * r = pi_new / mu` formed directly and
+        # the clip taken on the log-ratio: a uniform draw far into a narrow
+        # Gaussian's tail has `pi_old(x)` underflowing, so `r` alone can overflow
+        # (and `w * r` would be `0 * inf`) where the product is perfectly finite.
+        log_ratio = new_gaussian_log_prob - old_gaussian_log_prob
+        unclipped = jnp.exp(new_gaussian_log_prob - behavior_log_prob) * advantage
+        clipped = is_weight * jnp.exp(
+            jnp.clip(log_ratio, jnp.log1p(-clip_eps), jnp.log1p(clip_eps))
+        ) * advantage
+        gaussian_surrogate = jnp.minimum(unclipped, clipped)
+    gaussian_policy_loss = -is_gaussian * gaussian_surrogate
     policy_loss = category_policy_loss + gaussian_policy_loss
 
     value_loss = jnp.square(value_pred - episode.reward)
 
     category_entropy = masked_categorical_entropy(logits, mask)
-    action_entropy = -is_gaussian * mixture_marginal_log_prob(
+    action_entropy = -is_gaussian * is_weight * mixture_marginal_log_prob(
         logits, means, scale_trils, mask, episode.raw_action, num_atoms
     )
     entropy = category_entropy + action_entropy
@@ -642,10 +755,14 @@ def mixture_ppo_loss_from_outputs(
         + mean_box_penalty
     )
 
+    # Both Gaussian diagnostics are expectations under `pi_old`, so they carry
+    # the same importance weight (exactly 1 on an on-policy batch).
     category_approx_kl = old_category_log_prob - new_category_log_prob
-    gaussian_approx_kl = is_gaussian * (old_gaussian_log_prob - new_gaussian_log_prob)
+    gaussian_approx_kl = is_gaussian * is_weight * (old_gaussian_log_prob - new_gaussian_log_prob)
     category_clip_frac = (jnp.abs(category_ratio - 1.0) > clip_eps).astype(jnp.float32)
-    gaussian_clip_frac = is_gaussian * (jnp.abs(gaussian_ratio - 1.0) > clip_eps).astype(jnp.float32)
+    gaussian_clip_frac = is_gaussian * is_weight * (
+        jnp.abs(gaussian_ratio - 1.0) > clip_eps
+    ).astype(jnp.float32)
 
     metrics = {
         "loss": loss,
@@ -721,6 +838,7 @@ def mixture_ppo_loss(
         clip_eps, value_coef, category_entropy_coef, gaussian_entropy_coef,
         trpo_category_kl_coef, trpo_gaussian_kl_coef,
         magnet_category_kl_coef, magnet_gaussian_kl_coef, mean_box_penalty,
+        low=network.low, high=network.high,
     )
 
 
@@ -840,4 +958,6 @@ def build_mixture_network(hyperparams: MixturePPOHyperparams) -> MixtureActorCri
         full_covariance=hyperparams.full_covariance,
         scale_parameterization=hyperparams.scale_parameterization,
         max_correlation=hyperparams.max_correlation,
+        sigma_min=hyperparams.sigma_min,
+        sigma_max=hyperparams.sigma_max,
     )

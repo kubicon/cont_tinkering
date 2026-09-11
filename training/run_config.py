@@ -56,14 +56,23 @@ class NetworkConfig:
     # the per-axis marginals alone, so the off-diagonal entries get exactly zero
     # payoff gradient. See `training.gaussian`.
     full_covariance: bool = False
-    # "linear" (the default) or "log" -- how the scale head's output is read into
-    # the Cholesky factor. See `training.config.PPOHyperparams` for the tradeoff;
-    # "log" is positive by construction and gives the spread and the correlations
-    # separate gradients, at the cost of the KL's uniform strong convexity.
+    # "log" (the default here) or "linear" -- how the scale head's output is read
+    # into the Cholesky factor. See `training.config.PPOHyperparams` for the
+    # tradeoff; "log" is positive by construction and gives the spread and the
+    # correlations separate gradients, at the cost of the KL's uniform strong
+    # convexity.
     scale_parameterization: str = "log"
     # `scale_parameterization: "log"` + `full_covariance` only; bounds the
     # condition number of `Sigma`. 0 leaves the off-diagonal unbounded.
     max_correlation: float = 0.0
+    # Bounds on each Gaussian component's standard deviation, given as plain
+    # sigma in action units under either `scale_parameterization` ("log" clips
+    # to their logs). A floor keeps a component from collapsing onto a point;
+    # a ceiling keeps it from spreading past the box. `null` keeps the built-in
+    # bounds: `training.gaussian.SIGMA_MIN` (1e-3) below, the box width above.
+    # Best responses built from this config inherit the same bounds.
+    sigma_min: float | None = None
+    sigma_max: float | None = None
     clip_means: bool = False  # constrain the mean head to the action box; see `MixtureActorCritic`
     # Pulls a mean that drifts out of the box back to its edge; only bites with
     # `clip_means` on. See `training.mixture.mean_box_excess`.
@@ -98,6 +107,17 @@ class PPOConfig:
     # Target/magnet parameter tracking.
     target_tau: float = 0.001
     magnet_interval: int = 500
+
+    # Off-policy exploration of the continuous action, `train_sequential.py`'s
+    # `self_play` only (`discrete_mmd` never draws a Gaussian, so it is inert
+    # there). With probability `explore_eps` a drawn
+    # Gaussian sample (a bet size) is replaced by a uniform draw on the action
+    # box; the check/bet choice itself is untouched. Each player's loss
+    # importance-weights its own exploratory actions back to its policy, while
+    # the opponent's exploration is left in: that is what teaches a player how
+    # to answer sizes the opponent's policy never plays. Evaluation and
+    # checkpoints are the policy alone. Best responses never explore. 0 disables.
+    explore_eps: float = 0.0
 
     # Entropy bonus, split per head.
     category_entropy_coef: float = 0.1
@@ -313,6 +333,29 @@ def _build_dataclass(cls: type, data: dict) -> Any:
     return cls(**data)
 
 
+def _check_sigma_bounds(network: NetworkConfig) -> NetworkConfig:
+    """Coerce `sigma_min` / `sigma_max` to floats and reject impossible bounds.
+
+    Coercion matters: YAML 1.1 reads an unsigned exponent like `1e-3` as a
+    string, not a number.
+    """
+    bounds = {}
+    for name in ("sigma_min", "sigma_max"):
+        value = getattr(network, name)
+        if value is None:
+            continue
+        value = float(value)
+        if not value > 0.0:
+            raise ValueError(f"network.{name} must be positive, got {value}")
+        bounds[name] = value
+    if len(bounds) == 2 and bounds["sigma_min"] > bounds["sigma_max"]:
+        raise ValueError(
+            f"network.sigma_min ({bounds['sigma_min']}) exceeds network.sigma_max "
+            f"({bounds['sigma_max']})"
+        )
+    return dataclasses.replace(network, **bounds)
+
+
 def run_config_from_dict(raw: dict) -> RunConfig:
     """Builds a `RunConfig` from an already-parsed config dict (e.g. `yaml.safe_load`'s
     output, or one produced by `sweep.py` for a single sweep combination).
@@ -338,6 +381,11 @@ def run_config_from_dict(raw: dict) -> RunConfig:
     network = _build_dataclass(NetworkConfig, raw.get("network", {}) or {})
     if network.policy not in POLICIES:
         raise ValueError(f"unknown network.policy {network.policy!r}, choices: {sorted(POLICIES)}")
+    network = _check_sigma_bounds(network)
+    ppo = _build_dataclass(PPOConfig, raw.get("ppo", {}) or {})
+    if not 0.0 <= float(ppo.explore_eps) < 1.0:
+        raise ValueError(f"ppo.explore_eps must lie in [0, 1), got {ppo.explore_eps}")
+    ppo = dataclasses.replace(ppo, explore_eps=float(ppo.explore_eps))
 
     train = _build_dataclass(TrainConfig, raw.get("train", {}) or {})
     if train.solver not in SOLVERS:
@@ -347,7 +395,7 @@ def run_config_from_dict(raw: dict) -> RunConfig:
         game=game_config,
         network=network,
         optimizer=_build_dataclass(OptimizerConfig, raw.get("optimizer", {}) or {}),
-        ppo=_build_dataclass(PPOConfig, raw.get("ppo", {}) or {}),
+        ppo=ppo,
         train=train,
         best_response=_build_dataclass(BestResponseConfig, raw.get("best_response", {}) or {}),
         discrete=_build_dataclass(DiscreteConfig, raw.get("discrete", {}) or {}),

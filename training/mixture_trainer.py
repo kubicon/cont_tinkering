@@ -38,6 +38,7 @@ from .trainer_common import (
     build_loss_fn,
     create_mixture_train_state,
     reject_batch_norm,
+    reject_exploration,
     update_target_and_magnet,
 )
 
@@ -140,6 +141,7 @@ class MixturePPOTrainer:
         seed: int = 0,
     ):
         reject_batch_norm("hyperparams", hyperparams)
+        reject_exploration("hyperparams", hyperparams)
         if hyperparams.num_atoms != 0:
             # `train` reports exploitability every chunk via
             # `sample_mixture_actions`, which is meaningless with atoms. Fail
@@ -354,6 +356,7 @@ class MixtureSelfPlayPPOTrainer:
     ):
         for name, hyperparams in (("hyperparams_1", hyperparams_1), ("hyperparams_2", hyperparams_2)):
             reject_batch_norm(name, hyperparams)
+            reject_exploration(name, hyperparams)
             if hyperparams.num_atoms != 0:
                 raise ValueError(
                     f"{name}: one-shot games have no discrete actions, "

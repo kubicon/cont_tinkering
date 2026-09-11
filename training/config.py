@@ -28,7 +28,8 @@ class PPOHyperparams:
     full_covariance: bool = False
     # How the scale head's output is read into the Cholesky factor `A`.
     #   "linear" -- the output *is* `diag(A)` (and the off-diagonal entries),
-    #       projected onto `[SIGMA_MIN, box width]`. The historical default, and
+    #       projected onto `[SIGMA_MIN, box width]` (or the mixture's
+    #       `[sigma_min, sigma_max]` when set). The historical default, and
     #       the parametrization in which the KL regularizer is uniformly
     #       strongly convex -- which is what the MMD analysis in `MultiDim.md` /
     #       `theory/THEORY.md` rests on. Kept as the default so every existing
@@ -92,6 +93,17 @@ class MixturePPOHyperparams(PPOHyperparams):
     # straight-through projection is what needs the restoring force. In squared
     # action units, so its natural scale follows the width of the action box.
     mean_box_penalty_coef: float = 0.0
+    # Bounds on each Gaussian component's (conditional) standard deviation, in
+    # action units whatever `scale_parameterization` is -- under "log" the head's
+    # output is clipped to their logs. `None` keeps the built-in bounds:
+    # `training.gaussian.SIGMA_MIN` below, the action box's width above.
+    sigma_min: float | None = None
+    sigma_max: float | None = None
+    # Off-policy exploration of the continuous action (sequential self-play
+    # only): with this probability a drawn Gaussian sample is replaced by a
+    # uniform draw on `[low, high]`, and the loss importance-weights it back to
+    # the policy (see `training.mixture.sample_mixture_component`). 0 disables it.
+    explore_eps: float = 0.0
 
     # Target/magnet parameter tracking (see `training.mixture_trainer.MixtureTrainState`).
     target_tau: float = 0.005  # Polyak-averaging coefficient for `target_params`.

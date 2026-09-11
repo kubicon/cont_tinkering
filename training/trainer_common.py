@@ -86,6 +86,15 @@ def reject_batch_norm(name: str, hyperparams: PPOHyperparams) -> None:
         raise ValueError(f"{name}: batch_norm is not supported (see PPOTrainer for why).")
 
 
+def reject_exploration(name: str, hyperparams: MixturePPOHyperparams) -> None:
+    """Off-policy exploration is wired into the sequential sampler only."""
+    if getattr(hyperparams, "explore_eps", 0.0) > 0.0:
+        raise ValueError(
+            f"{name}: explore_eps is only implemented for sequential self-play "
+            f"(training.sequential_trainer); got {hyperparams.explore_eps}"
+        )
+
+
 def append_chunk_records(
     history: list[dict], metrics_stack, chunk: int, epochs: int
 ) -> dict:

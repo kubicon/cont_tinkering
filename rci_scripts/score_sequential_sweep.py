@@ -11,7 +11,9 @@ are CLI hyperparameters so measurement stays outside the training wall-time.
 
 Reuse is deliberate: this script only finds runs, rebuilds the
 ``PolicyMixture`` pair a checkpoint stores, and calls the same scoring
-functions ``train_sequential.py`` uses online.
+functions ``train_sequential.py`` uses online. For non-Kuhn games,
+``--n-checkpoints N`` (N > 2) scores a linearly spaced subsample that always
+includes the first and last checkpoint; Kuhn ignores the flag.
 
 The pickle is a dict with numpy arrays ready for later plots:
 
@@ -91,6 +93,27 @@ def list_steps(checkpoint_dir: Path) -> list[int]:
     return sorted(
         int(path.stem) for path in checkpoint_dir.glob("*.pkl") if path.stem.isdigit()
     )
+
+
+def subsample_steps(steps: list[int], n: int) -> list[int]:
+    """Pick ``n`` linearly spaced checkpoints, always including first and last.
+
+    ``n`` must be > 2. If there are fewer than ``n`` checkpoints, return all of
+    them. Rounding can collapse adjacent indices on very short lists; we dedupe
+    while preserving order so first and last stay present.
+    """
+    if n <= 2:
+        raise ValueError(f"n-checkpoints must be > 2, got {n}")
+    if len(steps) <= n:
+        return list(steps)
+    idxs = [int(round(i * (len(steps) - 1) / (n - 1))) for i in range(n)]
+    out: list[int] = []
+    seen: set[int] = set()
+    for idx in idxs:
+        if idx not in seen:
+            seen.add(idx)
+            out.append(steps[idx])
+    return out
 
 
 def resolve_config(run_dir: Path, configs_dir: Path) -> Path:
@@ -286,6 +309,7 @@ def score_run(
     seed: int,
     include_target: bool,
     overwrite: bool,
+    n_checkpoints: int | None = None,
 ) -> dict:
     out_path = run_dir / RESULT_FILENAME
     if out_path.exists() and not overwrite:
@@ -301,9 +325,20 @@ def score_run(
     )
 
     checkpoint_dir = run_dir / CHECKPOINT_DIRNAME
-    steps = list_steps(checkpoint_dir)
-    if not steps:
+    all_steps = list_steps(checkpoint_dir)
+    if not all_steps:
         raise FileNotFoundError(f"no {{step}}.pkl checkpoints in {checkpoint_dir}")
+    # Kuhn's exact BR is cheap -- score every checkpoint. Approximate BR for
+    # Leduc / Blotto is ~1h each, so optionally thin to a linear subsample.
+    if not exact and n_checkpoints is not None:
+        steps = subsample_steps(all_steps, n_checkpoints)
+        if len(steps) < len(all_steps):
+            print(
+                f"  {run_dir.name}: scoring {len(steps)}/{len(all_steps)} "
+                f"checkpoints (--n-checkpoints {n_checkpoints})"
+            )
+    else:
+        steps = all_steps
 
     meta = run_meta(run_dir)
     try:
@@ -385,7 +420,7 @@ def score_run(
         wall_time.append(float(row["wall_time"]) if "wall_time" in row else float("nan"))
         episodes_train.append(float(row["episodes"]) if "episodes" in row else float("nan"))
         env_steps.append(float(row["env_steps"]) if "env_steps" in row else float("nan"))
-        print(f"  {run_dir.name} step {step:5d}: {headline}")
+        print(f"  {run_dir.name} step {step:5d}: {headline}", flush=True)
 
     try:
         config_meta = str(config_path.resolve().relative_to(REPO_ROOT))
@@ -404,6 +439,7 @@ def score_run(
         "episodes": episodes,
         "exact_grid": grid,
         "seed": seed,
+        "n_checkpoints": n_checkpoints if not exact else None,
         "scored_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "steps": np.asarray(steps, dtype=np.int32),
         "expl": np.asarray(expl, dtype=np.float64),
@@ -470,6 +506,15 @@ def main() -> None:
     )
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument(
+        "--n-checkpoints",
+        type=int,
+        default=11,
+        help="for non-Kuhn (approximate BR) runs only: score at most this many "
+             "checkpoints, always including first and last, linearly spaced in "
+             "between (must be > 2). Ignored on Kuhn. If the run has fewer "
+             "checkpoints, score all of them. Default: score every checkpoint",
+    )
+    ap.add_argument(
         "--no-target",
         action="store_true",
         help="skip Polyak-target scoring on Kuhn even when checkpoints carry it",
@@ -480,6 +525,8 @@ def main() -> None:
         help=f"recompute even when {RESULT_FILENAME} already exists",
     )
     args = ap.parse_args()
+    if args.n_checkpoints is not None and args.n_checkpoints <= 2:
+        raise SystemExit(f"--n-checkpoints must be > 2, got {args.n_checkpoints}")
 
     out_root = args.out if args.out.is_absolute() else REPO_ROOT / args.out
     configs_dir = args.configs if args.configs.is_absolute() else REPO_ROOT / args.configs
@@ -515,6 +562,7 @@ def main() -> None:
             seed=args.seed,
             include_target=not args.no_target,
             overwrite=args.overwrite,
+            n_checkpoints=args.n_checkpoints,
         )
         print(
             f"  wrote {len(result['steps'])} scores -> {run_dir / RESULT_FILENAME} "

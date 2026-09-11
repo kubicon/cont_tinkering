@@ -202,6 +202,9 @@ def br_hyperparams(game: ZeroSumGame, player: int, config: RunConfig,
     hyperparams = build_hyperparams(game, player, config)
     if not keep_regularizers:
         hyperparams = dataclasses.replace(hyperparams, **{name: 0.0 for name in BR_REGULARIZERS})
+    # A best response plays its policy, never an exploring behavior policy; its
+    # samplers are built without `explore_eps`, and the hyperparams say so too.
+    hyperparams = dataclasses.replace(hyperparams, explore_eps=0.0)
     return dataclasses.replace(hyperparams, **overrides) if overrides else hyperparams
 
 
