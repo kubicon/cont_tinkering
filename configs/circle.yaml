@@ -1,14 +1,16 @@
+# Cyclic kernel on the circle: sum_k 2^-k sin(2 pi k (a1 - a2)) on [0, 1].
+# Uniform is a Nash and the value is 0; any evenly spaced support of more than
+# `harmonics` atoms is also exact, so this is the cycling test, not a capacity test.
 game:
-  name: multi_point
-  peaks: [0.0, 1.0, 2.0]
-  width: 0.1
-  coupling: 1.0
+  name: circle
+  harmonics: 3
+  coefficients: null   # null -> 2^-k
 
 network:
   hidden_dims: [64, 64]
   activation: gelu
   normalization: rms_norm
-  num_components: 2
+  num_components: 8
 
 optimizer:
   learning_rate: 0.0003
@@ -42,5 +44,5 @@ train:
   opponent: random     # fixed_opponent: "random" or "static"
   steps: 100
   epochs: 500
-  checkpoint_dir: sweeps/two_point
+  checkpoint_dir: sweeps/circle
   seed: 0

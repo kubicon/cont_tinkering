@@ -1,0 +1,140 @@
+# python train_sequential.py configs/kuhn_solvers.yaml --solver self_play|nfsp|psro
+#
+# Continuous-bet Kuhn poker, set up so the three sequential solvers can be run
+# against each other. `game:`, `network:`, `optimizer:` and `ppo:` are shared by
+# all three on purpose -- the policy and its optimizer are the same object in
+# every one of them, and a comparison in which they were not would not be a
+# comparison. Only the schedule differs, and each solver brings its own section
+# for that.
+#
+# `train.solver` picks the default; `--solver` overrides it, so the same file
+# produces all five runs -- pair it with `--checkpoint-dir`, since each run needs
+# a directory of its own (the script refuses to write one solver's run into
+# another's). **If a solver genuinely needs a different learning rate or batch
+# size**, copy this file rather than editing in place: those live in the shared
+# sections, and silently changing them for one solver is how a comparison stops
+# meaning anything.
+#
+#   python train_sequential.py configs/kuhn_solvers.yaml --solver nfsp \
+#       --checkpoint-dir data/kuhn_nfsp
+#   python train_sequential.py configs/kuhn_solvers.yaml --solver discrete_mmd \
+#       --checkpoint-dir data/kuhn_discrete16
+#
+# The budgets below are not matched to each other and are not meant to be. Each
+# log point records `wall_time`, `episodes` and `env_steps`, so cut every curve
+# at a common budget when plotting rather than trying to guess equal schedules
+# in advance. What they are is *sufficient*: on `configs/kuhn_classic.yaml`
+# (fixed bet size, exact metric, known value -1/18), PSRO at these settings
+# reaches exploitability 0.007 in 10 rounds and NFSP 0.03-0.12 in 20.
+
+game:
+  name: kuhn
+  num_cards: 3
+  min_bet: 0.25
+  max_bet: 2.0
+  exploitability_grid_points: 1025
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 2
+  clip_means: true    # the action *is* the bet size, so keep the means in the betting range
+
+optimizer:
+  learning_rate: 0.003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 300
+  explore_eps: 0.05
+
+  # Read in full by `self_play` -- they are the method under test. NFSP's and
+  # PSRO's inner best responses zero the entropy/TRPO/magnet coefficients
+  # (`br_hyperparams`): a best response pulled towards its own past is not a best
+  # response, and it would flatter whichever algorithm called the oracle.
+  category_entropy_coef: 0.04
+  gaussian_entropy_coef: 0.04
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  solver: self_play   # self_play | discrete_mmd | nfsp | psro | rpn
+  mode: self_play     # the only mode a sequential game supports
+  # `self_play` only: 40 x 400 = 16k PPO iterations, one log point per chunk.
+  steps: 40
+  epochs: 400
+  checkpoint_dir: data/kuhn_self_play
+  seed: 0
+
+discrete:
+  # `solver: discrete_mmd` -- the same self-play run, but the bet size is one of
+  # `bins` evenly spaced sizes instead of a continuous draw, so the policy plays
+  # through its categorical head alone (`games/discretized.py`). This is *the*
+  # knob of that baseline: 16 sizes over [0.25, 2.0] is a spacing of ~0.12, which
+  # is fine enough to matter and coarse enough to cost something. Sweep it.
+  bins: 16
+  max_actions: 1024
+
+nfsp:
+  rounds: 20
+  # 50 x 20 = 1000 PPO iterations per best response, two per round. This is the
+  # budget to raise first: measured on the one-shot games, a 400-iteration
+  # "best response" is not one (see baselines/neural/README.md).
+  br_steps: 50
+  br_epochs: 20
+  eta: 0.1
+  reservoir_capacity: 200000
+  reservoir_episodes: 8192   # ~eta of these are best-response hands and contribute rows
+  sl_steps: 400
+  sl_batch: 256
+
+rpn:
+  # `solver: rpn` -- randomized policy networks by zeroth-order pseudo-gradient.
+  # A different policy class (implicit, `a = f(o, z)`, no density), so from
+  # `network:` it reads only `hidden_dims` and `activation`.
+  #
+  # The cost model is unlike every other solver here: one iteration plays
+  # `perturbation_batch * utility_episodes` hands (twice that for the `separate`
+  # estimator), so 2000 iterations below is ~16M hands -- far more than PSRO's or
+  # NFSP's schedules. That is the method on a tree, not a mis-set budget; compare
+  # the solvers on `env_steps`, which is exactly why it is logged.
+  iterations: 2000
+  log_every: 50
+  noise_dim: 8
+  estimator: separate      # separate = IJCAI'23 (RPN); joint = IJCAI'25 (JPSPG), half the evaluations
+  sigma: 0.1
+  utility_episodes: 64
+  perturbation_batch: 64   # the knob that decides whether the estimate has signal
+  antithetic: true
+  dynamics: simultaneous   # simultaneous | extragradient | optimistic
+  learning_rate: 0.0001
+  optimizer: adabelief
+  max_grad_norm: 0.0
+  strategy_samples: 128    # noise draws per infoset when *sampling* the strategy out to score it
+  br_iterations: 200       # zeroth-order ascent behind each `expl_lb`
+
+psro:
+  rounds: 12
+  br_steps: 50
+  br_epochs: 20
+  payoff_episodes: 20000     # hands per population pair; the matrix is 13x13 by the end
+  meta_solver: nash          # "uniform" is the self-play-ish ablation
+
+scoring:
+  # Kuhn has an exact tree best response, so `expl` is free every log point and
+  # the RL bound below is unnecessary. `exact_grid: null` uses the game's own
+  # `exploitability_grid_points`.
+  exact_grid: null
+  score_every: 0
+  episodes: 20000
+  include_target: true       # also score the Polyak iterate (self_play only; free here)

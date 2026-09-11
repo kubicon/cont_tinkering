@@ -1,14 +1,18 @@
+# Complete-information all-pay auction, as a zero-sum difference game.
+# Unique Nash: uniform on [0, 2 * value] -- continuum support, so no finite mixture
+# represents it exactly and the residual exploitability measures the representation.
+# `sharpness: null` keeps the hard win rule, which is what the analytic Nash is for.
 game:
-  name: multi_point
-  peaks: [0.0, 1.0, 2.0]
-  width: 0.1
-  coupling: 1.0
+  name: all_pay_auction
+  value: 0.5
+  high: 1.0
+  sharpness: null
 
 network:
   hidden_dims: [64, 64]
   activation: gelu
   normalization: rms_norm
-  num_components: 2
+  num_components: 8
 
 optimizer:
   learning_rate: 0.0003
@@ -42,5 +46,5 @@ train:
   opponent: random     # fixed_opponent: "random" or "static"
   steps: 100
   epochs: 500
-  checkpoint_dir: sweeps/two_point
+  checkpoint_dir: sweeps/all_pay_auction
   seed: 0

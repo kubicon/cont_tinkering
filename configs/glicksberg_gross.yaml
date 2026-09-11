@@ -1,14 +1,15 @@
+# Glicksberg & Gross (1953): (1+x)(1+y)(1-xy)/(1+xy)^2 on [0, 1]^2.
+# Unique Nash has CDF (4/pi) arctan sqrt(t) -- a density unbounded at 0, hence
+# diffuse in a way no Gaussian mixture and no coarse grid represents well.
+# Value: 4/pi ~ 1.2732.
 game:
-  name: multi_point
-  peaks: [0.0, 1.0, 2.0]
-  width: 0.1
-  coupling: 1.0
+  name: glicksberg_gross
 
 network:
   hidden_dims: [64, 64]
   activation: gelu
   normalization: rms_norm
-  num_components: 2
+  num_components: 8
 
 optimizer:
   learning_rate: 0.0003
@@ -42,5 +43,5 @@ train:
   opponent: random     # fixed_opponent: "random" or "static"
   steps: 100
   epochs: 500
-  checkpoint_dir: sweeps/two_point
+  checkpoint_dir: sweeps/glicksberg_gross
   seed: 0

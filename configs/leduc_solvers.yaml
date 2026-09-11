@@ -1,0 +1,129 @@
+# python train_sequential.py configs/leduc_solvers.yaml --solver self_play|nfsp|psro
+#
+# Continuous-raise Leduc Hold'em for the three sequential solvers; the layout and
+# the reasoning are `configs/kuhn_solvers.yaml`'s, and that file is the one to
+# read first. What changes here is the tree and therefore the budgets:
+#
+#   * **There is no exact exploitability.** Leduc's public state carries real bet
+#     sizes accumulated over several raises, so there is no finite infoset
+#     enumeration to traverse (see `games/leduc.py`). Every log point still gets
+#     `h2h` -- the two strategies' own value -- and `scoring.score_every` below
+#     adds `expl_lb`, an RL best-response bound. That bound costs two PPO runs,
+#     which is why it is charged to `total_wall_time` and not to `wall_time`.
+#   * **Everything is larger.** Two betting rounds and a raise cap make episodes
+#     several times longer than Kuhn's three-step tree, and the best responses
+#     correspondingly harder: the budgets below are roughly 4x Kuhn's, in the same
+#     proportion `configs/leduc.yaml` gives self-play 200k iterations where
+#     `configs/kuhn.yaml` gives 16k. They are a starting point, not a measured
+#     result -- watch `rl_gap` (PSRO) or `br_value_0` (NFSP) and raise `br_steps`
+#     if the oracle looks like the bottleneck.
+
+game:
+  name: leduc
+  num_ranks: 3
+  num_suits: 2
+  min_bet: 0.25
+  max_bet: 2.0
+  max_raises: 2
+  second_round_scale: 1.0
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 2
+  clip_means: true    # the action *is* the raise size, so keep the means in the betting range
+
+optimizer:
+  learning_rate: 0.001
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 2000
+
+  # `self_play` reads these in full; NFSP's and PSRO's inner best responses zero
+  # them (see `kuhn_solvers.yaml`).
+  category_entropy_coef: 0.03
+  gaussian_entropy_coef: 0.03
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  solver: self_play   # self_play | discrete_mmd | nfsp | psro | rpn
+  mode: self_play
+  # `self_play` only: 100 x 2000 = 200k PPO iterations, one log point per chunk.
+  steps: 100
+  epochs: 2000
+  checkpoint_dir: data/leduc_self_play
+  seed: 0
+
+discrete:
+  # `solver: discrete_mmd`. Leduc raises are sized in [0.25, 2.0] like Kuhn's
+  # bets, so the same 16 sizes; unlike Kuhn there is no exact metric to price the
+  # discretization with, and `expl_lb` below is measured *inside* the discretized
+  # game -- it cannot see the off-grid deviations the grid gave up. Read it
+  # against a continuous run's bound with that in mind.
+  bins: 16
+  max_actions: 1024
+
+nfsp:
+  rounds: 40
+  br_steps: 100        # 100 x 20 = 2000 PPO iterations per best response
+  br_epochs: 20
+  eta: 0.1
+  reservoir_capacity: 1000000
+  reservoir_episodes: 8192
+  sl_steps: 1000
+  sl_batch: 256
+
+rpn:
+  # `solver: rpn`; see `configs/kuhn_solvers.yaml` for what the knobs mean. Leduc
+  # hands are several times longer than Kuhn's, so the same iteration count costs
+  # several times the environment steps -- halve `utility_episodes` before
+  # halving `perturbation_batch` if it has to come down, since the batch is what
+  # keeps the estimate above the noise floor.
+  iterations: 2000
+  log_every: 50
+  noise_dim: 8
+  estimator: separate
+  sigma: 0.1
+  utility_episodes: 64
+  perturbation_batch: 64
+  antithetic: true
+  dynamics: simultaneous
+  learning_rate: 0.0001
+  optimizer: adabelief
+  max_grad_norm: 0.0
+  strategy_samples: 128
+  # NOTE the cost of `expl_lb` here: each bound is `2 * br_iterations *
+  # perturbation_batch * utility_episodes` hands, so at the `scoring.score_every:
+  # 4` below (40 log points, hence 10 bounds) it comes to more than the run
+  # itself. Raise `scoring.score_every`, or lower `br_iterations`, when running
+  # `--solver rpn` on this file.
+  br_iterations: 200
+
+psro:
+  rounds: 16
+  br_steps: 100
+  br_epochs: 20
+  payoff_episodes: 20000
+  meta_solver: nash
+
+scoring:
+  exact_grid: null     # unused: Leduc has no exact tree best response
+  # The only exploitability number available here, and it costs two PPO runs each
+  # time -- every 4th log point rather than every one.
+  score_every: 4
+  br_steps: 100
+  br_epochs: 20
+  episodes: 20000
+  include_target: true

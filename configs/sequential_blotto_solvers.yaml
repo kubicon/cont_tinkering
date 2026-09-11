@@ -1,0 +1,118 @@
+# python train_sequential.py configs/sequential_blotto_solvers.yaml --solver self_play|nfsp|psro
+#
+# Sequential Colonel Blotto for the sequential solvers; the layout matches
+# `configs/kuhn_solvers.yaml`. The action is the *fraction of the remaining
+# budget* to commit on the current front (`games/sequential_blotto.py`), so the
+# policy lives on `[0, 1]` and `clip_means: true` keeps mixture means inside it.
+#
+#   python train_sequential.py configs/sequential_blotto_solvers.yaml --solver nfsp \
+#       --checkpoint-dir data/blotto_nfsp
+#   python train_sequential.py configs/sequential_blotto_solvers.yaml --solver discrete_mmd \
+#       --checkpoint-dir data/blotto_discrete16
+#
+# There is no exact best response (the state carries real bid sizes), so nothing
+# prints an `expl` column while training -- measure a checkpoint afterwards with
+# `python best_response.py configs/sequential_blotto_br.yaml`, or set
+# `scoring.score_every` for an RL bound. The equilibrium wants *spread out* bids:
+# if the payoff sticks near zero and the components pile up, raise the entropy
+# coefficients before touching anything else.
+
+game:
+  name: sequential_blotto
+  num_fields: 3
+  field_values: null    # null = every front worth 1
+  budget: 1.0
+  # Steepness of the logistic contest on a front. With budget 1 over 3 fronts a
+  # typical bid gap is ~0.1, so 10 makes a gap that size worth ~0.73 win
+  # probability. `null` means the bigger bid simply wins -- trainable under PPO,
+  # but it gives a collapsed policy no gradient at all (see the module doc).
+  sharpness: 10.0
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  # Three components: the categorical head is what keeps the mixture from
+  # collapsing onto one bid size (this game has no discrete atoms).
+  num_components: 3
+  clip_means: true
+
+optimizer:
+  learning_rate: 0.003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 300
+
+  # `self_play` reads these in full; NFSP's and PSRO's inner best responses zero
+  # them (see `kuhn_solvers.yaml`).
+  category_entropy_coef: 0.04
+  gaussian_entropy_coef: 0.04
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  solver: self_play   # self_play | discrete_mmd | nfsp | psro | rpn
+  mode: self_play
+  # `self_play` only: 40 x 400 = 16k PPO iterations, one log point per chunk.
+  steps: 40
+  epochs: 400
+  checkpoint_dir: data/blotto_self_play
+  seed: 0
+
+discrete:
+  # `solver: discrete_mmd` -- the bid fraction is one of `bins` evenly spaced
+  # values in [0, 1] instead of a continuous draw. Same knob as on Kuhn/Leduc.
+  bins: 16
+  max_actions: 1024
+
+nfsp:
+  rounds: 20
+  br_steps: 50
+  br_epochs: 20
+  eta: 0.1
+  reservoir_capacity: 200000
+  reservoir_episodes: 8192
+  sl_steps: 400
+  sl_batch: 256
+
+rpn:
+  # `solver: rpn`; see `configs/kuhn_solvers.yaml` for what the knobs mean.
+  iterations: 2000
+  log_every: 50
+  noise_dim: 8
+  estimator: separate
+  sigma: 0.1
+  utility_episodes: 64
+  perturbation_batch: 64
+  antithetic: true
+  dynamics: simultaneous
+  learning_rate: 0.0001
+  optimizer: adabelief
+  max_grad_norm: 0.0
+  strategy_samples: 128
+  br_iterations: 200
+
+psro:
+  rounds: 12
+  br_steps: 50
+  br_epochs: 20
+  payoff_episodes: 20000
+  meta_solver: nash
+
+scoring:
+  exact_grid: null     # unused: Blotto has no exact tree best response
+  score_every: 0       # set >0 for an RL `expl_lb`; otherwise measure offline
+  br_steps: 50
+  br_epochs: 20
+  episodes: 20000
+  include_target: true
