@@ -1,0 +1,69 @@
+# Best-response measurement for configs/disk_sumo_asymmetric.yaml. Keep the
+# entire game block identical to that file: changing shaping or physics here
+# would measure a different game.
+
+game:
+  name: disk_sumo
+  horizon: 100
+  ring_radius: 1.0
+  disk_radius: 0.15
+  start_distance: 0.45
+  start_jitter: 0.04
+  random_orientation: true
+  random_start: false
+  egocentric: true
+  dt: 0.1
+  substeps: 10
+  mass: 1.0
+  max_force: 1.0
+  force_asymmetry: 0.2
+  drag: 0.5
+  stiffness: 400.0
+  contact_damping: 10.0
+  margin_weight: 0.3
+  shaping_weight: 0.5
+
+best_response:
+  checkpoint_dir: data/disk_sumo_asymmetric
+  checkpoint_step: null
+  responder: both
+  opponent_iterate: both
+  eval_episodes: 200000
+  eval_batch_size: 20000
+  eval_seed: 12345
+  progress_episodes: 20000
+
+network:
+  hidden_dims: [64, 64]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 4
+  clip_means: true
+
+optimizer:
+  learning_rate: 0.003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 500
+  trpo_category_kl_coef: 0.0
+  trpo_gaussian_kl_coef: 0.0
+  magnet_category_kl_coef: 0.0
+  magnet_gaussian_kl_coef: 0.0
+  category_entropy_coef: 0.005
+  gaussian_entropy_coef: 0.005
+  advantage: vtrace
+  gamma: 1.0
+  vtrace_lambda: 0.95
+
+train:
+  steps: 40
+  epochs: 300
+  seed: 0

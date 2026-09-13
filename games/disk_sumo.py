@@ -15,6 +15,12 @@ there. With `random_start` both centres are instead drawn uniformly in the ring
 every bout, so a policy has to play from a disk hard against the rim, from the
 middle, and from everything between, and no two bouts open alike.
 
+**Optional force asymmetry.** `force_asymmetry=a` gives one disk a force
+multiplier `1 + a` and the other `1 - a`. The strong disk is chosen uniformly
+at the start of every bout, so neither seat has a systematic advantage. When
+enabled, both multipliers are appended to each player's observation (own
+first), allowing one policy to learn both attacking and defending roles.
+
 **Why every control step is two decisions.** Sumo is a simultaneous-move game,
 and `games.sequential` is turn-taking. The standard extensive-form encoding is
 used, as in `games.sequential_blotto`: player 0 chooses a force, it is parked in
@@ -106,6 +112,7 @@ class DiskSumoState:
     pos: chex.Array  # (2, 2) float32, disk centres, ring centre at the origin
     vel: chex.Array  # (2, 2) float32
     pending: chex.Array  # (2,) float32, player 0's world-frame force this step
+    force_multiplier: chex.Array  # (2,) float32, per-bout actuator strengths
     result: chex.Array  # () float32 in {-1, 0, +1}, from player 0's side
     done: chex.Array  # () bool, the bout ended before the time limit
     turn: chex.Array  # () int32 in [0, 2 * horizon]
@@ -128,6 +135,7 @@ class DiskSumo(SequentialZeroSumGame):
         substeps: int = 10,
         mass: float = 1.0,
         max_force: float = 1.0,
+        force_asymmetry: float = 0.0,
         drag: float = 1.0,
         stiffness: float = 100.0,
         contact_damping: float = 5.0,
@@ -164,6 +172,8 @@ class DiskSumo(SequentialZeroSumGame):
             raise ValueError(
                 f"margin_weight must be in [0, 1] so a win outranks any timeout, got {margin_weight}"
             )
+        if not 0.0 <= force_asymmetry < 1.0:
+            raise ValueError(f"force_asymmetry must be in [0, 1), got {force_asymmetry}")
 
         self.horizon = int(horizon)
         self.ring_radius = float(ring_radius)
@@ -177,6 +187,7 @@ class DiskSumo(SequentialZeroSumGame):
         self.substeps = int(substeps)
         self.mass = float(mass)
         self.max_force = float(max_force)
+        self.force_asymmetry = float(force_asymmetry)
         self.drag = float(drag)
         self.stiffness = float(stiffness)
         self.contact_damping = float(contact_damping)
@@ -199,17 +210,26 @@ class DiskSumo(SequentialZeroSumGame):
         return self._space
 
     def obs_dim(self, player: int) -> int:
-        return 11
+        # Keep symmetric-game checkpoints compatible. The asymmetric role must
+        # be visible, or strength becomes hidden chance instead of something a
+        # policy can condition its attacking/defending behavior on.
+        return 13 if self.force_asymmetry > 0.0 else 11
 
     # ---- the game tree ------------------------------------------------------
 
     def initial_state(self, key: chex.PRNGKey) -> DiskSumoState:
         """Both disks at rest, placed by whichever start `random_start` selects."""
         pos = self._random_start(key) if self.random_start else self._facing_start(key)
+        strong_player = jax.random.bernoulli(jax.random.fold_in(key, 1)).astype(jnp.int32)
+        weak, strong = 1.0 - self.force_asymmetry, 1.0 + self.force_asymmetry
+        force_multiplier = jnp.where(
+            jnp.arange(2) == strong_player, strong, weak
+        ).astype(jnp.float32)
         return DiskSumoState(
             pos=pos.astype(jnp.float32),
             vel=jnp.zeros((2, 2), dtype=jnp.float32),
             pending=jnp.zeros((2,), dtype=jnp.float32),
+            force_multiplier=force_multiplier,
             result=jnp.zeros((), dtype=jnp.float32),
             done=jnp.zeros((), dtype=bool),
             turn=jnp.zeros((), dtype=jnp.int32),
@@ -285,13 +305,19 @@ class DiskSumo(SequentialZeroSumGame):
         rotation = self._frame(state.pos[own], state.pos[opp])
         radii = jnp.linalg.norm(state.pos, axis=-1) / self.ring_radius
         time_left = 1.0 - (state.turn // 2).astype(jnp.float32) / self.horizon
-        return jnp.concatenate([
+        observation = jnp.concatenate([
             rotation @ state.pos[own] / self.ring_radius,
             rotation @ state.vel[own] / self._speed_scale,
             rotation @ state.pos[opp] / self.ring_radius,
             rotation @ state.vel[opp] / self._speed_scale,
             jnp.stack([1.0 - radii[own], 1.0 - radii[opp], time_left]),
         ])
+        if self.force_asymmetry > 0.0:
+            observation = jnp.concatenate([
+                observation,
+                jnp.stack([state.force_multiplier[own], state.force_multiplier[opp]]),
+            ])
+        return observation
 
     def action_mask(self, player: int, state: DiskSumoState) -> chex.Array:
         """`(1,)` all-`True`: pushing is the only kind, and every force is legal."""
@@ -324,7 +350,9 @@ class DiskSumo(SequentialZeroSumGame):
         # promote `pending`, `pos` and `vel`, and break the scans that carry them.
         local = self._space.box.clip(action.value).astype(state.pos.dtype)
         local = local / jnp.maximum(jnp.linalg.norm(local), 1.0)
-        force = self.max_force * (self._frame(own, opp).T @ local)
+        force = self.max_force * state.force_multiplier[player] * (
+            self._frame(own, opp).T @ local
+        )
 
         # Player 0 only parks their force; player 1's choice closes the control
         # step, and both branches are computed because `player` is traced.
@@ -336,6 +364,7 @@ class DiskSumo(SequentialZeroSumGame):
             pos=jnp.where(resolves, pos, state.pos),
             vel=jnp.where(resolves, vel, state.vel),
             pending=jnp.where(resolves, jnp.zeros_like(force), force),
+            force_multiplier=state.force_multiplier,
             result=jnp.where(resolves, result, state.result),
             done=jnp.where(resolves, done, state.done),
             turn=state.turn + 1,

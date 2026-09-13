@@ -303,6 +303,9 @@ class DiskSumoConfig:
     substeps: int = 10
     mass: float = 1.0
     max_force: float = 1.0
+    # Per bout, one randomly selected disk gets multiplier 1 + a and the other
+    # 1 - a. Zero keeps the original symmetric game and 11-D observation.
+    force_asymmetry: float = 0.0
     drag: float = 1.0
     stiffness: float = 100.0
     contact_damping: float = 5.0

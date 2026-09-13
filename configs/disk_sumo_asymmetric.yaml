@@ -1,0 +1,90 @@
+# Random-role asymmetric disk sumo.
+#
+#   python train.py configs/disk_sumo_asymmetric.yaml
+#   python best_response.py configs/disk_sumo_asymmetric_br.yaml
+#
+# One disk has 1.2x force and the other 0.8x force in each bout. The assignment
+# is random and observable, so both seats remain fair while both policies can
+# learn an attacking role and a defending role. This run deliberately uses the
+# same 40k PPO-iteration budget as configs/disk_sumo.yaml for comparison.
+
+game:
+  name: disk_sumo
+  horizon: 100
+  ring_radius: 1.0
+  disk_radius: 0.15
+
+  # Open close enough that engagement is likely, but retain enough jitter to
+  # avoid the exact mirrored head-on state. With radius .15 this gap and jitter
+  # cannot initialize overlapping disks.
+  start_distance: 0.45
+  start_jitter: 0.04
+  random_orientation: true
+  random_start: false
+  egocentric: true
+
+  dt: 0.1
+  substeps: 10
+  mass: 1.0
+  max_force: 1.0
+  force_asymmetry: 0.2   # per-bout multipliers are 1.2 and 0.8, randomly assigned
+  drag: 0.5
+  stiffness: 400.0
+  contact_damping: 10.0
+
+  # Give V-trace positional progress before the sparse terminal outcome. A win
+  # remains strictly better than any timeout because margin_weight < 1.
+  margin_weight: 0.3
+  shaping_weight: 0.5
+
+network:
+  policy: gaussian_mixture
+  hidden_dims: [128, 128]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 4
+  full_covariance: false
+  scale_parameterization: log
+  max_correlation: 0.0
+  sigma_min: 0.1
+  sigma_max: null
+  # Four 2-D buckets cover all quadrants instead of initializing every mean on
+  # the same diagonal of the action box.
+  bucket_means: true
+  clip_means: true
+  mean_box_penalty_coef: 1.0
+
+optimizer:
+  learning_rate: 0.0003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 4000
+  explore_eps: 0.05
+
+  advantage: vtrace
+  gamma: 1.0
+  vtrace_lambda: 0.95
+  vtrace_rho_bar: 1.0
+  vtrace_c_bar: 1.0
+
+  category_entropy_coef: 0.04
+  gaussian_entropy_coef: 0.04
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  mode: self_play
+  steps: 10
+  epochs: 4000
+  checkpoint_dir: data/disk_sumo_asymmetric
+  seed: 0

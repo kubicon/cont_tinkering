@@ -165,6 +165,7 @@ def test_contact_conserves_momentum_without_drag_or_forces():
         pos=jnp.asarray([[-0.2, 0.0], [0.2, 0.05]], dtype=jnp.float32),
         vel=jnp.asarray([[1.0, 0.0], [-0.5, 0.0]], dtype=jnp.float32),
         pending=jnp.zeros((2,), dtype=jnp.float32),
+        force_multiplier=jnp.ones((2,), dtype=jnp.float32),
         result=jnp.zeros((), dtype=jnp.float32),
         done=jnp.zeros((), dtype=bool),
         turn=jnp.asarray(1, dtype=jnp.int32),  # player 1 to act: the next step resolves
@@ -184,6 +185,7 @@ def test_the_disk_that_leaves_first_loses_a_simultaneous_exit():
         pos=jnp.asarray([[-0.95, 0.0], [0.92, 0.0]], dtype=jnp.float32),
         vel=jnp.asarray([[-1.0, 0.0], [1.0, 0.0]], dtype=jnp.float32),
         pending=jnp.zeros((2,), dtype=jnp.float32),
+        force_multiplier=jnp.ones((2,), dtype=jnp.float32),
         result=jnp.zeros((), dtype=jnp.float32),
         done=jnp.zeros((), dtype=bool),
         turn=jnp.asarray(1, dtype=jnp.int32),
@@ -233,6 +235,36 @@ def test_random_start_stays_fair_on_average():
     assert abs(float(np.mean(np.asarray(payoffs)))) < 0.05
 
 
+def test_force_asymmetry_randomizes_an_observable_strong_role():
+    game = _game(force_asymmetry=0.2)
+    states = jax.vmap(game.initial_state)(jax.random.split(jax.random.PRNGKey(9), BATCH))
+    multipliers = np.asarray(states.force_multiplier)
+
+    np.testing.assert_allclose(
+        np.sort(multipliers, axis=-1),
+        np.broadcast_to([0.8, 1.2], multipliers.shape),
+        atol=1e-6,
+    )
+    assert np.any(multipliers[:, 0] > multipliers[:, 1])
+    assert np.any(multipliers[:, 1] > multipliers[:, 0])
+    assert game.obs_dim(0) == game.obs_dim(1) == 13
+
+    state = jax.tree_util.tree_map(lambda x: x[0], states)
+    for player in (0, 1):
+        obs = np.asarray(game.observation(player, state))
+        assert obs[-2] == pytest.approx(multipliers[0, player])
+        assert obs[-1] == pytest.approx(multipliers[0, 1 - player])
+
+
+def test_force_asymmetry_scales_the_applied_force():
+    game = _deterministic(force_asymmetry=0.2)
+    state = game.initial_state(jax.random.PRNGKey(0)).replace(
+        force_multiplier=jnp.asarray([1.2, 0.8], dtype=jnp.float32)
+    )
+    after_0 = game.step(state, _force(1.0, 0.0), jax.random.PRNGKey(1))
+    assert np.linalg.norm(np.asarray(after_0.pending)) == pytest.approx(1.2)
+
+
 def test_random_play_is_fair_on_average():
     game = _game(horizon=30, margin_weight=0.5)
     _, payoffs = jax.vmap(
@@ -246,6 +278,7 @@ def test_random_play_is_fair_on_average():
 @pytest.mark.parametrize("kwargs", [
     dict(horizon=0), dict(substeps=0), dict(ring_radius=0.0), dict(start_distance=0.1),
     dict(start_distance=1.9), dict(margin_weight=1.5), dict(drag=-1.0),
+    dict(force_asymmetry=-0.1), dict(force_asymmetry=1.0),
 ])
 def test_invalid_parameters_are_rejected(kwargs):
     with pytest.raises(ValueError):
