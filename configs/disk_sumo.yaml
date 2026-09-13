@@ -57,8 +57,8 @@ game:
   #                     step. Undiscounted it telescopes to the same kind of
   #                     terminal term, but arrives as it happens -- which only a
   #                     bootstrapping estimator (`ppo.advantage: vtrace`) uses.
-  margin_weight: 0.3
-  shaping_weight: 0.5
+  margin_weight: 0.0
+  shaping_weight: 0.0
 
 network:
   policy: gaussian_mixture  # the only policy a sequential game supports
@@ -76,7 +76,7 @@ network:
   # Confine each component to its own bucket of the box (equal-area boxes, any
   # num_components; a regular grid for 1, 4, 9, ...). Pair with sigma_min ~
   # bucket/4, a bucket being ~ box width / sqrt(num_components) across.
-  bucket_means: true
+  bucket_means: false
   clip_means: true        # keep the means in the [-1, 1]^2 force box
   mean_box_penalty_coef: 1.0    # pulls drifted means back to the box edge
 
@@ -120,7 +120,7 @@ ppo:
 
 train:
   mode: self_play         # the only mode a sequential game supports
-  steps: 100               # outer steps: each logs and writes a checkpoint
+  steps: 10               # outer steps: each logs and writes a checkpoint
   epochs: 4000             # training iterations per outer step
   checkpoint_dir: data/disk_sumo
   seed: 0
