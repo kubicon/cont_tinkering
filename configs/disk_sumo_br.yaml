@@ -13,7 +13,7 @@
 
 game:
   name: disk_sumo
-  horizon: 50             # control steps; 2 * horizon decisions
+  horizon: 100            # control steps; 2 * horizon decisions
   ring_radius: 1.0
   disk_radius: 0.15
   start_distance: 0.6     # centre-to-centre at the start
@@ -75,7 +75,7 @@ network:
   hidden_dims: [64, 64]
   activation: gelu
   normalization: rms_norm
-  num_components: 3   # must match the checkpoint's
+  num_components: 4   # must match the checkpoint's
   clip_means: true
 
 optimizer:
