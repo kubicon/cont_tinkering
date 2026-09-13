@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+from pathlib import Path
 
 import jax
 
@@ -168,12 +169,19 @@ def run_one_direction(
     trainer = SequentialBestResponseTrainer(
         game, opponent, hyperparams, responder=responder, seed=config.train.seed
     )
+    # One directory per measured direction, so responders to different
+    # checkpoint steps, players and iterates never overwrite each other.
+    br_dir = (
+        Path(settings.checkpoint_dir) / "br" / f"step{step}_responder{responder}_vs_{iterate}"
+    )
+    print(f"  saving best-response checkpoints to {br_dir}")
     trainer.train(
         config.train.steps,
         epochs=config.train.epochs,
         metric_fn=build_progress_metric_fn(
             config, jax.random.PRNGKey(_eval_seed(settings, responder, iterate)), resp_iterates
         ),
+        checkpoint_dir=br_dir,
     )
 
     # One key per readout: the two estimates are then independent, so agreement

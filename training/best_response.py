@@ -14,7 +14,7 @@ import jax.numpy as jnp
 from games.sequential import TERMINAL, SequentialZeroSumGame
 from games.spaces import MASKED_LOGIT, HybridAction, HybridSpace
 
-from .checkpoint import load_checkpoint_step_multi, target_entry
+from .checkpoint import load_checkpoint_step_multi, save_checkpoint_step_multi, target_entry
 from .config import MixturePPOHyperparams
 from .mixture import (
     MixtureActorCritic,
@@ -411,8 +411,12 @@ class SequentialBestResponseTrainer:
         steps: int,
         epochs: int = 10,
         metric_fn: Callable[["SequentialBestResponseTrainer"], dict[str, float]] | None = None,
+        checkpoint_dir: str | Path | None = None,
     ) -> list[dict]:
         """Trains for `steps` chunks of `epochs` `lax.scan`-ned iterations each.
+
+        With `checkpoint_dir`, writes `{step}.pkl` there once per chunk (and at
+        step 0), in the layout `save` describes.
         """
         def commit(state) -> None:
             self.state = state
@@ -435,5 +439,30 @@ class SequentialBestResponseTrainer:
             history=self.history,
             format_record=format_record,
             metric_fn=(lambda: metric_fn(self)) if metric_fn is not None else None,
+            checkpoint_fn=(
+                (lambda step: self.save(checkpoint_dir, step)) if checkpoint_dir is not None else None
+            ),
         )
         return self.history
+
+    def save(self, checkpoint_dir: str | Path, step: int) -> None:
+        """The same `{step}.pkl` layout as `SequentialSelfPlayPPOTrainer.save`.
+
+        The responder's live and Polyak-averaged params go under its own
+        `player_{p}` entries, and the frozen opponent under the other player's
+        (the same params as both its live and target entry, since it does not
+        train). The file is then a complete strategy pair, so anything that
+        reads a self-play checkpoint -- `load_frozen_policy`, the sumo renderers
+        -- plays the best response against the strategy it was trained on.
+        """
+        responder, opponent = f"player_{self.responder}", f"player_{self.opponent_player}"
+        save_checkpoint_step_multi(
+            checkpoint_dir,
+            step,
+            {
+                responder: (self.hyperparams, self.state.params),
+                target_entry(responder): (self.hyperparams, self.state.target_params),
+                opponent: (self.opponent.hyperparams, self.opponent.params),
+                target_entry(opponent): (self.opponent.hyperparams, self.opponent.params),
+            },
+        )

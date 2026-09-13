@@ -117,5 +117,9 @@ train:
   steps: 40
   epochs: 300
   seed: 0
-  # `mode` and `checkpoint_dir` are ignored here: a best response is a
-  # measurement of somebody else's strategy, not a strategy to keep.
+  # `mode` and `checkpoint_dir` are ignored here. The responder's checkpoints go
+  # to `best_response.checkpoint_dir/br/step{S}_responder{P}_vs_{iterate}/{t}.pkl`,
+  # in the self-play layout (opponent included), so e.g.
+  #   python scripts/render_disk_sumo.py configs/disk_sumo.yaml \
+  #       --checkpoint-dir data/disk_sumo/br/step21_responder0_vs_live
+  # renders the best response against the strategy it beat.
