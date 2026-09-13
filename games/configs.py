@@ -18,6 +18,7 @@ import jax.numpy as jnp
 
 from .base import ZeroSumGame
 from .disk_sumo import DiskSumo
+from .mjx_sumo import MjxAntSumo, MjxBugSumo, MjxSpiderSumo, MjxSumo
 from .examples import (
     AllPayAuctionGame,
     AsymmetricWellGame,
@@ -293,6 +294,10 @@ class DiskSumoConfig:
     start_distance: float = 0.6
     start_jitter: float = 0.05
     random_orientation: bool = True
+    # Place both disks uniformly in the ring every bout, instead of facing each
+    # other across the centre; `start_distance`, `start_jitter` and
+    # `random_orientation` are then unused.
+    random_start: bool = False
     egocentric: bool = True
     dt: float = 0.1
     substeps: int = 10
@@ -308,6 +313,105 @@ class DiskSumoConfig:
 
     def build(self) -> SequentialZeroSumGame:
         return DiskSumo(**dataclasses.asdict(self))
+
+
+@dataclasses.dataclass
+class MjxSumoConfig:
+    """`disk_sumo` on MuJoCo/MJX physics instead of the hand-rolled integrator.
+
+    Same game, same 11-dimensional observation, same `[-1, 1]^2` egocentric
+    force, so a `disk_sumo` config transfers by changing `name` and swapping the
+    contact parameters (`stiffness` / `contact_damping` become the `solref`
+    pair). See `games/mjx_sumo.py`. Like `disk_sumo` it has no exact best
+    response; measure checkpoints with `best_response.py`.
+    """
+
+    horizon: int = 50
+    ring_radius: float = 1.0
+    disk_radius: float = 0.15
+    start_distance: float = 0.6
+    start_jitter: float = 0.05
+    random_orientation: bool = True
+    egocentric: bool = True
+    dt: float = 0.1
+    substeps: int = 10
+    mass: float = 1.0
+    max_force: float = 1.0
+    drag: float = 1.0
+    # MuJoCo contact softness, as (timeconst, dampratio); smaller is harder.
+    solref_timeconst: float = 0.02
+    solref_dampratio: float = 1.0
+    # One contact converges in far fewer than MuJoCo's default 100 iterations.
+    solver_iterations: int = 4
+    solver_ls_iterations: int = 8
+    # Timeout tie-breaker weight on the distance-from-centre gap; 0 is pure sumo.
+    margin_weight: float = 0.0
+    # Dense potential-based shaping on the same distance gap; 0 is terminal-only.
+    shaping_weight: float = 0.0
+
+    def build(self) -> SequentialZeroSumGame:
+        return MjxSumo(**dataclasses.asdict(self))
+
+
+@dataclasses.dataclass
+class MjxAntSumoConfig:
+    """Two MuJoCo ants pushing each other out of a ring -- RoboSumo, in JAX.
+
+    The articulated counterpart of `mjx_sumo`: the action is eight joint
+    torques rather than a force, the observation is 65-dimensional, and an
+    agent loses by leaving the ring *or* by ending up on its back
+    (`knockdown_height`). See `games/mjx_sumo.py`. No exact best response;
+    measure checkpoints with `best_response.py`.
+    """
+
+    horizon: int = 80
+    ring_radius: float = 3.0
+    start_distance: float = 2.4
+    start_jitter: float = 0.1
+    random_orientation: bool = True
+    dt: float = 0.05
+    substeps: int = 5
+    gear: float = 150.0
+    # The height an ant stands at, and the one below which it counts as downed.
+    start_height: float = 0.55
+    knockdown_height: float = 0.3
+    # Pure input normalization: a walking ant has no closed-form top speed.
+    velocity_scale: float = 5.0
+    angular_scale: float = 10.0
+    joint_velocity_scale: float = 10.0
+    solver_iterations: int = 4
+    solver_ls_iterations: int = 8
+    # Timeout tie-breaker weight on the distance-from-centre gap; 0 is pure sumo.
+    margin_weight: float = 0.0
+    # Dense potential-based shaping on the same distance gap; 0 is terminal-only.
+    shaping_weight: float = 0.0
+
+    def build(self) -> SequentialZeroSumGame:
+        return MjxAntSumo(**dataclasses.asdict(self))
+
+
+@dataclasses.dataclass
+class MjxBugSumoConfig(MjxAntSumoConfig):
+    """`mjx_ant_sumo` with six legs instead of four: 12 torques, 81 observations.
+
+    Harder to tip and slower to turn than the ant, and the most expensive of the
+    three to simulate.
+    """
+
+    def build(self) -> SequentialZeroSumGame:
+        return MjxBugSumo(**dataclasses.asdict(self))
+
+
+@dataclasses.dataclass
+class MjxSpiderSumoConfig(MjxAntSumoConfig):
+    """`mjx_ant_sumo` with three legs instead of four: 6 torques, 57 observations.
+
+    A tripod has no stability margin, so `knockdown_height` decides far more
+    bouts here than it does for the ant. The cheapest of the three.
+    """
+
+    def build(self) -> SequentialZeroSumGame:
+        return MjxSpiderSumo(**dataclasses.asdict(self))
 
 
 @dataclasses.dataclass
@@ -370,4 +474,8 @@ GAME_CONFIGS: dict[str, type] = {
     "leduc": LeducConfig,
     "sequential_blotto": SequentialBlottoConfig,
     "disk_sumo": DiskSumoConfig,
+    "mjx_sumo": MjxSumoConfig,
+    "mjx_ant_sumo": MjxAntSumoConfig,
+    "mjx_bug_sumo": MjxBugSumoConfig,
+    "mjx_spider_sumo": MjxSpiderSumoConfig,
 }

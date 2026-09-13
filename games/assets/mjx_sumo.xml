@@ -1,0 +1,75 @@
+<!--
+  Stage-1 MJX sumo arena: two pucks in a ring, real contact solver.
+
+  `games/mjx_sumo.py` reads this as a `str.format` template and fills in the
+  placeholders from its constructor arguments, so every number a config can set
+  lives here exactly once. Do not put literal braces in this file.
+
+  The model is deliberately the smallest one that still exercises the whole MJX
+  path (put_model -> Data in a scan carry -> vmap -> jit):
+
+    * No gravity and no floor. Each puck has two slide joints (world x and y)
+      and nothing else, so it cannot tip, bounce or leave the plane. The only
+      contact in the model is puck-against-puck, which is the one the game is
+      actually about.
+    * The ring is a *rule*, not a geom: a puck is out once its centre passes
+      `ring_radius`, tested by `games/mjx_sumo.py` per substep. A physical
+      platform edge would add falling, tumbling and a second contact pair for
+      no gain at this stage.
+    * Joint damping stands in for drag, so a puck under full thrust settles at
+      `max_force / drag` rather than accelerating forever.
+    * One motor per joint, `ctrlrange` [-1, 1] with `gear = max_force`: the
+      control the policy emits *is* the normalized force, and the game only has
+      to rotate it out of the egocentric frame.
+
+  Stage 2 (articulated bodies) replaces the two <body> blocks and the
+  <actuator> list; everything in `games/mjx_sumo.py` except `_OBS_DIM` and the
+  qpos/qvel layout survives unchanged.
+-->
+<mujoco model="mjx_sumo">
+  <!--
+    `timestep` is the *substep*: the game takes `substeps` of these per control
+    step, so one control step advances `dt` seconds. Newton with few iterations
+    is the standard MJX setting -- this model has a single contact, so the
+    solver converges long before the default 100 iterations.
+  -->
+  <option timestep="{timestep}" gravity="0 0 0" integrator="Euler"
+          solver="Newton" iterations="{iterations}" ls_iterations="{ls_iterations}"/>
+
+  <default>
+    <joint type="slide" damping="{drag}" limited="false"/>
+    <!--
+      `solref` is MuJoCo's contact softness as (timeconst, dampratio): the
+      stiffness/damping pair of `games/disk_sumo.py`, in the units the solver
+      actually takes. Smaller timeconst is a harder contact.
+    -->
+    <geom type="sphere" size="{disk_radius}" mass="{mass}" condim="3"
+          solref="{solref_timeconst} {solref_dampratio}"/>
+    <motor gear="{max_force}" ctrlrange="-1 1" ctrllimited="true"/>
+  </default>
+
+  <worldbody>
+    <!--
+      Both bodies sit at the origin; the start positions are qpos, written by
+      `initial_state`. qpos is therefore [p0_x, p0_y, p1_x, p1_y] and qvel the
+      same, which is what `_positions` / `_velocities` reshape to (2, 2).
+    -->
+    <body name="p0">
+      <joint name="p0_x" axis="1 0 0"/>
+      <joint name="p0_y" axis="0 1 0"/>
+      <geom name="p0_geom"/>
+    </body>
+    <body name="p1">
+      <joint name="p1_x" axis="1 0 0"/>
+      <joint name="p1_y" axis="0 1 0"/>
+      <geom name="p1_geom"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor joint="p0_x"/>
+    <motor joint="p0_y"/>
+    <motor joint="p1_x"/>
+    <motor joint="p1_y"/>
+  </actuator>
+</mujoco>

@@ -12,6 +12,15 @@ from .kuhn_best_response import (
     exploitability,
     game_value,
 )
+from .mjx_sumo import (
+    MjxAntSumo,
+    MjxBugSumo,
+    MjxLeggedSumo,
+    MjxSpiderSumo,
+    MjxSumo,
+    MjxSumoBase,
+    MjxSumoState,
+)
 from .sequential import SequentialZeroSumGame, TERMINAL
 from .sequential_blotto import BlottoState, ContinuousSequentialBlotto
 from .sequential_examples import ContinuousKuhnPoker, KuhnState
@@ -44,6 +53,13 @@ __all__ = [
     "BlottoState",
     "DiskSumo",
     "DiskSumoState",
+    "MjxSumo",
+    "MjxAntSumo",
+    "MjxBugSumo",
+    "MjxSpiderSumo",
+    "MjxLeggedSumo",
+    "MjxSumoBase",
+    "MjxSumoState",
     "ContinuousLeducHoldem",
     "KuhnStrategy",
     "analytic_equilibrium",

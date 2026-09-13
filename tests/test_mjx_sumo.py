@@ -1,11 +1,19 @@
-"""Rules-level checks for `games.disk_sumo.DiskSumo`.
+"""Rules-level checks for `games.mjx_sumo.MjxSumo`.
 
-Two halves, as in `test_sequential_blotto.py`: the `games.sequential` contract a
-batched, `jit`ed rollout depends on (fixed shapes, a bounded horizon, absorbing
-terminal states), and the sumo rules themselves -- that pushing an idle opponent
-wins, that the two seats are mirror images, that contact conserves momentum, and
-above all that player 1 never sees player 0's force for the live control step,
-which is what makes the two decisions one simultaneous move.
+Deliberately the same suite as `test_disk_sumo.py`, because `MjxSumo` is meant
+to be the same game on a real solver: the `games.sequential` contract a batched,
+`jit`ed rollout depends on (fixed shapes, a bounded horizon, absorbing terminal
+states), then the sumo rules themselves -- pushing an idle opponent wins, the
+two seats are mirror images, contact conserves momentum, and above all player 1
+never sees player 0's force for the live control step.
+
+On top of that there are the checks that only make sense here: that the state
+carrying an `mjx.Data` still survives the terminal-state guard leafwise, that it
+`vmap`s, and that MuJoCo's physics reproduces the drag law the observation's
+velocity scale assumes.
+
+MJX on CPU is slow, so the horizons and batches here are the smallest ones that
+still make each assertion meaningful.
 """
 
 from __future__ import annotations
@@ -15,15 +23,22 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from games.disk_sumo import DiskSumo, DiskSumoState
+from games.mjx_sumo import MjxSumo, MjxSumoState
 from games.sequential import TERMINAL
 from games.spaces import HybridAction
 
-BATCH = 256
+BATCH = 32
 
 
-def _game(**kwargs) -> DiskSumo:
-    return DiskSumo(**kwargs)
+def _game(**kwargs) -> MjxSumo:
+    kwargs.setdefault("horizon", 20)
+    kwargs.setdefault("substeps", 4)
+    return MjxSumo(**kwargs)
+
+
+def _deterministic(**kwargs) -> MjxSumo:
+    """Fixed facing axis and no jitter: the start is exactly symmetric."""
+    return _game(random_orientation=False, start_jitter=0.0, **kwargs)
 
 
 def _force(x: float, y: float) -> HybridAction:
@@ -37,16 +52,23 @@ def _constant(x: float, y: float):
     return lambda obs, mask, key: action
 
 
-def _deterministic(**kwargs) -> DiskSumo:
-    """Fixed facing axis and no jitter: the start is exactly symmetric."""
-    return _game(random_orientation=False, start_jitter=0.0, **kwargs)
+def _state(game: MjxSumo, pos, vel, turn: int) -> MjxSumoState:
+    """A hand-built state: `pos`/`vel` are `(2, 2)`, laid into `qpos`/`qvel`."""
+    state = game.initial_state(jax.random.PRNGKey(0))
+    return state.replace(
+        data=state.data.replace(
+            qpos=jnp.asarray(pos, dtype=jnp.float32).reshape(-1),
+            qvel=jnp.asarray(vel, dtype=jnp.float32).reshape(-1),
+        ),
+        turn=jnp.asarray(turn, dtype=jnp.int32),
+    )
 
 
 # ---- the sequential-game contract ------------------------------------------
 
 
 def test_random_play_terminates_within_max_steps_with_bounded_payoffs():
-    game = _game(horizon=20, margin_weight=0.5)
+    game = _game(margin_weight=0.5)
     finals, payoffs = jax.vmap(
         lambda key: game.play_episode(
             (game.random_action_fn(0), game.random_action_fn(1)), key
@@ -60,6 +82,7 @@ def test_random_play_terminates_within_max_steps_with_bounded_payoffs():
 
 
 def test_stepping_a_terminal_state_is_a_noop():
+    """The guard in `games.sequential.step` has to hold across every `mjx.Data` leaf."""
     game = _deterministic(horizon=2)
     state = game.initial_state(jax.random.PRNGKey(0))
     for _ in range(game.max_steps):
@@ -67,7 +90,9 @@ def test_stepping_a_terminal_state_is_a_noop():
     assert int(game.current_player(state)) == TERMINAL
 
     stepped = game.step(state, _force(-1.0, 1.0), jax.random.PRNGKey(7))
-    for before, after in zip(jax.tree_util.tree_leaves(state), jax.tree_util.tree_leaves(stepped)):
+    leaves = jax.tree_util.tree_leaves(state)
+    assert len(leaves) > 10  # the mjx.Data arrays, not just the bookkeeping fields
+    for before, after in zip(leaves, jax.tree_util.tree_leaves(stepped)):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
@@ -88,10 +113,12 @@ def test_players_alternate_and_the_physics_waits_for_player_one():
     assert int(game.current_player(state)) == 0
     after_0 = game.step(state, _force(1.0, 0.0), jax.random.PRNGKey(1))
     assert int(game.current_player(after_0)) == 1
-    np.testing.assert_array_equal(np.asarray(after_0.pos), np.asarray(state.pos))
+    np.testing.assert_array_equal(
+        np.asarray(after_0.data.qpos), np.asarray(state.data.qpos)
+    )
     after_1 = game.step(after_0, _force(1.0, 0.0), jax.random.PRNGKey(2))
     assert int(game.current_player(after_1)) == 0
-    assert not np.allclose(np.asarray(after_1.pos), np.asarray(state.pos))
+    assert not np.allclose(np.asarray(after_1.data.qpos), np.asarray(state.data.qpos))
 
 
 # ---- information ------------------------------------------------------------
@@ -122,7 +149,7 @@ def test_a_symmetric_start_looks_identical_from_both_seats():
 
 
 def test_charging_an_idle_opponent_pushes_them_out():
-    game = _deterministic()
+    game = _deterministic(horizon=50)
     final, payoff = game.play_episode((_constant(1.0, 0.0), _constant(0.0, 0.0)), jax.random.PRNGKey(0))
     assert bool(final.done) and float(payoff) == 1.0
     final, payoff = game.play_episode((_constant(0.0, 0.0), _constant(1.0, 0.0)), jax.random.PRNGKey(0))
@@ -130,7 +157,7 @@ def test_charging_an_idle_opponent_pushes_them_out():
 
 
 def test_equal_head_on_charges_stalemate_at_zero():
-    game = _deterministic(margin_weight=0.5)
+    game = _deterministic(horizon=50, margin_weight=0.5)
     final, payoff = game.play_episode((_constant(1.0, 0.0), _constant(1.0, 0.0)), jax.random.PRNGKey(0))
     assert not bool(final.done)
     assert abs(float(payoff)) < 1e-5
@@ -138,115 +165,89 @@ def test_equal_head_on_charges_stalemate_at_zero():
 
 def test_the_timeout_margin_rewards_the_disk_nearer_the_centre():
     game = _deterministic(margin_weight=0.5)
-    state = game.initial_state(jax.random.PRNGKey(0)).replace(
-        pos=jnp.asarray([[0.1, 0.0], [0.7, 0.0]], dtype=jnp.float32),
-        turn=jnp.asarray(game.max_steps, dtype=jnp.int32),
-    )
+    state = _state(game, [[0.1, 0.0], [0.7, 0.0]], jnp.zeros((2, 2)), turn=game.max_steps)
     assert int(game.current_player(state)) == TERMINAL
-    assert float(game.payoff(state)) == pytest.approx(0.5 * 0.6)
+    assert float(game.payoff(state)) == pytest.approx(0.5 * 0.6, abs=1e-6)
     assert float(_deterministic(margin_weight=0.0).payoff(state)) == 0.0
 
 
 def test_diagonal_forces_are_no_stronger_than_straight_ones():
+    """The unit-disk projection, not the `[-1, 1]^2` box, is what bounds a push."""
     game = _deterministic(drag=0.0)
     state = game.initial_state(jax.random.PRNGKey(0))
     straight = game.step(game.step(state, _force(0.0, 1.0), jax.random.PRNGKey(1)),
                          _force(0.0, 0.0), jax.random.PRNGKey(2))
     diagonal = game.step(game.step(state, _force(1.0, 1.0), jax.random.PRNGKey(1)),
                          _force(0.0, 0.0), jax.random.PRNGKey(2))
-    assert np.linalg.norm(np.asarray(diagonal.vel[0])) == pytest.approx(
-        np.linalg.norm(np.asarray(straight.vel[0])), rel=1e-5
-    )
+    speed = lambda s: np.linalg.norm(np.asarray(game._velocities(s)[0]))
+    assert speed(diagonal) == pytest.approx(speed(straight), rel=1e-5)
 
 
 def test_contact_conserves_momentum_without_drag_or_forces():
-    game = _deterministic(drag=0.0, contact_damping=0.0)
-    state = DiskSumoState(
-        pos=jnp.asarray([[-0.2, 0.0], [0.2, 0.05]], dtype=jnp.float32),
-        vel=jnp.asarray([[1.0, 0.0], [-0.5, 0.0]], dtype=jnp.float32),
-        pending=jnp.zeros((2,), dtype=jnp.float32),
-        result=jnp.zeros((), dtype=jnp.float32),
-        done=jnp.zeros((), dtype=bool),
-        turn=jnp.asarray(1, dtype=jnp.int32),  # player 1 to act: the next step resolves
+    game = _deterministic(drag=0.0)
+    state = _state(
+        game, [[-0.2, 0.0], [0.2, 0.05]], [[1.0, 0.0], [-0.5, 0.0]],
+        turn=1,  # player 1 to act: the next step resolves
     )
     stepped = game.step(state, _force(0.0, 0.0), jax.random.PRNGKey(0))
     # They collided (the velocities changed) ...
-    assert not np.allclose(np.asarray(stepped.vel), np.asarray(state.vel))
+    assert not np.allclose(np.asarray(stepped.data.qvel), np.asarray(state.data.qvel))
     # ... and total momentum did not.
     np.testing.assert_allclose(
-        np.asarray(stepped.vel).sum(axis=0), np.asarray(state.vel).sum(axis=0), atol=1e-5
+        np.asarray(game._velocities(stepped)).sum(axis=0),
+        np.asarray(game._velocities(state)).sum(axis=0),
+        atol=1e-5,
     )
 
 
 def test_the_disk_that_leaves_first_loses_a_simultaneous_exit():
     game = _deterministic(drag=0.0)
-    state = DiskSumoState(
-        pos=jnp.asarray([[-0.95, 0.0], [0.92, 0.0]], dtype=jnp.float32),
-        vel=jnp.asarray([[-1.0, 0.0], [1.0, 0.0]], dtype=jnp.float32),
-        pending=jnp.zeros((2,), dtype=jnp.float32),
-        result=jnp.zeros((), dtype=jnp.float32),
-        done=jnp.zeros((), dtype=bool),
-        turn=jnp.asarray(1, dtype=jnp.int32),
-    )
+    state = _state(game, [[-0.95, 0.0], [0.92, 0.0]], [[-1.0, 0.0], [1.0, 0.0]], turn=1)
     stepped = game.step(state, _force(0.0, 0.0), jax.random.PRNGKey(0))
     assert bool(stepped.done)
-    assert np.all(np.linalg.norm(np.asarray(stepped.pos), axis=-1) > game.ring_radius)
+    assert np.all(np.linalg.norm(np.asarray(game._positions(stepped)), axis=-1) > game.ring_radius)
     assert float(game.payoff(stepped)) == -1.0  # player 0 was nearer the edge
 
 
-def test_random_start_places_both_disks_legally():
-    """Inside the ring, whole disk in, and never already in contact."""
-    game = _game(random_start=True)
-    pos = np.asarray(jax.vmap(game.initial_state)(jax.random.split(jax.random.PRNGKey(0), BATCH)).pos)
-    radii = np.linalg.norm(pos, axis=-1)
-    gaps = np.linalg.norm(pos[:, 1] - pos[:, 0], axis=-1)
-    assert np.all(radii <= game.ring_radius - game.disk_radius + 1e-5)
-    assert np.all(gaps >= 2.0 * game.disk_radius)
-
-
-def test_random_start_reaches_both_the_middle_and_the_rim():
-    """The point of it: a bout can open anywhere, not just where the facing start is."""
-    game = _game(random_start=True)
-    pos = np.asarray(jax.vmap(game.initial_state)(jax.random.split(jax.random.PRNGKey(1), BATCH)).pos)
-    radii = np.linalg.norm(pos, axis=-1)
-    assert radii.min() < 0.2 and radii.max() > 0.8
-    # Uniform on the area of a disk of radius r has mean radius 2r/3.
-    assert abs(radii.mean() - 2.0 / 3.0 * (game.ring_radius - game.disk_radius)) < 0.05
-
-
-def test_random_start_is_off_by_default():
-    """The facing start is untouched: mirrored across the centre, `start_distance` apart."""
-    game = _deterministic()
-    pos = np.asarray(game.initial_state(jax.random.PRNGKey(0)).pos)
-    np.testing.assert_allclose(pos[0], -pos[1], atol=1e-6)
-    assert float(np.linalg.norm(pos[1] - pos[0])) == pytest.approx(game.start_distance, abs=1e-5)
-
-
-def test_random_start_stays_fair_on_average():
-    """Both seats are drawn from the same distribution, so neither gains from it."""
-    game = _game(horizon=30, margin_weight=0.5, random_start=True)
-    _, payoffs = jax.vmap(
-        lambda key: game.play_episode(
-            (game.random_action_fn(0), game.random_action_fn(1)), key
-        )
-    )(jax.random.split(jax.random.PRNGKey(2), 2000))
-    assert abs(float(np.mean(np.asarray(payoffs)))) < 0.05
-
-
 def test_random_play_is_fair_on_average():
-    game = _game(horizon=30, margin_weight=0.5)
+    game = _game(margin_weight=0.5)
     _, payoffs = jax.vmap(
         lambda key: game.play_episode(
             (game.random_action_fn(0), game.random_action_fn(1)), key
         )
-    )(jax.random.split(jax.random.PRNGKey(1), 2000))
-    assert abs(float(np.mean(np.asarray(payoffs)))) < 0.05
+    )(jax.random.split(jax.random.PRNGKey(1), 128))
+    assert abs(float(np.mean(np.asarray(payoffs)))) < 0.1
+
+
+# ---- the physics the observation assumes ------------------------------------
+
+
+def test_a_lone_puck_settles_at_the_speed_the_observation_normalizes_by():
+    """`_speed_scale` is `max_force / drag`; MuJoCo's joint damping has to agree.
+
+    The observation divides velocities by it, so if the two disagree the network
+    sees an input whose scale is silently wrong -- which no rules test catches.
+
+    Player 0 pushes *away* from the opponent (egocentric x points at them, so
+    `(-1, 0)` retreats) in an oversized ring: no contact to share the drag with,
+    and no exit before the clock runs out, which is what makes this the one-body
+    drag law rather than a two-body one.
+    """
+    game = _deterministic(horizon=40, substeps=10, ring_radius=5.0, max_force=1.0, drag=2.0)
+    final, _ = game.play_episode((_constant(-1.0, 0.0), _constant(0.0, 0.0)), jax.random.PRNGKey(0))
+    assert not bool(final.done)  # nobody left the ring, so the puck ran free throughout
+    positions = np.asarray(game._positions(final))
+    assert np.linalg.norm(positions[0] - positions[1]) > 2 * game.disk_radius  # never touched
+    assert game._speed_scale == pytest.approx(0.5)
+    speed = np.linalg.norm(np.asarray(game._velocities(final)[0]))
+    assert speed == pytest.approx(game._speed_scale, rel=0.02)
 
 
 @pytest.mark.parametrize("kwargs", [
     dict(horizon=0), dict(substeps=0), dict(ring_radius=0.0), dict(start_distance=0.1),
     dict(start_distance=1.9), dict(margin_weight=1.5), dict(drag=-1.0),
+    dict(solref_timeconst=0.0), dict(solver_iterations=0),
 ])
 def test_invalid_parameters_are_rejected(kwargs):
     with pytest.raises(ValueError):
-        _game(**kwargs)
+        MjxSumo(**kwargs)

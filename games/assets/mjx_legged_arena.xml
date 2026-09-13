@@ -1,0 +1,28 @@
+<!--
+  The arena two sumo ants are attached into (see `games/assets/mjx_legged.xml`).
+
+  Unlike the Stage-1 puck model this one has gravity and a floor, because an
+  articulated body's whole problem is staying on its feet. The ring is still a
+  *rule* and not a geom -- an agent is out once its torso passes `ring_radius`
+  -- so the floor is a plain infinite plane and nothing can fall off an edge.
+  The plane's bitmasks collide with every agent mask (`games/mjx_sumo.py` picks
+  them so that bit 0 is the floor).
+
+  `str.format` template; do not put literal braces in this file.
+-->
+<mujoco model="mjx_legged_arena">
+  <compiler angle="degree" coordinate="local" inertiafromgeom="true"/>
+
+  <!--
+    `timestep` is the substep. Newton with few iterations is the standard MJX
+    setting; an ant pair runs a dozen-odd contacts, far short of needing
+    MuJoCo's default 100 iterations.
+  -->
+  <option timestep="{timestep}" gravity="0 0 -9.81" integrator="Euler"
+          solver="Newton" iterations="{iterations}" ls_iterations="{ls_iterations}"/>
+
+  <worldbody>
+    <geom name="floor" type="plane" pos="0 0 0" size="0 0 1" condim="3"
+          friction="1 0.5 0.5" contype="1" conaffinity="1" rgba="0.8 0.9 0.8 1"/>
+  </worldbody>
+</mujoco>

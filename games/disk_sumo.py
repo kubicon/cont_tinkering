@@ -8,6 +8,13 @@ drag and a penalty-spring contact between them, and the first disk whose
 *centre* leaves the ring loses. Everything is `jnp`, so the rollout `jit`s and
 `vmap`s exactly like the card games do.
 
+**Where a bout starts.** By default the disks face each other across the
+centre, `start_distance` apart, on an axis that is uniform on the circle -- a
+symmetric position, which is what makes a symmetric pair of policies stalemate
+there. With `random_start` both centres are instead drawn uniformly in the ring
+every bout, so a policy has to play from a disk hard against the rim, from the
+middle, and from everything between, and no two bouts open alike.
+
 **Why every control step is two decisions.** Sumo is a simultaneous-move game,
 and `games.sequential` is turn-taking. The standard extensive-form encoding is
 used, as in `games.sequential_blotto`: player 0 chooses a force, it is parked in
@@ -71,6 +78,11 @@ from .spaces import HybridAction, HybridSpace, hybrid
 # A force is a pure continuous action: no parameterless choice alongside it.
 NUM_ATOMS = 0
 
+# Placement attempts `random_start` draws before falling back to the facing
+# start. The gap it asks for is small next to the ring, so one attempt almost
+# always suffices; 16 makes the fallback unreachable in practice.
+_START_ATTEMPTS = 16
+
 # Guards the contact normal and the egocentric frame against coincident centres
 # (unreachable in play -- the contact spring keeps the disks apart -- but the
 # computation must not produce a NaN on the way to being discarded).
@@ -110,6 +122,7 @@ class DiskSumo(SequentialZeroSumGame):
         start_distance: float = 0.6,
         start_jitter: float = 0.05,
         random_orientation: bool = True,
+        random_start: bool = False,
         egocentric: bool = True,
         dt: float = 0.1,
         substeps: int = 10,
@@ -158,6 +171,7 @@ class DiskSumo(SequentialZeroSumGame):
         self.start_distance = float(start_distance)
         self.start_jitter = float(start_jitter)
         self.random_orientation = bool(random_orientation)
+        self.random_start = bool(random_start)
         self.egocentric = bool(egocentric)
         self.dt = float(dt)
         self.substeps = int(substeps)
@@ -190,11 +204,23 @@ class DiskSumo(SequentialZeroSumGame):
     # ---- the game tree ------------------------------------------------------
 
     def initial_state(self, key: chex.PRNGKey) -> DiskSumoState:
-        """The disks face each other across the centre, at rest.
+        """Both disks at rest, placed by whichever start `random_start` selects."""
+        pos = self._random_start(key) if self.random_start else self._facing_start(key)
+        return DiskSumoState(
+            pos=pos.astype(jnp.float32),
+            vel=jnp.zeros((2, 2), dtype=jnp.float32),
+            pending=jnp.zeros((2,), dtype=jnp.float32),
+            result=jnp.zeros((), dtype=jnp.float32),
+            done=jnp.zeros((), dtype=bool),
+            turn=jnp.zeros((), dtype=jnp.int32),
+        )
+
+    def _facing_start(self, key: chex.PRNGKey) -> chex.Array:
+        """`(2, 2)`: the disks face each other across the centre, `start_distance` apart.
 
         The axis they face along is uniform on the circle when
         `random_orientation`, and each centre is jittered by up to
-        `start_jitter` per coordinate -- the only chance moves in the game.
+        `start_jitter` per coordinate.
         """
         angle_key, jitter_key = jax.random.split(key)
         angle = (
@@ -206,15 +232,36 @@ class DiskSumo(SequentialZeroSumGame):
         jitter = jax.random.uniform(
             jitter_key, (2, 2), minval=-self.start_jitter, maxval=self.start_jitter
         )
-        pos = jnp.stack([-half * axis, half * axis]) + jitter
-        return DiskSumoState(
-            pos=pos.astype(jnp.float32),
-            vel=jnp.zeros((2, 2), dtype=jnp.float32),
-            pending=jnp.zeros((2,), dtype=jnp.float32),
-            result=jnp.zeros((), dtype=jnp.float32),
-            done=jnp.zeros((), dtype=bool),
-            turn=jnp.zeros((), dtype=jnp.int32),
-        )
+        return jnp.stack([-half * axis, half * axis]) + jitter
+
+    def _random_start(self, key: chex.PRNGKey) -> chex.Array:
+        """`(2, 2)`: both centres uniform in the ring, far enough apart not to start in contact.
+
+        Uniform on the disk of radius `ring_radius - disk_radius` -- `sqrt` of a
+        uniform radius, or the draw crowds the centre -- so a bout can open
+        anywhere, including hard against the rim with the opponent between the
+        disk and the middle. That is the point of it: the facing start is
+        symmetric, and a policy trained only on symmetric starts has never seen
+        the position it most needs to play well from. It also breaks the
+        stalemate the symmetric start invites, where two equal disks push
+        head-on and neither can gain ground.
+
+        `_START_ATTEMPTS` independent pairs are drawn and the first with a legal
+        gap is kept, which is uniform conditioned on that gap and -- unlike a
+        rejection loop -- one fixed shape, so this still `jit`s and `vmap`s.
+        The facing start is the fallback for the vanishingly unlikely draw where
+        every pair overlaps.
+        """
+        radius = self.ring_radius - self.disk_radius
+        radius_key, angle_key, fallback_key = jax.random.split(key, 3)
+        # sqrt of a uniform is what makes the *area* uniform rather than the radius.
+        radii = radius * jnp.sqrt(jax.random.uniform(radius_key, (_START_ATTEMPTS, 2)))
+        angles = jax.random.uniform(angle_key, (_START_ATTEMPTS, 2), maxval=2.0 * jnp.pi)
+        candidates = radii[..., None] * jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
+
+        legal = jnp.linalg.norm(candidates[:, 1] - candidates[:, 0], axis=-1) > 2.0 * self.disk_radius
+        first = jnp.argmax(legal)  # the first legal pair, or pair 0 when there is none
+        return jnp.where(jnp.any(legal), candidates[first], self._facing_start(fallback_key))
 
     def current_player(self, state: DiskSumoState) -> chex.Array:
         over = state.done | (state.turn >= self.max_steps)

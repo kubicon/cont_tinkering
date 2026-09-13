@@ -1,0 +1,57 @@
+<!--
+  One sumo walker: a spherical torso on a free joint, with `n` identical legs
+  spaced around it, each a hip and an ankle. With four legs at the diagonals
+  this is exactly the classic MuJoCo/Gym ant; with six or three it is the same
+  animal with a different leg count.
+
+  `games/mjx_sumo.py` reads this as a `str.format` template, builds the `legs`
+  and `actuators` blocks from the body's `LEG_ANGLES` (see
+  `games/assets/mjx_legged_leg.xml`), fills it in once per player, and attaches
+  both copies into `mjx_legged_arena.xml` with `MjSpec.attach(prefix=...)`,
+  which namespaces every body, joint, geom and actuator. Nothing here is
+  prefixed by hand. Do not put literal braces in this file.
+
+  Changed from the stock ant, and why:
+
+    * No floor and no <option>: those belong to the arena this is attached
+      into, not to a body that gets instantiated twice.
+    * `contype` / `conaffinity` are per-player bitmasks rather than the stock
+      `conaffinity="0"`. Two geoms collide when one's contype shares a bit with
+      the other's conaffinity, so the masks are what make a walker collide with
+      the floor and with the *other* walker while never colliding with itself --
+      which matters here precisely because the stock ant, designed to be alone
+      in the world, switches all agent-agent collision off.
+    * The torso starts at `start_height`, the height it settles to rather than
+      the stock 0.75 it is dropped from, so a bout does not open with both
+      agents falling.
+    * `armature` and joint damping are the stock values: they are most of what
+      keeps a many-hinged model stable at a large timestep, and MJX inherits
+      that stability directly.
+-->
+<mujoco model="mjx_legged">
+  <compiler angle="degree" coordinate="local" inertiafromgeom="true"/>
+
+  <default>
+    <joint armature="1" damping="1" limited="true" type="hinge"/>
+    <geom condim="3" density="5.0" friction="1 0.5 0.5" margin="0.01" size="0.08"
+          type="capsule" contype="{contype}" conaffinity="{conaffinity}"/>
+    <motor ctrllimited="true" ctrlrange="-1 1" gear="{gear}"/>
+  </default>
+
+  <worldbody>
+    <body name="torso" pos="0 0 {start_height}">
+      <geom name="torso_geom" pos="0 0 0" size="0.25" type="sphere"/>
+      <joint armature="0" damping="0" limited="false" margin="0.01" name="root" pos="0 0 0" type="free"/>
+{legs}
+    </body>
+  </worldbody>
+
+  <!--
+    Actuator order fixes the meaning of the policy's action, and
+    `games/mjx_sumo.py` both documents it as (hip, ankle) per leg in leg order
+    and asserts it against the compiled model.
+  -->
+  <actuator>
+{actuators}
+  </actuator>
+</mujoco>

@@ -1,0 +1,32 @@
+<!--
+  One leg of a radially symmetric walker (see `games/assets/mjx_legged.xml`),
+  as a `str.format` template. `games/mjx_sumo.py` fills it in once per leg from
+  the body's `LEG_ANGLES`, so the leg count is a class attribute rather than a
+  file: a four-legged ant, a six-legged bug and a three-legged spider are the
+  same three lines of XML repeated a different number of times.
+
+  Placeholders, for a leg pointing along the unit vector u at its own angle:
+    index    1-based leg number, which names its two joints
+    ax, ay   u scaled by one segment length -- the hip, then the knee
+    ex, ey   u scaled by two, the far end of the foot capsule
+    px, py   u turned a quarter turn left, the axis the ankle swings about
+
+  Taking the ankle axis as *left* of the leg for every leg (rather than the
+  stock ant's alternating signs) makes one positive range bend every ankle the
+  same way -- downwards -- which is what lets the stance in `_index_model` be
+  derived instead of tabulated. The body it describes is unchanged: swinging
+  about the opposite axis through the negated range is the same motion.
+
+  Do not put literal braces in this file.
+-->
+      <body name="leg_{index}" pos="0 0 0">
+        <geom fromto="0 0 0 {ax} {ay} 0" name="aux_{index}_geom"/>
+        <body name="aux_{index}" pos="{ax} {ay} 0">
+          <joint axis="0 0 1" name="hip_{index}" pos="0 0 0" range="-30 30"/>
+          <geom fromto="0 0 0 {ax} {ay} 0" name="leg_{index}_geom"/>
+          <body name="foot_{index}" pos="{ax} {ay} 0">
+            <joint axis="{px} {py} 0" name="ankle_{index}" pos="0 0 0" range="30 70"/>
+            <geom fromto="0 0 0 {ex} {ey} 0" name="ankle_{index}_geom"/>
+          </body>
+        </body>
+      </body>

@@ -1,56 +1,54 @@
-# python train.py configs/disk_sumo.yaml
+# python train.py configs/mjx_sumo.yaml
 #
-# Two disks pushing each other out of a ring, with continuous 2-D forces (see
-# `games/disk_sumo.py`). Sequential, so `train.py` runs
-# `SequentialSelfPlayPPOTrainer`; the schema is otherwise the shared one.
+# `disk_sumo` played on MuJoCo/MJX physics (see `games/mjx_sumo.py`): the same
+# game -- same 11-dimensional observation, same egocentric force in `[-1, 1]^2`,
+# same payoff -- with MuJoCo's constraint solver in place of the hand-rolled
+# penalty spring. Everything below is `configs/disk_sumo.yaml` except the game
+# block's contact parameters and a smaller `train` budget, since MJX costs far
+# more per step than the hand-rolled integrator.
 #
-# Each control step is two decisions (player 0 chooses, then player 1 chooses
-# without seeing it), so `horizon: 50` is a 100-decision episode. That is long
-# for a Monte Carlo return, so this config bootstraps with V-trace
-# (`ppo.advantage: vtrace`) from the dense shaping reward.
-#
-# The action is a force in the player's egocentric frame (x towards the
-# opponent), in `[-1, 1]^2`; `clip_means: true` keeps the components inside it.
+# MJX is built for GPU: on CPU this is slow enough to be a smoke test only.
+# On a GPU, raise `ppo.batch_size` and `train.epochs` back to the `disk_sumo`
+# values and watch memory -- an `mjx.Data` rides in the rollout's scan carry,
+# so the batch is what will run you out of it first.
 #
 # There is no exact best response, so nothing prints an exploitability column
 # while training -- measure the checkpoint afterwards with
-# `python best_response.py configs/disk_sumo_br.yaml`.
+# `python best_response.py configs/mjx_sumo_br.yaml`.
 
 game:
-  name: disk_sumo
-  horizon: 100             # control steps; 2 * horizon decisions
+  name: mjx_sumo
+  horizon: 50             # control steps; 2 * horizon decisions
   ring_radius: 1.0
   disk_radius: 0.15
   start_distance: 0.6     # centre-to-centre at the start
   start_jitter: 0.05      # per-coordinate start noise
   random_orientation: true
-  # Place both disks uniformly in the ring every bout, rather than facing each
-  # other across the centre. A symmetric start invites a symmetric stalemate --
-  # two equal disks pushing head-on cannot gain ground on each other, whatever
-  # the horizon -- and a policy trained only on it has never played from the
-  # rim. Measured: random play decides 36% of bouts from random starts against
-  # 8% from the facing start. `start_distance`, `start_jitter` and
-  # `random_orientation` are then unused (they still place the fallback start).
-  random_start: true
   egocentric: true
   dt: 0.1                 # seconds per control step
-  substeps: 10
+  substeps: 10            # mjx.step calls per control step; timestep = dt / substeps
   mass: 1.0
   max_force: 1.0
-  # Momentum, not treacle. `mass / drag` is how long a disk keeps its speed: at
-  # drag 1 that was one control step, so velocity tracked force and a head-on
-  # push cancelled instantly -- nobody could ever be moved. At drag 0.5 it is
-  # 2 s against a 5 s bout, and top speed (`max_force / drag`) is 2.
-  drag: 0.5
-  # The contact spring has to stop faster disks now: at stiffness 100 a head-on
-  # charge squashed the pair 29% into each other. 400 brings that back to 14%,
-  # with the damping raised alongside it to keep the same 0.35 damping ratio.
-  stiffness: 400.0
-  contact_damping: 10.0
-  # Random play decides ~64% of bouts under the start and physics above (it was
-  # ~7% with the facing start and drag 1), so the two terms below are now a
-  # refinement rather than the only signal there is. Both act on the same
-  # distance gap `phi = (d_1 - d_0) / ring_radius` (distances from the centre):
+  # Joint damping, and the same change `configs/disk_sumo.yaml` explains: at
+  # drag 1 velocity tracked force within a control step and two equal pucks
+  # pushing head-on could never move each other, so every bout was a draw.
+  # `mass / drag` is now 2 s against a 5 s bout, and top speed is 2.
+  #
+  # The other half of that fix, `random_start`, is `disk_sumo`-only for now --
+  # `MjxSumoBase` still opens every bout with the two bodies facing each other.
+  drag: 0.5               # joint damping
+  # MuJoCo contact softness, as (timeconst, dampratio) -- `disk_sumo`'s
+  # stiffness / contact_damping in the units the solver takes. Smaller
+  # timeconst is a harder contact; dampratio 1 is critically damped.
+  solref_timeconst: 0.02
+  solref_dampratio: 1.0
+  # There is one contact in the model, so it converges in far fewer than
+  # MuJoCo's default 100 iterations. Raising these costs time for nothing here.
+  solver_iterations: 4
+  solver_ls_iterations: 8
+  # Random play pushes somebody out in only ~7% of bouts, so pure sumo starts
+  # with almost no signal. Two ways to add one, on the same distance gap
+  # `phi = (d_1 - d_0) / ring_radius` (distances from the centre):
   #   margin_weight  -- a terminal tie-breaker, `margin_weight * phi`, paid only
   #                     when nobody is pushed out. Keep it below 1.
   #   shaping_weight -- dense potential-based shaping, `w * (phi' - phi)` per
@@ -89,7 +87,7 @@ optimizer:
 ppo:
   clip_eps: 0.1
   value_coef: 0.5
-  batch_size: 512
+  batch_size: 64          # MJX is the cost here; raise this on a GPU
   ppo_epochs: 1
   target_tau: 0.001
   magnet_interval: 4000
@@ -121,6 +119,6 @@ ppo:
 train:
   mode: self_play         # the only mode a sequential game supports
   steps: 100               # outer steps: each logs and writes a checkpoint
-  epochs: 4000             # training iterations per outer step
-  checkpoint_dir: data/disk_sumo
+  epochs: 500             # raise on a GPU
+  checkpoint_dir: data/mjx_sumo
   seed: 0
