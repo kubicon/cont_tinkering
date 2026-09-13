@@ -164,7 +164,10 @@ def main() -> None:
         run_one_shot(game, config)
 
     if config.train.checkpoint_dir is not None:
-        print(f"saved checkpoints 0.pkl..{config.train.steps}.pkl to {config.train.checkpoint_dir}")
+        print(
+            f"saved checkpoints 0.pkl..{config.train.steps}.pkl to {config.train.checkpoint_dir}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

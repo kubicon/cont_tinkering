@@ -157,11 +157,11 @@ def run_training_chunks(
         extra = metric_fn() if metric_fn is not None else {}
         record.update(extra)
 
-        print(format_record(record))
+        print(format_record(record), flush=True)
         if extra:
-            print("  " + "  ".join(f"{k} {v:+.5f}" for k, v in extra.items()))
+            print("  " + "  ".join(f"{k} {v:+.5f}" for k, v in extra.items()), flush=True)
         if strategy_log_fn is not None:
-            print(strategy_log_fn())
+            print(strategy_log_fn(), flush=True)
         if checkpoint_fn is not None:
             checkpoint_fn(chunk + 1)
 

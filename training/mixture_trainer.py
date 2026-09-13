@@ -263,16 +263,18 @@ class MixturePPOTrainer:
                         f" | exploitability {record['exploitability']:.4f}"
                         f" (target {record['exploitability_target']:.4f})"
                     )
-                print(message)
+                print(message, flush=True)
                 print(
                     f"  player {self.perspective} strategy: "
-                    f"{self._strategy_str(self.state.params, self._obs)}"
+                    f"{self._strategy_str(self.state.params, self._obs)}",
+                    flush=True,
                 )
                 print(
                     f"  player {self.perspective} target strategy: "
-                    f"{self._strategy_str(self.state.target_params, self._obs)}"
+                    f"{self._strategy_str(self.state.target_params, self._obs)}",
+                    flush=True,
                 )
-                print(f"  opponent sample: {self._opponent_sample}")
+                print(f"  opponent sample: {self._opponent_sample}", flush=True)
 
             if checkpoint_dir is not None:
                 self.save(checkpoint_dir, chunk + 1)
@@ -492,12 +494,13 @@ class MixtureSelfPlayPPOTrainer:
                 f"category_entropy {record['category_entropy_2']:.4f}"
                 + (f" | exploitability {record['exploitability']:.4f}"
                    f" (target {record['exploitability_target']:.4f})"
-                   if measure_exploitability else "")
+                   if measure_exploitability else ""),
+                flush=True,
             )
-            print(f"  p1 strategy: {self._strategy_str_1(self.state_1.params, self._obs_1)}")
-            print(f"  p2 strategy: {self._strategy_str_2(self.state_2.params, self._obs_2)}")
-            print(f"  p1 target strategy: {self._strategy_str_1(self.state_1.target_params, self._obs_1)}")
-            print(f"  p2 target strategy: {self._strategy_str_2(self.state_2.target_params, self._obs_2)}")
+            print(f"  p1 strategy: {self._strategy_str_1(self.state_1.params, self._obs_1)}", flush=True)
+            print(f"  p2 strategy: {self._strategy_str_2(self.state_2.params, self._obs_2)}", flush=True)
+            print(f"  p1 target strategy: {self._strategy_str_1(self.state_1.target_params, self._obs_1)}", flush=True)
+            print(f"  p2 target strategy: {self._strategy_str_2(self.state_2.target_params, self._obs_2)}", flush=True)
 
             if checkpoint_dir is not None:
                 self.save(checkpoint_dir, chunk + 1)

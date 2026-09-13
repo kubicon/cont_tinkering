@@ -208,10 +208,11 @@ class ExpFamilyPPOTrainer:
                 f"| entropy {record['entropy']:+.4f} | magnet_kl {record['magnet_kl']:.4f} "
                 f"| approx_kl {record['approx_kl']:+.4f} "
                 f"| exploitability {record['exploitability']:.4f}"
-                f" (target {record['exploitability_target']:.4f})"
+                f" (target {record['exploitability_target']:.4f})",
+                flush=True,
             )
-            print(f"  player {self.perspective}: {self._strategy_str(self.state.params, self._obs)}")
-            print(f"  player {self.perspective} target: {self._strategy_str(self.state.target_params, self._obs)}")
+            print(f"  player {self.perspective}: {self._strategy_str(self.state.params, self._obs)}", flush=True)
+            print(f"  player {self.perspective} target: {self._strategy_str(self.state.target_params, self._obs)}", flush=True)
 
             if checkpoint_dir is not None:
                 self.save(checkpoint_dir, chunk + 1)
@@ -380,10 +381,11 @@ class ExpFamilySelfPlayPPOTrainer:
                 f"| p1 entropy {record['entropy_1']:+.4f} magnet_kl {record['magnet_kl_1']:.4f} "
                 f"| p2 entropy {record['entropy_2']:+.4f} magnet_kl {record['magnet_kl_2']:.4f} "
                 f"| exploitability {record['exploitability']:.4f}"
-                f" (target {record['exploitability_target']:.4f})"
+                f" (target {record['exploitability_target']:.4f})",
+                flush=True,
             )
-            print(f"  p1: {self._strategy_str_1(self.state_1.params, self._obs_1)}")
-            print(f"  p2: {self._strategy_str_2(self.state_2.params, self._obs_2)}")
+            print(f"  p1: {self._strategy_str_1(self.state_1.params, self._obs_1)}", flush=True)
+            print(f"  p2: {self._strategy_str_2(self.state_2.params, self._obs_2)}", flush=True)
 
             if checkpoint_dir is not None:
                 self.save(checkpoint_dir, chunk + 1)
