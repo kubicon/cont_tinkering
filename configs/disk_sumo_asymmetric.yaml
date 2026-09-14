@@ -27,7 +27,7 @@ game:
   substeps: 10
   mass: 1.0
   max_force: 1.0
-  force_asymmetry: 0.00  # per-bout multipliers are 1.05 and 0.95
+  force_asymmetry: 0.05  # per-bout multipliers are 1.05 and 0.95
   # Full thrust exhausts a fresh disk in 2 seconds. At zero stamina it retains
   # 25% thrust; easing completely off restores full stamina in 4 seconds.
   # Partial effort blends continuously between draining and recovering.
