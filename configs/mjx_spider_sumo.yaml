@@ -23,7 +23,7 @@
 
 game:
   name: mjx_spider_sumo
-  horizon: 80             # control steps; 2 * horizon decisions, 4 s at dt 0.05
+  horizon: 250            # control steps; 2 * horizon decisions, 12.5 s at dt 0.05
   ring_radius: 3.0
   start_distance: 2.4     # torso-to-torso at the start
   start_jitter: 0.1
@@ -79,7 +79,7 @@ ppo:
   # With this probability a sampled force is replaced by a uniform draw on the
   # box (on the component's bucket under `network.bucket_means`); V-trace
   # importance-weights it back to the policy. 0 disables.
-  explore_eps: 0.0
+  explore_eps: 0.05
 
   # V-trace over each player's own decisions (`training/vtrace.py`). gamma 1
   # keeps the zero-sum objective; lambda < 1 is the variance reduction. The
@@ -103,6 +103,6 @@ ppo:
 train:
   mode: self_play         # the only mode a sequential game supports
   steps: 100               # outer steps: each logs and writes a checkpoint
-  epochs: 500             # raise on a GPU
+  epochs: 4000            # raise on a GPU
   checkpoint_dir: data/mjx_spider_sumo
   seed: 0

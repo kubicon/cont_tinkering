@@ -13,7 +13,7 @@
 
 game:
   name: mjx_sumo
-  horizon: 50             # control steps; 2 * horizon decisions
+  horizon: 250            # control steps; 2 * horizon decisions, 25 s at dt 0.1
   ring_radius: 1.0
   disk_radius: 0.15
   start_distance: 0.6     # centre-to-centre at the start
