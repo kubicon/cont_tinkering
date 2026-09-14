@@ -29,8 +29,8 @@ game:
   stiffness: 400.0
   contact_damping: 10.0
 
-  margin_weight: 0.3
-  shaping_weight: 0.5
+  margin_weight: 0.0
+  shaping_weight: 0.0
 
   # null enables all of: quick, strong, endurance, heavy, nimble, burst, brace.
   archetypes: null
