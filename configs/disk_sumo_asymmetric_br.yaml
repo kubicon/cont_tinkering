@@ -16,7 +16,7 @@ game:
   substeps: 10
   mass: 1.0
   max_force: 1.0
-  force_asymmetry: 0.05
+  force_asymmetry: 0.00
   stamina_enabled: true
   stamina_drain_rate: 0.5
   stamina_recovery_rate: 0.25
