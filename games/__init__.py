@@ -1,6 +1,7 @@
 from .base import ZeroSumGame
 from .disk_sumo import DiskSumo, DiskSumoState
 from .disk_sumo_v2 import DiskSumoV2, DiskSumoV2State
+from .disk_sumo_v3 import DiskSumoV3
 from .discretized import DiscretizedSequentialGame, base_game, discretize, linear_action_grid
 from .examples import AllPayAuctionGame, CircleGame, GlicksbergGrossGame, SilentDuelGame
 from .leduc import ContinuousLeducHoldem, LeducState
@@ -56,6 +57,7 @@ __all__ = [
     "DiskSumoState",
     "DiskSumoV2",
     "DiskSumoV2State",
+    "DiskSumoV3",
     "MjxSumo",
     "MjxAntSumo",
     "MjxBugSumo",

@@ -377,30 +377,15 @@ class DiskSumo(SequentialZeroSumGame):
     def _step(self, state: DiskSumoState, action: HybridAction, key: chex.PRNGKey) -> DiskSumoState:
         del key  # the physics is deterministic; the only chance is the start
         player = state.turn % 2
-        own = state.pos[player]
-        opp = state.pos[1 - player]
-
-        # Keep the state's dtype: a float64 action (x64 on) would otherwise
-        # promote `pending`, `pos` and `vel`, and break the scans that carry them.
-        local = self._space.box.clip(action.value).astype(state.pos.dtype)
-        local = local / jnp.maximum(jnp.linalg.norm(local), 1.0)
-        effort = jnp.linalg.norm(local)
-        stamina_scale = jnp.where(
-            self.stamina_enabled,
-            self.stamina_min_force + (1.0 - self.stamina_min_force) * state.stamina[player],
-            1.0,
-        )
-        force = self.max_force * state.force_multiplier[player] * stamina_scale * (
-            self._frame(own, opp).T @ local
-        )
+        force, effort = self._world_force(state, player, action.value)
+        efforts = jnp.stack([state.pending_effort, effort])
 
         # Player 0 only parks their force; player 1's choice closes the control
         # step, and both branches are computed because `player` is traced.
-        pos, vel, result, done = self._simulate(
-            state.pos, state.vel, jnp.stack([state.pending, force])
+        pos, vel, result, done = self._integrate(
+            state, state.pos, state.vel, jnp.stack([state.pending, force]), efforts
         )
         resolves = player == 1
-        efforts = jnp.stack([state.pending_effort, effort])
         stamina_delta = self.dt * (
             self.stamina_recovery_rate * (1.0 - efforts)
             - self.stamina_drain_rate * efforts
@@ -423,6 +408,39 @@ class DiskSumo(SequentialZeroSumGame):
         )
 
     # ---- physics ------------------------------------------------------------
+
+    def _world_force(self, state: DiskSumoState, player, value: chex.Array):
+        """`(force, effort)`: the world-frame force `player`'s raw action means in `state`.
+
+        The action is clipped to the box and projected onto the unit disk (its
+        norm is the `effort`), rotated out of the egocentric frame, and scaled by
+        the actuator multiplier and stamina. Shared with `scripts/render_disk_sumo.py`,
+        which has to recompute player 1's force: it is never stored in a state.
+        """
+        own, opp = state.pos[player], state.pos[1 - player]
+        # Keep the state's dtype: a float64 action (x64 on) would otherwise
+        # promote `pending`, `pos` and `vel`, and break the scans that carry them.
+        local = self._space.box.clip(value).astype(state.pos.dtype)
+        local = local / jnp.maximum(jnp.linalg.norm(local), 1.0)
+        stamina_scale = jnp.where(
+            self.stamina_enabled,
+            self.stamina_min_force + (1.0 - self.stamina_min_force) * state.stamina[player],
+            1.0,
+        )
+        force = self.max_force * state.force_multiplier[player] * stamina_scale * (
+            self._frame(own, opp).T @ local
+        )
+        return force, jnp.linalg.norm(local)
+
+    def _integrate(self, state: DiskSumoState, pos, vel, forces, efforts):
+        """Advance one control step from `pos, vel`; return `(pos, vel, result, done)`.
+
+        `state` supplies the bodies and `efforts` is `(2,)`. Both disks are
+        identical here, so this is `_simulate`; subclasses with per-disk bodies
+        override it.
+        """
+        del state, efforts
+        return self._simulate(pos, vel, forces)
 
     def _frame(self, own: chex.Array, opp: chex.Array) -> chex.Array:
         """`(2, 2)` rotation taking world vectors into the egocentric frame.

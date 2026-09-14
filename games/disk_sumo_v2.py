@@ -71,6 +71,24 @@ _NEUTRAL = {"force": 1.0, "mass": 1.0, "drag": 1.0, "drain": 1.0,
 #     Endurance buys a longer window with a lower peak, burst the reverse.
 # What remains to differ is how a disk gets there: peak thrust, speed, inertia,
 # how long full thrust lasts, and bracing.
+# DEFAULT_ARCHETYPES: dict[str, dict[str, float]] = {
+#     # Faster and lighter, loses a straight shove.
+#     "quick": {"force": 0.948, "mass": 0.9, "drag": 0.72, "min_force": 1.056},
+#     # Wins a straight shove, low top speed.
+#     "strong": {"force": 1.029, "drag": 1.4, "min_force": 0.972},
+#     # Weaker peak, but full thrust lasts 2.7 s instead of 2 s.
+#     "endurance": {"force": 0.82, "drain": 0.75, "recovery": 0.8, "min_force": 1.219},
+#     # Barely moved by collisions, sluggish to start and to turn.
+#     "heavy": {"force": 0.972, "mass": 1.6, "min_force": 1.029},
+#     # Changes direction almost instantly, low top speed, easily knocked back.
+#     "nimble": {"force": 0.979, "mass": 0.6, "drag": 1.3, "min_force": 1.023},
+#     # Hits very hard for 1.3 s, then gasses out. Its drag keeps its top speed
+#     # below quick's: thrust does not also make it fast.
+#     "burst": {"force": 1.39, "drag": 1.45, "drain": 1.5, "recovery": 1.3, "min_force": 0.72},
+#     # Planted when not thrusting, weak on offence.
+#     "brace": {"force": 0.958, "brace": 3.0, "min_force": 1.044},
+# }
+
 DEFAULT_ARCHETYPES: dict[str, dict[str, float]] = {
     # Faster and lighter, loses a straight shove.
     "quick": {"force": 0.9, "mass": 0.9, "drag": 0.72, "min_force": 1.111},
@@ -112,21 +130,26 @@ class DiskSumoV2State:
 
 
 def resolve_archetypes(
-    archetypes: Sequence[str] | None, archetype_traits: Mapping[str, Mapping[str, float]] | None
+    archetypes: Sequence[str] | None,
+    archetype_traits: Mapping[str, Mapping[str, float]] | None,
+    defaults: Mapping[str, Mapping[str, float]] = DEFAULT_ARCHETYPES,
+    trait_names: Sequence[str] = TRAIT_NAMES,
+    neutral: Mapping[str, float] = _NEUTRAL,
 ) -> tuple[tuple[str, ...], dict[str, dict[str, float]]]:
     """Enabled names and their full trait rows, defaults merged with overrides.
 
-    An override may name an archetype that is not in `DEFAULT_ARCHETYPES`; its
-    unspecified traits are neutral.
+    An override may name an archetype that is not in `defaults`; its
+    unspecified traits are neutral. The last three arguments let a subclass
+    (`games.disk_sumo_v3`) bring its own trait set.
     """
-    table = {name: dict(traits) for name, traits in DEFAULT_ARCHETYPES.items()}
+    table = {name: dict(traits) for name, traits in defaults.items()}
     for name, traits in (archetype_traits or {}).items():
-        unknown = set(traits) - set(TRAIT_NAMES)
+        unknown = set(traits) - set(trait_names)
         if unknown:
             raise ValueError(f"unknown trait(s) {sorted(unknown)} for archetype {name!r}, "
-                             f"choices: {list(TRAIT_NAMES)}")
+                             f"choices: {list(trait_names)}")
         table.setdefault(name, {}).update({k: float(v) for k, v in traits.items()})
-    names = tuple(archetypes) if archetypes is not None else tuple(DEFAULT_ARCHETYPES)
+    names = tuple(archetypes) if archetypes is not None else tuple(defaults)
     if not names:
         raise ValueError("at least one archetype must be enabled")
     if len(set(names)) != len(names):
@@ -134,11 +157,15 @@ def resolve_archetypes(
     for name in names:
         if name not in table:
             raise ValueError(f"unknown archetype {name!r}, choices: {sorted(table)}")
-    return names, {name: {**_NEUTRAL, **table[name]} for name in names}
+    return names, {name: {**neutral, **table[name]} for name in names}
 
 
 class DiskSumoV2(DiskSumo):
     """Disk sumo with randomly dealt, optionally hidden archetypes. See the module docstring."""
+
+    TRAIT_NAMES = TRAIT_NAMES
+    DEFAULT_ARCHETYPES = DEFAULT_ARCHETYPES
+    NEUTRAL_TRAITS = _NEUTRAL
 
     def __init__(
         self,
@@ -178,7 +205,9 @@ class DiskSumoV2(DiskSumo):
             drag=drag, stiffness=stiffness, contact_damping=contact_damping,
             margin_weight=margin_weight, shaping_weight=shaping_weight,
         )
-        names, table = resolve_archetypes(archetypes, archetype_traits)
+        names, table = resolve_archetypes(
+            archetypes, archetype_traits, self.DEFAULT_ARCHETYPES, self.TRAIT_NAMES, self.NEUTRAL_TRAITS
+        )
         for name, traits in table.items():
             for trait in ("force", "mass"):
                 if traits[trait] <= 0.0:
@@ -202,11 +231,16 @@ class DiskSumoV2(DiskSumo):
         self.observe_velocity_change = bool(observe_velocity_change)
         # (K, len(TRAIT_NAMES)) with the shared physics folded in, so the step
         # only ever gathers rows.
-        base = {"force": max_force, "mass": mass, "drag": drag, "drain": stamina_drain_rate,
-                "recovery": stamina_recovery_rate, "min_force": stamina_min_force, "brace": 1.0}
+        base = self._base_traits()
         self._traits = jnp.asarray(
-            [[table[name][t] * base[t] for t in TRAIT_NAMES] for name in names], dtype=jnp.float32
+            [[table[name][t] * base[t] for t in self.TRAIT_NAMES] for name in names], dtype=jnp.float32
         )
+
+    def _base_traits(self) -> dict[str, float]:
+        """The shared physics each trait multiplier scales."""
+        return {"force": self.max_force, "mass": self.mass, "drag": self.drag,
+                "drain": self.stamina_drain_rate, "recovery": self.stamina_recovery_rate,
+                "min_force": self.stamina_min_force, "brace": 1.0}
 
     # ---- shape/static information ------------------------------------------
 
@@ -216,7 +250,12 @@ class DiskSumoV2(DiskSumo):
     def traits(self, archetype: chex.Array) -> dict[str, chex.Array]:
         """Absolute trait values (shared physics folded in) for archetype indices."""
         rows = self._traits[archetype]
-        return {name: rows[..., i] for i, name in enumerate(TRAIT_NAMES)}
+        return {name: rows[..., i] for i, name in enumerate(self.TRAIT_NAMES)}
+
+    def ring_radius_at(self, state: DiskSumoV2State) -> chex.Array:
+        """Ring radius during the control step `state` is in; constant here."""
+        del state
+        return self.ring_radius
 
     # ---- the game tree ------------------------------------------------------
 
@@ -244,7 +283,7 @@ class DiskSumoV2(DiskSumo):
         """See the module docstring for the layout; `state.pending*` is never read."""
         own, opp = player, 1 - player
         rotation = self._frame(state.pos[own], state.pos[opp])
-        radii = jnp.linalg.norm(state.pos, axis=-1) / self.ring_radius
+        radii = jnp.linalg.norm(state.pos, axis=-1) / self.ring_radius_at(state)
         time_left = 1.0 - (state.turn // 2).astype(jnp.float32) / self.horizon
         one_hot = jax.nn.one_hot(state.archetype, self.num_archetypes, dtype=jnp.float32)
         parts = [
@@ -265,21 +304,11 @@ class DiskSumoV2(DiskSumo):
     def _step(self, state: DiskSumoV2State, action: HybridAction, key: chex.PRNGKey) -> DiskSumoV2State:
         del key
         player = state.turn % 2
-        own = state.pos[player]
-        opp = state.pos[1 - player]
         traits = self.traits(state.archetype)
-
-        local = self._space.box.clip(action.value).astype(state.pos.dtype)
-        local = local / jnp.maximum(jnp.linalg.norm(local), 1.0)
-        effort = jnp.linalg.norm(local)
-        min_force = traits["min_force"][player]
-        stamina_scale = min_force + (1.0 - min_force) * state.stamina[player]
-        force = traits["force"][player] * stamina_scale * (self._frame(own, opp).T @ local)
-
+        force, effort = self._world_force(state, player, action.value)
         efforts = jnp.stack([state.pending_effort, effort])
-        drag = traits["drag"] * (1.0 + traits["brace"] * (1.0 - efforts))
-        pos, vel, result, done = self._simulate_bodies(
-            state.pos, state.vel, jnp.stack([state.pending, force]), traits["mass"], drag
+        pos, vel, result, done = self._integrate(
+            state, state.pos, state.vel, jnp.stack([state.pending, force]), efforts
         )
         resolves = player == 1
         stamina_delta = self.dt * (traits["recovery"] * (1.0 - efforts) - traits["drain"] * efforts)
@@ -298,6 +327,23 @@ class DiskSumoV2(DiskSumo):
         )
 
     # ---- physics ------------------------------------------------------------
+
+    def _world_force(self, state: DiskSumoV2State, player, value: chex.Array):
+        """`DiskSumo._world_force` with the archetype's thrust and exhausted floor."""
+        own, opp = state.pos[player], state.pos[1 - player]
+        local = self._space.box.clip(value).astype(state.pos.dtype)
+        local = local / jnp.maximum(jnp.linalg.norm(local), 1.0)
+        traits = self.traits(state.archetype)
+        min_force = traits["min_force"][player]
+        stamina_scale = min_force + (1.0 - min_force) * state.stamina[player]
+        force = traits["force"][player] * stamina_scale * (self._frame(own, opp).T @ local)
+        return force, jnp.linalg.norm(local)
+
+    def _integrate(self, state: DiskSumoV2State, pos, vel, forces, efforts):
+        """Per-disk mass, and drag raised by `brace` for a disk that is barely thrusting."""
+        traits = self.traits(state.archetype)
+        drag = traits["drag"] * (1.0 + traits["brace"] * (1.0 - efforts))
+        return self._simulate_bodies(pos, vel, forces, traits["mass"], drag)
 
     def _simulate_bodies(self, pos, vel, forces, mass, drag):
         """`DiskSumo._simulate` with per-disk `(2,)` mass and drag coefficients."""

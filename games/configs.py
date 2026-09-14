@@ -19,6 +19,7 @@ import jax.numpy as jnp
 from .base import ZeroSumGame
 from .disk_sumo import DiskSumo
 from .disk_sumo_v2 import DiskSumoV2
+from .disk_sumo_v3 import DiskSumoV3
 from .mjx_sumo import MjxAntSumo, MjxBugSumo, MjxSpiderSumo, MjxSumo
 from .examples import (
     AllPayAuctionGame,
@@ -371,6 +372,23 @@ class DiskSumoV2Config:
 
 
 @dataclasses.dataclass
+class DiskSumoV3Config(DiskSumoV2Config):
+    """`disk_sumo_v2` with three archetypes that counter each other in a cycle.
+
+    See `games.disk_sumo_v3`: rammer beats grinder, grinder beats anchor, anchor
+    beats rammer. `archetype_traits` also accepts `top_speed` and
+    `brace_quadratic`.
+    """
+
+    # Fraction of the ring radius lost, linearly, by the horizon; 0 keeps v2's
+    # fixed ring and lets a disfavoured disk run out the clock.
+    ring_shrink: float = 0.0
+
+    def build(self) -> SequentialZeroSumGame:
+        return DiskSumoV3(**dataclasses.asdict(self))
+
+
+@dataclasses.dataclass
 class MjxSumoConfig:
     """`disk_sumo` on MuJoCo/MJX physics instead of the hand-rolled integrator.
 
@@ -530,6 +548,7 @@ GAME_CONFIGS: dict[str, type] = {
     "sequential_blotto": SequentialBlottoConfig,
     "disk_sumo": DiskSumoConfig,
     "disk_sumo_v2": DiskSumoV2Config,
+    "disk_sumo_v3": DiskSumoV3Config,
     "mjx_sumo": MjxSumoConfig,
     "mjx_ant_sumo": MjxAntSumoConfig,
     "mjx_bug_sumo": MjxBugSumoConfig,
