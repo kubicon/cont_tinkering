@@ -34,6 +34,8 @@ Example:
 from __future__ import annotations
 
 import argparse
+import shutil
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -46,7 +48,7 @@ from training.hyperparams import action_bounds, build_expfam_hyperparams, build_
 from training.kuhn_evaluation import build_kuhn_metric_fn, build_kuhn_strategy_log_fn
 from training.mixture import OpponentActionFn
 from training.mixture_trainer import MixturePPOTrainer, MixtureSelfPlayPPOTrainer
-from training.run_config import RunConfig, load_run_config
+from training.run_config import CONFIG_FILENAME, RunConfig, load_run_config
 from training.sequential_trainer import SequentialSelfPlayPPOTrainer
 
 
@@ -142,6 +144,9 @@ def run_sequential(game: SequentialZeroSumGame, config: RunConfig) -> None:
             "mixture policy's atoms and legality masks (see training/expfam.py's scope note)"
         )
 
+    if hasattr(game, "physics_backend"):
+        print(f"physics : MJX-{game.physics_backend}", flush=True)
+
     hyperparams_0 = build_hyperparams(game, 0, config)
     hyperparams_1 = build_hyperparams(game, 1, config)
     trainer = SequentialSelfPlayPPOTrainer(game, hyperparams_0, hyperparams_1, seed=config.train.seed)
@@ -157,6 +162,13 @@ def main() -> None:
     args = parse_args()
     config = load_run_config(args.config)
     game = config.game.build()
+
+    if config.train.checkpoint_dir is not None:
+        # The checkpoints hold network hyperparams only; the game, PPO and training
+        # settings they were trained under live in the YAML, which may later change.
+        checkpoint_dir = Path(config.train.checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(args.config, checkpoint_dir / CONFIG_FILENAME)
 
     if isinstance(game, SequentialZeroSumGame):
         run_sequential(game, config)

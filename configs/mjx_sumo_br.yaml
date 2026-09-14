@@ -5,46 +5,11 @@
 # printed exploitability is a *lower bound*: read the `br_value` column and only
 # trust the number once it has stopped climbing.
 #
-# The `game` section must describe the same game the checkpoint was trained on
-# -- it is not stored in the checkpoint, only the networks are. `network` here
+# The game is read from the `config.yaml` that `train.py` saves into the
+# checkpoint directory, so there is no `game` section here. `network` here
 # describes the *responder*; `num_components` has to match the checkpoint's,
 # because a batched rollout selects between the two players' categorical heads
 # and they must be the same width.
-
-game:
-  name: mjx_sumo
-  horizon: 250            # control steps; 2 * horizon decisions, 25 s at dt 0.1
-  ring_radius: 1.0
-  disk_radius: 0.15
-  start_distance: 0.6     # centre-to-centre at the start
-  start_jitter: 0.05      # per-coordinate start noise
-  random_orientation: true
-  egocentric: true
-  dt: 0.1                 # seconds per control step
-  substeps: 10
-  mass: 1.0
-  max_force: 1.0
-  # Joint damping, and the same change `configs/disk_sumo.yaml` explains: at
-  # drag 1 velocity tracked force within a control step and two equal pucks
-  # pushing head-on could never move each other, so every bout was a draw.
-  # `mass / drag` is now 2 s against a 5 s bout, and top speed is 2.
-  drag: 0.5
-  solref_timeconst: 0.02  # MuJoCo contact softness (timeconst, dampratio)
-  solref_dampratio: 1.0
-  solver_iterations: 4
-  solver_ls_iterations: 8
-  # Random play pushes somebody out in only ~7% of bouts, so pure sumo starts
-  # with almost no signal. Two ways to add one, on the same distance gap
-  # `phi = (d_1 - d_0) / ring_radius` (distances from the centre):
-  #   margin_weight  -- a terminal tie-breaker, `margin_weight * phi`, paid only
-  #                     when nobody is pushed out. Keep it below 1.
-  #   shaping_weight -- dense potential-based shaping, `w * (phi' - phi)` per
-  #                     step. Undiscounted it telescopes to the same kind of
-  #                     terminal term, but arrives as it happens -- which only a
-  #                     bootstrapping estimator (`ppo.advantage: vtrace`) uses.
-  margin_weight: 0.3
-  shaping_weight: 0.5
-
 
 best_response:
   checkpoint_dir: data/mjx_sumo

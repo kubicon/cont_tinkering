@@ -415,6 +415,8 @@ def main() -> None:
 
     log = build_run_log(config, args.config)
     print(f"game    : {type(game).__name__}  {dataclasses.asdict(config.game)}")
+    if hasattr(game, "physics_backend"):
+        print(f"physics : MJX-{game.physics_backend}")
     print(describe(game, config))
     print(f"run     : {log.directory}\n")
 

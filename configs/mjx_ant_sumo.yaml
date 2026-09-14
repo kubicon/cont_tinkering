@@ -81,12 +81,15 @@ ppo:
   # V-trace over each player's own decisions (`training/vtrace.py`). gamma 1
   # keeps the zero-sum objective; lambda < 1 is the variance reduction. The
   # importance weights correct a player's own exploration (`explore_eps`) and
-  # any drift over `ppo_epochs`; the opponent's moves are environment.
+  # any drift over `ppo_epochs`; `vtrace_opponent_correction` handles the opponent's.
   advantage: vtrace
   gamma: 1.0
   vtrace_lambda: 0.95
-  vtrace_rho_bar: 1.0
+  vtrace_rho_bar: 2.0
   vtrace_c_bar: 1.0
+  # Correct the opponent's exploration after each own decision; not before it
+  # (fully observed state: the past only reweights states, see training/vtrace.py).
+  vtrace_opponent_correction: future
 
   # No atoms: the categorical head only picks which torque component to use.
   category_entropy_coef: 0.04

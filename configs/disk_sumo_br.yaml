@@ -5,56 +5,11 @@
 # printed exploitability is a *lower bound*: read the `br_value` column and only
 # trust the number once it has stopped climbing.
 #
-# The `game` section must describe the same game the checkpoint was trained on
-# -- it is not stored in the checkpoint, only the networks are. `network` here
+# The game is read from the `config.yaml` that `train.py` saves into the
+# checkpoint directory, so there is no `game` section here. `network` here
 # describes the *responder*; `num_components` has to match the checkpoint's,
 # because a batched rollout selects between the two players' categorical heads
 # and they must be the same width.
-
-game:
-  name: disk_sumo
-  horizon: 100            # control steps; 2 * horizon decisions
-  ring_radius: 1.0
-  disk_radius: 0.15
-  start_distance: 0.6     # centre-to-centre at the start
-  start_jitter: 0.05      # per-coordinate start noise
-  random_orientation: true
-  # Place both disks uniformly in the ring every bout, rather than facing each
-  # other across the centre. A symmetric start invites a symmetric stalemate --
-  # two equal disks pushing head-on cannot gain ground on each other, whatever
-  # the horizon -- and a policy trained only on it has never played from the
-  # rim. Measured: random play decides 36% of bouts from random starts against
-  # 8% from the facing start. `start_distance`, `start_jitter` and
-  # `random_orientation` are then unused (they still place the fallback start).
-  random_start: true
-  egocentric: true
-  dt: 0.1                 # seconds per control step
-  substeps: 10
-  mass: 1.0
-  max_force: 1.0
-  # Momentum, not treacle. `mass / drag` is how long a disk keeps its speed: at
-  # drag 1 that was one control step, so velocity tracked force and a head-on
-  # push cancelled instantly -- nobody could ever be moved. At drag 0.5 it is
-  # 2 s against a 5 s bout, and top speed (`max_force / drag`) is 2.
-  drag: 0.5
-  # The contact spring has to stop faster disks now: at stiffness 100 a head-on
-  # charge squashed the pair 29% into each other. 400 brings that back to 14%,
-  # with the damping raised alongside it to keep the same 0.35 damping ratio.
-  stiffness: 400.0
-  contact_damping: 10.0
-  # Random play decides ~64% of bouts under the start and physics above (it was
-  # ~7% with the facing start and drag 1), so the two terms below are now a
-  # refinement rather than the only signal there is. Both act on the same
-  # distance gap `phi = (d_1 - d_0) / ring_radius` (distances from the centre):
-  #   margin_weight  -- a terminal tie-breaker, `margin_weight * phi`, paid only
-  #                     when nobody is pushed out. Keep it below 1.
-  #   shaping_weight -- dense potential-based shaping, `w * (phi' - phi)` per
-  #                     step. Undiscounted it telescopes to the same kind of
-  #                     terminal term, but arrives as it happens -- which only a
-  #                     bootstrapping estimator (`ppo.advantage: vtrace`) uses.
-  margin_weight: 0.3
-  shaping_weight: 0.5
-
 
 best_response:
   checkpoint_dir: data/disk_sumo

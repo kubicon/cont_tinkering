@@ -5,18 +5,11 @@
 # of them. The printed exploitability is a *lower bound*: read the `br_value`
 # column and only trust the number once it has stopped climbing.
 #
-# The `game` section must describe the same game the checkpoint was trained on
-# -- it is not stored in the checkpoint, only the networks are. `network` here
+# The game is read from the `config.yaml` that `train.py` saves into the
+# checkpoint directory, so there is no `game` section here. `network` here
 # describes the *responder*; `num_components` has to match the checkpoint's,
 # because a batched rollout selects between the two players' categorical heads
 # and they must be the same width.
-
-game:
-  name: sequential_blotto
-  num_fields: 3
-  field_values: null
-  budget: 1.0
-  sharpness: 10.0
 
 best_response:
   checkpoint_dir: data/sequential_blotto

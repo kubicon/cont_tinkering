@@ -11,13 +11,9 @@
 #
 #   python train.py configs/kuhn_classic.yaml     # writes data/kuhn_classic
 #   python best_response.py configs/kuhn_br.yaml  # must match its exploitability
-
-game:
-  name: kuhn
-  num_cards: 3
-  min_bet: 1.0
-  max_bet: 1.0
-  exploitability_grid_points: 1025
+#
+# The game is read from the `config.yaml` that `train.py` saves into the
+# checkpoint directory.
 
 best_response:
   checkpoint_dir: data/kuhn_classic

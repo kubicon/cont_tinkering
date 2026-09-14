@@ -1,31 +1,5 @@
-# Best-response measurement for configs/disk_sumo_asymmetric.yaml. Keep the
-# entire game block identical to that file: changing shaping or physics here
-# would measure a different game.
-
-game:
-  name: disk_sumo
-  horizon: 100
-  ring_radius: 1.0
-  disk_radius: 0.15
-  start_distance: 0.45
-  start_jitter: 0.04
-  random_orientation: true
-  random_start: false
-  egocentric: true
-  dt: 0.1
-  substeps: 10
-  mass: 1.0
-  max_force: 1.0
-  force_asymmetry: 0.05
-  stamina_enabled: true
-  stamina_drain_rate: 0.5
-  stamina_recovery_rate: 0.25
-  stamina_min_force: 0.25
-  drag: 0.5
-  stiffness: 400.0
-  contact_damping: 10.0
-  margin_weight: 0.3
-  shaping_weight: 0.5
+# Best-response measurement for configs/disk_sumo_asymmetric.yaml. The game is
+# read from the `config.yaml` that `train.py` saves into the checkpoint directory.
 
 best_response:
   checkpoint_dir: data/disk_sumo_asymmetric

@@ -1,49 +1,5 @@
-# Best-response measurement for configs/disk_sumo_v3.yaml. Keep the entire
-# game block identical to that file: changing shaping, physics or archetypes
-# here would measure a different game.
-
-game:
-  name: disk_sumo_v3
-  horizon: 100
-  ring_radius: 1.0
-  disk_radius: 0.15
-  start_distance: 0.45
-  start_jitter: 0.04
-  random_orientation: true
-  random_start: false
-  egocentric: true
-
-  dt: 0.1
-  substeps: 10
-  mass: 1.0
-  max_force: 1.0
-  stamina_drain_rate: 0.5
-  stamina_recovery_rate: 0.25
-  stamina_min_force: 0.25
-  drag: 0.5
-  stiffness: 400.0
-  # Bouncier than v2's 10 (restitution ~0.7 instead of ~0.3): a run-up
-  # has to be able to deliver a hit, or nothing beats the grinder.
-  contact_damping: 3.0
-
-  # The ring loses this fraction of its radius by the horizon, so the side a
-  # matchup disfavours cannot run out the clock.
-  ring_shrink: 0.7
-
-  margin_weight: 0.3
-  shaping_weight: 0.5
-
-  # null enables all of: rammer, grinder, anchor.
-  archetypes: null
-  # Per-archetype trait overrides, e.g. {anchor: {brace_quadratic: 8.0}}.
-  archetype_traits: null
-
-  # Hidden-type variant: set observe_opponent_archetype false. Opponent stamina
-  # follows it unless set explicitly, and observe_velocity_change gives a
-  # memoryless policy single-frame evidence of the opponent's body.
-  observe_opponent_archetype: true
-  observe_opponent_stamina: null
-  observe_velocity_change: false
+# Best-response measurement for configs/disk_sumo_v3.yaml. The game is read
+# from the `config.yaml` that `train.py` saves into the checkpoint directory.
 
 best_response:
   checkpoint_dir: data/disk_sumo_v3

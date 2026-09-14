@@ -3,26 +3,16 @@
 # Measures the strategies in `data/leduc_classic` (written by `python train.py
 # configs/leduc_classic.yaml`) by training a best response to each of them.
 #
-# The `game` section must match the run under test exactly -- a checkpoint
-# stores the networks, not the game they were trained on -- so this is
-# `configs/leduc_classic.yaml`'s game verbatim: fixed bets of 2 pre-board and 4
-# post-board, at most two raises a round. `network.num_components` must match
-# it too (1), because a batched rollout selects between the two players'
-# categorical heads and they have to be the same width.
+# The game -- fixed bets of 2 pre-board and 4 post-board, at most two raises a
+# round -- is read from the `config.yaml` that `train.py` saves into the
+# checkpoint directory. `network.num_components` must match the run's (1),
+# because a batched rollout selects between the two players' categorical heads
+# and they have to be the same width.
 #
 # Classic Leduc has a published equilibrium value of about -0.0856 per hand to
 # player 0, so a converged self-play run should sit near that and this
 # exploitability should be small. It is a *lower* bound: read the `br_value`
 # column and only trust the number once it has stopped climbing.
-
-game:
-  name: leduc
-  num_ranks: 3
-  num_suits: 2
-  min_bet: 2.0
-  max_bet: 2.0
-  max_raises: 2
-  second_round_scale: 2.0
 
 best_response:
   checkpoint_dir: data/leduc_classic

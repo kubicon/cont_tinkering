@@ -1,4 +1,8 @@
 """CLI entry point for measuring a trained strategy by best-responding to it.
+
+The game is not read from the config given here but from the `config.yaml`
+that `train.py` saves into the checkpoint directory, so the responder always
+plays the game the strategy was trained in.
 """
 
 from __future__ import annotations
@@ -8,6 +12,7 @@ import dataclasses
 from pathlib import Path
 
 import jax
+import yaml
 
 from games.sequential import SequentialZeroSumGame
 from training.best_response import (
@@ -18,7 +23,7 @@ from training.best_response import (
     warn_if_regularized,
 )
 from training.hyperparams import build_hyperparams
-from training.run_config import RunConfig, load_run_config
+from training.run_config import CONFIG_FILENAME, BestResponseConfig, RunConfig, run_config_from_dict
 
 
 def _eval_seed(settings, responder: int, iterate: str, responder_iterate: str = "live") -> int:
@@ -33,7 +38,11 @@ def _eval_seed(settings, responder: int, iterate: str, responder_iterate: str = 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("config", help="path to a YAML run config with a `best_response` section")
+    parser.add_argument(
+        "config",
+        help="path to a YAML run config with a `best_response` section; the game comes from "
+        f"the checkpoint directory's {CONFIG_FILENAME}",
+    )
     parser.add_argument(
         "--responder", choices=("0", "1", "both"), default=None,
         help="which player learns a best response; overrides best_response.responder",
@@ -247,9 +256,42 @@ def report(results: dict[tuple[str, str, int], dict[str, Evaluation]]) -> None:
     print("  A bound, not a value: an under-trained responder reports too little.")
 
 
+def load_config(args: argparse.Namespace) -> RunConfig:
+    """The best-response config, with its game taken from the checkpoint directory's `config.yaml`.
+
+    A `game` block in the best-response config is optional; if there is one it
+    has to match the saved game, since responding in any other game would
+    measure a different strategy.
+    """
+    with open(args.config) as f:
+        raw = yaml.safe_load(f) or {}
+    checkpoint_dir = (
+        args.checkpoint_dir
+        or (raw.get("best_response") or {}).get("checkpoint_dir")
+        or BestResponseConfig.checkpoint_dir
+    )
+    saved = Path(checkpoint_dir) / CONFIG_FILENAME
+    if not saved.is_file():
+        raise FileNotFoundError(
+            f"{saved} not found: best_response.py reads the game from the {CONFIG_FILENAME} that "
+            "train.py saves next to its checkpoints. Retrain with train.py, or copy the "
+            "training config there."
+        )
+    with saved.open() as f:
+        trained_game = (yaml.safe_load(f) or {}).get("game")
+
+    config = run_config_from_dict({**raw, "game": trained_game})
+    if raw.get("game") is not None and run_config_from_dict(raw).game != config.game:
+        raise ValueError(
+            f"the game block in {args.config} differs from the one in {saved}; remove it "
+            "(the game is read from the checkpoint directory)"
+        )
+    return apply_overrides(config, args)
+
+
 def main() -> None:
     args = parse_args()
-    config = apply_overrides(load_run_config(args.config), args)
+    config = load_config(args)
     game = config.game.build()
     if not isinstance(game, SequentialZeroSumGame):
         raise ValueError(
