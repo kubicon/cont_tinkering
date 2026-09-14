@@ -21,6 +21,14 @@ at the start of every bout, so neither seat has a systematic advantage. When
 enabled, both multipliers are appended to each player's observation (own
 first), allowing one policy to learn both attacking and defending roles.
 
+**Optional stamina.** With `stamina_enabled`, full thrust cannot be sustained
+indefinitely. Each disk starts with unit stamina; effort drains it and easing
+off restores it. Available thrust falls linearly with stamina, down to
+`stamina_min_force` at exhaustion. Both stamina levels are observable (own
+first), but player 0's effort for the current simultaneous move remains hidden.
+This makes a committed charge something an opponent can evade and punish rather
+than a cost-free action that can be repeated for the whole bout.
+
 **Why every control step is two decisions.** Sumo is a simultaneous-move game,
 and `games.sequential` is turn-taking. The standard extensive-form encoding is
 used, as in `games.sequential_blotto`: player 0 chooses a force, it is parked in
@@ -100,9 +108,9 @@ class DiskSumoState:
     """Fixed-shape state of one `DiskSumo` bout.
 
     `turn` is the decision clock: control step `turn // 2` is being played and
-    player `turn % 2` is to choose. Player 0's force for the live control step
-    waits in `pending` (in world coordinates, already scaled) until player 1 has
-    chosen theirs; it is never part of either observation.
+    player `turn % 2` is to choose. Player 0's force and normalized effort for
+    the live control step wait in `pending` / `pending_effort` until player 1
+    has chosen theirs; neither is part of either observation.
 
     `result` is `+1`/`-1` once somebody has been pushed out and `0` otherwise;
     `done` marks that the bout ended early, including by the simultaneous-exit
@@ -112,7 +120,9 @@ class DiskSumoState:
     pos: chex.Array  # (2, 2) float32, disk centres, ring centre at the origin
     vel: chex.Array  # (2, 2) float32
     pending: chex.Array  # (2,) float32, player 0's world-frame force this step
+    pending_effort: chex.Array  # () float32, hidden player-0 effort in [0, 1]
     force_multiplier: chex.Array  # (2,) float32, per-bout actuator strengths
+    stamina: chex.Array  # (2,) float32 in [0, 1]
     result: chex.Array  # () float32 in {-1, 0, +1}, from player 0's side
     done: chex.Array  # () bool, the bout ended before the time limit
     turn: chex.Array  # () int32 in [0, 2 * horizon]
@@ -136,6 +146,10 @@ class DiskSumo(SequentialZeroSumGame):
         mass: float = 1.0,
         max_force: float = 1.0,
         force_asymmetry: float = 0.0,
+        stamina_enabled: bool = False,
+        stamina_drain_rate: float = 0.5,
+        stamina_recovery_rate: float = 0.25,
+        stamina_min_force: float = 0.25,
         drag: float = 1.0,
         stiffness: float = 100.0,
         contact_damping: float = 5.0,
@@ -152,7 +166,9 @@ class DiskSumo(SequentialZeroSumGame):
             if value <= 0.0:
                 raise ValueError(f"{name} must be positive, got {value}")
         for name, value in (("start_jitter", start_jitter), ("drag", drag),
-                            ("contact_damping", contact_damping)):
+                            ("contact_damping", contact_damping),
+                            ("stamina_drain_rate", stamina_drain_rate),
+                            ("stamina_recovery_rate", stamina_recovery_rate)):
             if value < 0.0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
         if start_distance < 2.0 * disk_radius:
@@ -174,6 +190,10 @@ class DiskSumo(SequentialZeroSumGame):
             )
         if not 0.0 <= force_asymmetry < 1.0:
             raise ValueError(f"force_asymmetry must be in [0, 1), got {force_asymmetry}")
+        if not 0.0 <= stamina_min_force <= 1.0:
+            raise ValueError(
+                f"stamina_min_force must be in [0, 1], got {stamina_min_force}"
+            )
 
         self.horizon = int(horizon)
         self.ring_radius = float(ring_radius)
@@ -188,6 +208,10 @@ class DiskSumo(SequentialZeroSumGame):
         self.mass = float(mass)
         self.max_force = float(max_force)
         self.force_asymmetry = float(force_asymmetry)
+        self.stamina_enabled = bool(stamina_enabled)
+        self.stamina_drain_rate = float(stamina_drain_rate)
+        self.stamina_recovery_rate = float(stamina_recovery_rate)
+        self.stamina_min_force = float(stamina_min_force)
         self.drag = float(drag)
         self.stiffness = float(stiffness)
         self.contact_damping = float(contact_damping)
@@ -210,10 +234,10 @@ class DiskSumo(SequentialZeroSumGame):
         return self._space
 
     def obs_dim(self, player: int) -> int:
-        # Keep symmetric-game checkpoints compatible. The asymmetric role must
-        # be visible, or strength becomes hidden chance instead of something a
-        # policy can condition its attacking/defending behavior on.
-        return 13 if self.force_asymmetry > 0.0 else 11
+        # Disabled optional mechanics preserve old checkpoint input widths.
+        # Strength and stamina must be visible so the policy can condition its
+        # attacking/defending behavior on the current role and resources.
+        return 11 + 2 * (self.force_asymmetry > 0.0) + 2 * self.stamina_enabled
 
     # ---- the game tree ------------------------------------------------------
 
@@ -229,7 +253,9 @@ class DiskSumo(SequentialZeroSumGame):
             pos=pos.astype(jnp.float32),
             vel=jnp.zeros((2, 2), dtype=jnp.float32),
             pending=jnp.zeros((2,), dtype=jnp.float32),
+            pending_effort=jnp.zeros((), dtype=jnp.float32),
             force_multiplier=force_multiplier,
+            stamina=jnp.ones((2,), dtype=jnp.float32),
             result=jnp.zeros((), dtype=jnp.float32),
             done=jnp.zeros((), dtype=bool),
             turn=jnp.zeros((), dtype=jnp.int32),
@@ -288,7 +314,10 @@ class DiskSumo(SequentialZeroSumGame):
         return jnp.where(over, TERMINAL, state.turn % 2).astype(jnp.int32)
 
     def observation(self, player: int, state: DiskSumoState) -> chex.Array:
-        """`(11,)`: own and opponent position and velocity, both edge margins, time left.
+        """Base `(11,)`: positions, velocities, both edge margins, and time left.
+
+        Observable force multipliers and stamina levels are appended, own
+        first, when their corresponding optional mechanic is enabled.
 
         Positions are relative to the ring centre in units of `ring_radius`,
         velocities in units of the full-force speed, and all four vectors are
@@ -316,6 +345,11 @@ class DiskSumo(SequentialZeroSumGame):
             observation = jnp.concatenate([
                 observation,
                 jnp.stack([state.force_multiplier[own], state.force_multiplier[opp]]),
+            ])
+        if self.stamina_enabled:
+            observation = jnp.concatenate([
+                observation,
+                jnp.stack([state.stamina[own], state.stamina[opp]]),
             ])
         return observation
 
@@ -350,7 +384,13 @@ class DiskSumo(SequentialZeroSumGame):
         # promote `pending`, `pos` and `vel`, and break the scans that carry them.
         local = self._space.box.clip(action.value).astype(state.pos.dtype)
         local = local / jnp.maximum(jnp.linalg.norm(local), 1.0)
-        force = self.max_force * state.force_multiplier[player] * (
+        effort = jnp.linalg.norm(local)
+        stamina_scale = jnp.where(
+            self.stamina_enabled,
+            self.stamina_min_force + (1.0 - self.stamina_min_force) * state.stamina[player],
+            1.0,
+        )
+        force = self.max_force * state.force_multiplier[player] * stamina_scale * (
             self._frame(own, opp).T @ local
         )
 
@@ -360,11 +400,23 @@ class DiskSumo(SequentialZeroSumGame):
             state.pos, state.vel, jnp.stack([state.pending, force])
         )
         resolves = player == 1
+        efforts = jnp.stack([state.pending_effort, effort])
+        stamina_delta = self.dt * (
+            self.stamina_recovery_rate * (1.0 - efforts)
+            - self.stamina_drain_rate * efforts
+        )
+        next_stamina = jnp.where(
+            self.stamina_enabled,
+            jnp.clip(state.stamina + stamina_delta, 0.0, 1.0),
+            state.stamina,
+        )
         return DiskSumoState(
             pos=jnp.where(resolves, pos, state.pos),
             vel=jnp.where(resolves, vel, state.vel),
             pending=jnp.where(resolves, jnp.zeros_like(force), force),
+            pending_effort=jnp.where(resolves, jnp.zeros_like(effort), effort),
             force_multiplier=state.force_multiplier,
+            stamina=jnp.where(resolves, next_stamina, state.stamina),
             result=jnp.where(resolves, result, state.result),
             done=jnp.where(resolves, done, state.done),
             turn=state.turn + 1,

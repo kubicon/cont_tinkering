@@ -16,7 +16,11 @@ game:
   substeps: 10
   mass: 1.0
   max_force: 1.0
-  force_asymmetry: 0.2
+  force_asymmetry: 0.05
+  stamina_enabled: true
+  stamina_drain_rate: 0.5
+  stamina_recovery_rate: 0.25
+  stamina_min_force: 0.25
   drag: 0.5
   stiffness: 400.0
   contact_damping: 10.0

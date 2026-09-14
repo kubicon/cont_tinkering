@@ -165,7 +165,9 @@ def test_contact_conserves_momentum_without_drag_or_forces():
         pos=jnp.asarray([[-0.2, 0.0], [0.2, 0.05]], dtype=jnp.float32),
         vel=jnp.asarray([[1.0, 0.0], [-0.5, 0.0]], dtype=jnp.float32),
         pending=jnp.zeros((2,), dtype=jnp.float32),
+        pending_effort=jnp.zeros((), dtype=jnp.float32),
         force_multiplier=jnp.ones((2,), dtype=jnp.float32),
+        stamina=jnp.ones((2,), dtype=jnp.float32),
         result=jnp.zeros((), dtype=jnp.float32),
         done=jnp.zeros((), dtype=bool),
         turn=jnp.asarray(1, dtype=jnp.int32),  # player 1 to act: the next step resolves
@@ -185,7 +187,9 @@ def test_the_disk_that_leaves_first_loses_a_simultaneous_exit():
         pos=jnp.asarray([[-0.95, 0.0], [0.92, 0.0]], dtype=jnp.float32),
         vel=jnp.asarray([[-1.0, 0.0], [1.0, 0.0]], dtype=jnp.float32),
         pending=jnp.zeros((2,), dtype=jnp.float32),
+        pending_effort=jnp.zeros((), dtype=jnp.float32),
         force_multiplier=jnp.ones((2,), dtype=jnp.float32),
+        stamina=jnp.ones((2,), dtype=jnp.float32),
         result=jnp.zeros((), dtype=jnp.float32),
         done=jnp.zeros((), dtype=bool),
         turn=jnp.asarray(1, dtype=jnp.int32),
@@ -265,6 +269,50 @@ def test_force_asymmetry_scales_the_applied_force():
     assert np.linalg.norm(np.asarray(after_0.pending)) == pytest.approx(1.2)
 
 
+def test_stamina_is_observable_but_pending_effort_is_hidden():
+    game = _deterministic(stamina_enabled=True)
+    state = game.initial_state(jax.random.PRNGKey(0)).replace(
+        stamina=jnp.asarray([0.25, 0.75], dtype=jnp.float32)
+    )
+    assert game.obs_dim(0) == game.obs_dim(1) == 13
+    np.testing.assert_allclose(np.asarray(game.observation(0, state)[-2:]), [0.25, 0.75])
+    np.testing.assert_allclose(np.asarray(game.observation(1, state)[-2:]), [0.75, 0.25])
+
+    parked = [game.step(state, _force(x, y), jax.random.PRNGKey(1))
+              for x, y in ((1.0, 0.0), (0.0, 0.0))]
+    assert float(parked[0].pending_effort) != float(parked[1].pending_effort)
+    np.testing.assert_array_equal(
+        np.asarray(game.observation(1, parked[0])), np.asarray(game.observation(1, parked[1]))
+    )
+
+
+def test_full_thrust_drains_stamina_and_rest_recovers_it():
+    game = _deterministic(
+        stamina_enabled=True, stamina_drain_rate=0.5, stamina_recovery_rate=0.25
+    )
+    state = game.initial_state(jax.random.PRNGKey(0))
+    charged = game.step(
+        game.step(state, _force(1.0, 0.0), jax.random.PRNGKey(1)),
+        _force(1.0, 0.0), jax.random.PRNGKey(2),
+    )
+    np.testing.assert_allclose(np.asarray(charged.stamina), [0.95, 0.95], atol=1e-6)
+
+    rested = game.step(
+        game.step(charged, _force(0.0, 0.0), jax.random.PRNGKey(3)),
+        _force(0.0, 0.0), jax.random.PRNGKey(4),
+    )
+    np.testing.assert_allclose(np.asarray(rested.stamina), [0.975, 0.975], atol=1e-6)
+
+
+def test_low_stamina_reduces_available_thrust():
+    game = _deterministic(stamina_enabled=True, stamina_min_force=0.25)
+    state = game.initial_state(jax.random.PRNGKey(0)).replace(
+        stamina=jnp.asarray([0.0, 1.0], dtype=jnp.float32)
+    )
+    after_0 = game.step(state, _force(1.0, 0.0), jax.random.PRNGKey(1))
+    assert np.linalg.norm(np.asarray(after_0.pending)) == pytest.approx(0.25)
+
+
 def test_random_play_is_fair_on_average():
     game = _game(horizon=30, margin_weight=0.5)
     _, payoffs = jax.vmap(
@@ -279,6 +327,8 @@ def test_random_play_is_fair_on_average():
     dict(horizon=0), dict(substeps=0), dict(ring_radius=0.0), dict(start_distance=0.1),
     dict(start_distance=1.9), dict(margin_weight=1.5), dict(drag=-1.0),
     dict(force_asymmetry=-0.1), dict(force_asymmetry=1.0),
+    dict(stamina_drain_rate=-0.1), dict(stamina_recovery_rate=-0.1),
+    dict(stamina_min_force=-0.1), dict(stamina_min_force=1.1),
 ])
 def test_invalid_parameters_are_rejected(kwargs):
     with pytest.raises(ValueError):

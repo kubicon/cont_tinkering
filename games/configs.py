@@ -306,6 +306,13 @@ class DiskSumoConfig:
     # Per bout, one randomly selected disk gets multiplier 1 + a and the other
     # 1 - a. Zero keeps the original symmetric game and 11-D observation.
     force_asymmetry: float = 0.0
+    # Optional resource that makes repeated full thrust progressively weaker.
+    # Stamina drains/recharges per simulated second; at zero stamina the disk
+    # retains `stamina_min_force` of its otherwise available thrust.
+    stamina_enabled: bool = False
+    stamina_drain_rate: float = 0.5
+    stamina_recovery_rate: float = 0.25
+    stamina_min_force: float = 0.25
     drag: float = 1.0
     stiffness: float = 100.0
     contact_damping: float = 5.0

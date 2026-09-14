@@ -3,10 +3,10 @@
 #   python train.py configs/disk_sumo_asymmetric.yaml
 #   python best_response.py configs/disk_sumo_asymmetric_br.yaml
 #
-# One disk has 1.2x force and the other 0.8x force in each bout. The assignment
-# is random and observable, so both seats remain fair while both policies can
-# learn an attacking role and a defending role. This run deliberately uses the
-# same 40k PPO-iteration budget as configs/disk_sumo.yaml for comparison.
+# One disk has 1.05x force and the other 0.95x force in each bout. The assignment
+# is random and observable, so both seats remain fair without making strength
+# decide a head-on contest by itself. Stamina makes continuous charging lose
+# effectiveness and creates room for evasion and counterattacks.
 
 game:
   name: disk_sumo
@@ -27,7 +27,14 @@ game:
   substeps: 10
   mass: 1.0
   max_force: 1.0
-  force_asymmetry: 0.2   # per-bout multipliers are 1.2 and 0.8, randomly assigned
+  force_asymmetry: 0.05  # per-bout multipliers are 1.05 and 0.95
+  # Full thrust exhausts a fresh disk in 2 seconds. At zero stamina it retains
+  # 25% thrust; easing completely off restores full stamina in 4 seconds.
+  # Partial effort blends continuously between draining and recovering.
+  stamina_enabled: true
+  stamina_drain_rate: 0.5
+  stamina_recovery_rate: 0.25
+  stamina_min_force: 0.25
   drag: 0.5
   stiffness: 400.0
   contact_damping: 10.0
