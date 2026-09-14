@@ -376,13 +376,12 @@ class DiskSumoV3Config(DiskSumoV2Config):
     """`disk_sumo_v2` with three archetypes that counter each other in a cycle.
 
     See `games.disk_sumo_v3`: rammer beats grinder, grinder beats anchor, anchor
-    beats rammer. `archetype_traits` also accepts `top_speed` and
-    `brace_quadratic`.
+    beats rammer. `archetype_traits` also accepts `top_speed`, `impact_brace`
+    and `brace_speed`.
     """
 
-    # Fraction of the ring radius lost, linearly, by the horizon; 0 keeps v2's
-    # fixed ring and lets a disfavoured disk run out the clock.
-    ring_shrink: float = 0.0
+    # Width of the grip cut-out around `top_speed`, as a fraction of it.
+    grip_width: float = 0.05
 
     def build(self) -> SequentialZeroSumGame:
         return DiskSumoV3(**dataclasses.asdict(self))
@@ -421,6 +420,15 @@ class MjxSumoConfig:
     margin_weight: float = 0.0
     # Dense potential-based shaping on the same distance gap; 0 is terminal-only.
     shaping_weight: float = 0.0
+    # "auto" selects Warp on an NVIDIA JAX backend and JAX elsewhere.
+    physics_backend: str = "jax"
+    # Warp contact capacity is shared by all vmapped worlds; size this for the
+    # largest rollout/evaluation batch. njmax is per world.
+    warp_naconmax: int | None = None
+    warp_njmax: int | None = None
+    # "auto" uses Warp's device default; staged modes trade copies for stable
+    # pointers and fewer expensive CUDA graph recaptures.
+    warp_graph_mode: str = "auto"
 
     def build(self) -> SequentialZeroSumGame:
         return MjxSumo(**dataclasses.asdict(self))
@@ -458,6 +466,10 @@ class MjxAntSumoConfig:
     margin_weight: float = 0.0
     # Dense potential-based shaping on the same distance gap; 0 is terminal-only.
     shaping_weight: float = 0.0
+    physics_backend: str = "jax"
+    warp_naconmax: int | None = None
+    warp_njmax: int | None = None
+    warp_graph_mode: str = "auto"
 
     def build(self) -> SequentialZeroSumGame:
         return MjxAntSumo(**dataclasses.asdict(self))

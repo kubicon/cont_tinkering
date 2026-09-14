@@ -115,8 +115,16 @@ class MixturePPOHyperparams(PPOHyperparams):
     advantage: str = "monte_carlo"
     gamma: float = 1.0
     vtrace_lambda: float = 0.95
-    vtrace_rho_bar: float = 1.0
+    vtrace_rho_bar: float = 2.0
     vtrace_c_bar: float = 1.0
+    # What V-trace does with the opponent's exploration (`training.mixture.
+    # build_mixture_ppo_loss_fn`): "none" leaves it as environment; "future"
+    # importance-weights the opponent's moves after each own decision; and
+    # "future_and_past" also weights each decision by the opponent's moves
+    # before it, floored at `vtrace_opponent_past_floor` so states only
+    # exploration reaches keep being trained on. V-trace only.
+    vtrace_opponent_correction: str = "none"
+    vtrace_opponent_past_floor: float = 0.05
 
     # Target/magnet parameter tracking (see `training.mixture_trainer.MixtureTrainState`).
     target_tau: float = 0.005  # Polyak-averaging coefficient for `target_params`.

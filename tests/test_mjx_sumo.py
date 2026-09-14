@@ -26,6 +26,9 @@ import pytest
 from games.mjx_sumo import MjxSumo, MjxSumoState
 from games.sequential import TERMINAL
 from games.spaces import HybridAction
+from training.config import MixturePPOHyperparams
+from training.mixture import build_mixture_network
+from training.sequential_rollout import build_episode_sampler
 
 BATCH = 32
 
@@ -98,6 +101,7 @@ def test_stepping_a_terminal_state_is_a_noop():
 
 def test_state_shapes_and_dtypes_survive_a_step():
     game = _game()
+    assert game.physics_backend == "jax"
     state = game.initial_state(jax.random.PRNGKey(0))
     stepped = game.step(state, _force(0.3, -0.2), jax.random.PRNGKey(1))
     for before, after in zip(jax.tree_util.tree_leaves(state), jax.tree_util.tree_leaves(stepped)):
@@ -119,6 +123,66 @@ def test_players_alternate_and_the_physics_waits_for_player_one():
     after_1 = game.step(after_0, _force(1.0, 0.0), jax.random.PRNGKey(2))
     assert int(game.current_player(after_1)) == 0
     assert not np.allclose(np.asarray(after_1.data.qpos), np.asarray(state.data.qpos))
+
+
+def test_paired_actions_match_two_generic_tree_steps():
+    """The fast rollout path preserves the original sequential-game semantics."""
+    game = _deterministic(horizon=2, substeps=1)
+    state = game.initial_state(jax.random.PRNGKey(0))
+    action_0, action_1 = _force(0.7, -0.2), _force(-0.1, 0.5)
+
+    @jax.jit
+    def both_paths(initial):
+        generic_parked = game.step(initial, action_0, jax.random.PRNGKey(1))
+        generic_resolved = game.step(generic_parked, action_1, jax.random.PRNGKey(2))
+        fast_parked = game.park_action(initial, action_0)
+        fast_resolved = game.resolve_action(fast_parked, action_1)
+        return generic_parked, generic_resolved, fast_parked, fast_resolved
+
+    generic_parked, generic_resolved, fast_parked, fast_resolved = both_paths(state)
+
+    for expected, actual in ((generic_parked, fast_parked), (generic_resolved, fast_resolved)):
+        for expected_leaf, actual_leaf in zip(
+            jax.tree_util.tree_leaves(expected), jax.tree_util.tree_leaves(actual)
+        ):
+            np.testing.assert_allclose(np.asarray(actual_leaf), np.asarray(expected_leaf), atol=1e-6)
+
+
+def test_training_sampler_replays_through_the_generic_game_api():
+    """The optimized sampler emits the same two-decision trajectory contract."""
+    game = _deterministic(horizon=2, substeps=1)
+    hp = MixturePPOHyperparams(
+        action_dim=2, hidden_dims=(8,), num_components=2, num_atoms=0,
+        low=(-1.0, -1.0), high=(1.0, 1.0), num_envs=1,
+    )
+    networks = (build_mixture_network(hp), build_mixture_network(hp))
+    init_0, init_1, state_key = jax.random.split(jax.random.PRNGKey(5), 3)
+    dummy = game.initial_state(state_key)
+    params = (
+        networks[0].init(init_0, game.observation(0, dummy)),
+        networks[1].init(init_1, game.observation(1, dummy)),
+    )
+    sampler = build_episode_sampler(game, *networks)
+    key = jax.random.PRNGKey(9)
+    episode, payoff = jax.jit(sampler)(params[0], params[0], params[1], params[1], key)
+
+    def replay(initial, rows):
+        def replay_step(state, row):
+            action_kind, action_value, step_key = row
+            actor = game.current_player(state)
+            state = game.step(
+                state, HybridAction(kind=action_kind, value=action_value), step_key
+            )
+            return state, actor
+
+        return jax.lax.scan(replay_step, initial, rows)
+
+    state, replayed_actors = jax.jit(replay)(
+        game.initial_state(jax.random.split(key)[0]),
+        (episode.action_kind, episode.action_value, jax.random.split(key, game.max_steps)),
+    )
+    np.testing.assert_array_equal(np.asarray(replayed_actors), np.asarray(episode.actor))
+    assert float(payoff) == pytest.approx(float(game.payoff(state)), abs=1e-6)
 
 
 # ---- information ------------------------------------------------------------
@@ -247,7 +311,62 @@ def test_a_lone_puck_settles_at_the_speed_the_observation_normalizes_by():
     dict(horizon=0), dict(substeps=0), dict(ring_radius=0.0), dict(start_distance=0.1),
     dict(start_distance=1.9), dict(margin_weight=1.5), dict(drag=-1.0),
     dict(solref_timeconst=0.0), dict(solver_iterations=0),
+    dict(physics_backend="bogus"), dict(warp_graph_mode="bogus"),
+    dict(physics_backend="warp"),
 ])
 def test_invalid_parameters_are_rejected(kwargs):
     with pytest.raises(ValueError):
         MjxSumo(**kwargs)
+
+
+def _has_nvidia_gpu() -> bool:
+    return any(
+        device.platform == "gpu" and "nvidia" in device.device_kind.lower()
+        for device in jax.devices()
+    )
+
+
+@pytest.mark.skipif(not _has_nvidia_gpu(), reason="MJX-Warp requires an NVIDIA GPU")
+def test_auto_backend_runs_the_paired_training_sampler_with_warp():
+    """Exercise Warp through the same vmap + scan path used by training."""
+    game = MjxSumo(
+        horizon=1,
+        substeps=1,
+        random_orientation=False,
+        start_jitter=0.0,
+        physics_backend="auto",
+        warp_naconmax=2,
+        warp_njmax=8,
+    )
+    assert game.physics_backend == "warp"
+
+    hp = MixturePPOHyperparams(
+        action_dim=2,
+        hidden_dims=(8,),
+        num_components=2,
+        num_atoms=0,
+        low=(-1.0, -1.0),
+        high=(1.0, 1.0),
+        num_envs=2,
+    )
+    networks = (build_mixture_network(hp), build_mixture_network(hp))
+    init_0, init_1, obs_key, sample_key = jax.random.split(jax.random.PRNGKey(5), 4)
+    initial = game.initial_state(obs_key)
+    params = (
+        networks[0].init(init_0, game.observation(0, initial)),
+        networks[1].init(init_1, game.observation(1, initial)),
+    )
+    sampler = build_episode_sampler(game, *networks)
+    episodes, payoffs = jax.jit(
+        jax.vmap(sampler, in_axes=(None, None, None, None, 0))
+    )(
+        params[0],
+        params[0],
+        params[1],
+        params[1],
+        jax.random.split(sample_key, hp.num_envs),
+    )
+
+    assert episodes.actor.shape == (hp.num_envs, game.max_steps)
+    assert payoffs.shape == (hp.num_envs,)
+    assert np.all(np.isfinite(np.asarray(payoffs)))

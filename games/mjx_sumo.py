@@ -1,9 +1,9 @@
 """Sumo on MuJoCo/MJX physics: pucks (`MjxSumo`) and ants (`MjxAntSumo`).
 
 `games.disk_sumo` integrates its own semi-implicit Euler and models contact as a
-penalty spring. This module plays sumo on MuJoCo's constraint solver via MJX,
-which is pure JAX and so `jit`s and `vmap`s exactly like the hand-rolled one
-does.
+penalty spring. This module plays sumo on MuJoCo's constraint solver via MJX;
+both its portable JAX implementation and its NVIDIA-optimized Warp
+implementation participate in the same `jit`/`vmap` training pipeline.
 
 Two games live here, sharing `MjxSumoBase` -- every rule that is not about the
 shape of a body:
@@ -169,17 +169,95 @@ class MjxSumoBase(SequentialZeroSumGame):
         self.margin_weight = float(margin_weight)
         self.shaping_weight = float(shaping_weight)
 
-    def _init_model(self) -> None:
-        """Compile the subclass's model onto the device. Call last from `__init__`.
+    def _init_model(
+        self,
+        physics_backend: str,
+        warp_naconmax: int | None,
+        warp_njmax: int | None,
+        warp_graph_mode: str,
+    ) -> None:
+        """Compile the subclass's model onto the selected MJX backend."""
+        if physics_backend not in ("auto", "jax", "warp"):
+            raise ValueError(
+                "physics_backend must be 'auto', 'jax' or 'warp', got "
+                f"{physics_backend!r}"
+            )
+        if warp_graph_mode not in ("auto", "warp", "warp_staged", "warp_staged_ex"):
+            raise ValueError(
+                "warp_graph_mode must be 'auto', 'warp', 'warp_staged' or "
+                f"'warp_staged_ex', got {warp_graph_mode!r}"
+            )
 
-        `impl="jax"` is pinned deliberately. MJX will otherwise pick its Warp
-        backend where `warp` is installed -- a different `Data` type, which is
-        not what the rollout's `lax.scan` carry and the terminal-state guard
-        were checked against.
-        """
+        backend = physics_backend
+        if backend == "auto":
+            # Warp is NVIDIA-only for performance. Keep local CPU smoke tests
+            # and non-NVIDIA accelerators on the portable JAX implementation.
+            has_nvidia_gpu = any(
+                device.platform == "gpu" and "nvidia" in device.device_kind.lower()
+                for device in jax.devices()
+            )
+            backend = "warp" if has_nvidia_gpu else "jax"
+
+        if backend == "warp":
+            from mujoco.mjx import warp as mjx_warp
+
+            if not mjx_warp.WARP_INSTALLED:
+                raise RuntimeError(
+                    "MJX-Warp was selected but warp-lang is unavailable; install the "
+                    "project with its mujoco-mjx[warp] dependency"
+                )
+            for name, value in (
+                ("warp_naconmax", warp_naconmax),
+                ("warp_njmax", warp_njmax),
+            ):
+                if value is None or value < 1:
+                    raise ValueError(
+                        f"physics_backend {physics_backend!r} resolved to Warp, so {name} "
+                        f"must be a positive integer, got {value}"
+                    )
+            graph_mode = None
+            if warp_graph_mode != "auto":
+                graph_mode = getattr(
+                    mjx_warp.types.GraphMode, warp_graph_mode.upper()
+                )
+        else:
+            graph_mode = None
+
+        self.physics_backend = backend
+        self.warp_naconmax = warp_naconmax
+        self.warp_njmax = warp_njmax
+        self.warp_graph_mode = warp_graph_mode
         self._mj_model = self._build_model()
-        self._model = mjx.put_model(self._mj_model, impl="jax")
-        self._init_data = mjx.make_data(self._model, impl="jax")
+        self._model = mjx.put_model(
+            self._mj_model, impl=backend, graph_mode=graph_mode
+        )
+        if backend == "warp":
+            # Warp allocates contact storage across every later-vmapped world;
+            # unlike the JAX backend it requires these capacities up front and
+            # make_data must receive the original MjModel.
+            self._init_data = mjx.make_data(
+                self._mj_model,
+                impl="warp",
+                naconmax=warp_naconmax,
+                njmax=warp_njmax,
+            )
+        else:
+            self._init_data = mjx.make_data(self._model, impl="jax")
+
+    @staticmethod
+    def _select_state(
+        use_old: chex.Array, new: MjxSumoState, old: MjxSumoState
+    ) -> MjxSumoState:
+        """Select a state while preserving MJX-Warp's non-vmapped metadata."""
+        return new.replace(
+            # Data.where is backend-aware; a raw tree_map/jnp.where loses the
+            # shared fields in Warp's Data implementation.
+            data=new.data.where(use_old, old.data),
+            pending=jnp.where(use_old, old.pending, new.pending),
+            result=jnp.where(use_old, old.result, new.result),
+            done=jnp.where(use_old, old.done, new.done),
+            turn=jnp.where(use_old, old.turn, new.turn),
+        )
 
     # ---- what a body has to answer ------------------------------------------
 
@@ -288,14 +366,59 @@ class MjxSumoBase(SequentialZeroSumGame):
         )
         resolves = player == 1
         return MjxSumoState(
-            data=jax.tree_util.tree_map(
-                lambda new, old: jnp.where(resolves, new, old), data, state.data
-            ),
+            data=data.where(~resolves, state.data),
             pending=jnp.where(resolves, jnp.zeros_like(control), control).astype(jnp.float32),
             result=jnp.where(resolves, result, state.result),
             done=jnp.where(resolves, done, state.done),
             turn=state.turn + 1,
         )
+
+    def step(
+        self, state: MjxSumoState, action: HybridAction, key: chex.PRNGKey
+    ) -> MjxSumoState:
+        """The generic terminal guard, using backend-aware MJX Data selection."""
+        stepped = self._step(state, action, key)
+        return self._select_state(self.is_terminal(state), stepped, state)
+
+    def park_action(self, state: MjxSumoState, action: HybridAction) -> MjxSumoState:
+        """Apply player 0's half-turn without running the physics solver.
+
+        The generic sequential-game ``_step`` above has to select on a traced
+        player number, so its call to ``_simulate`` is evaluated even on player
+        0's half-turn and then discarded.  MJX rollouts know statically that
+        adjacent decisions are player 0 then player 1; they use this method to
+        avoid that otherwise guaranteed extra simulation.
+
+        Terminal states remain absorbing, matching ``SequentialZeroSumGame.step``.
+        Callers use this only at the start of a control step (player 0 to act).
+        """
+        control = self._control(0, action.value.astype(state.data.qpos.dtype), self._positions(state))
+        parked = state.replace(pending=control.astype(jnp.float32), turn=state.turn + 1)
+        terminal = self.is_terminal(state)
+        return self._select_state(terminal, parked, state)
+
+    def resolve_action(self, state: MjxSumoState, action: HybridAction) -> MjxSumoState:
+        """Apply player 1's half-turn and run exactly one control-step simulation.
+
+        Paired with :meth:`park_action`, this is equivalent to two calls to
+        ``step`` but invokes ``_simulate`` only once.  Terminal padding still
+        has to be selected leafwise because terminal episodes can differ within
+        a vmapped batch.
+        """
+        dtype = state.data.qpos.dtype
+        control = self._control(1, action.value.astype(dtype), self._positions(state))
+        data, result, done = self._simulate(
+            state.data, jnp.concatenate([state.pending.astype(dtype), control])
+        )
+        resolved = MjxSumoState(
+            data=data,
+            pending=jnp.zeros_like(control, dtype=jnp.float32),
+            result=result,
+            done=done,
+            turn=state.turn + 1,
+        )
+        terminal = self.is_terminal(state)
+        return self._select_state(terminal, resolved, state)
 
     # ---- physics ------------------------------------------------------------
 
@@ -386,6 +509,10 @@ class MjxSumo(MjxSumoBase):
         solver_ls_iterations: int = 8,
         margin_weight: float = 0.0,
         shaping_weight: float = 0.0,
+        physics_backend: str = "jax",
+        warp_naconmax: int | None = None,
+        warp_njmax: int | None = None,
+        warp_graph_mode: str = "auto",
     ):
         self._init_rules(
             horizon=horizon, ring_radius=ring_radius, start_distance=start_distance,
@@ -419,7 +546,9 @@ class MjxSumo(MjxSumoBase):
         # force reaches in one control step.
         self._speed_scale = max_force / drag if drag > 0.0 else max_force * dt / mass
         self._space = hybrid(NUM_ATOMS, [-1.0, -1.0], [1.0, 1.0])
-        self._init_model()
+        self._init_model(
+            physics_backend, warp_naconmax, warp_njmax, warp_graph_mode
+        )
 
     def _build_model(self) -> mujoco.MjModel:
         return mujoco.MjModel.from_xml_string(
@@ -612,6 +741,10 @@ class MjxLeggedSumo(MjxSumoBase):
         solver_ls_iterations: int = 8,
         margin_weight: float = 0.0,
         shaping_weight: float = 0.0,
+        physics_backend: str = "jax",
+        warp_naconmax: int | None = None,
+        warp_njmax: int | None = None,
+        warp_graph_mode: str = "auto",
     ):
         self._init_rules(
             horizon=horizon, ring_radius=ring_radius, start_distance=start_distance,
@@ -645,7 +778,9 @@ class MjxLeggedSumo(MjxSumoBase):
         self.angular_scale = float(angular_scale)
         self.joint_velocity_scale = float(joint_velocity_scale)
         self._space = hybrid(NUM_ATOMS, [-1.0] * len(self.HINGES), [1.0] * len(self.HINGES))
-        self._init_model()
+        self._init_model(
+            physics_backend, warp_naconmax, warp_njmax, warp_graph_mode
+        )
         self._index_model()
 
     # ---- the model ----------------------------------------------------------

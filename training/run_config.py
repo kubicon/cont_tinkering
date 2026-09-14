@@ -32,6 +32,10 @@ from games.configs import GAME_CONFIGS
 
 POLICIES = ("gaussian_mixture", "exp_family")
 
+# `train.py` copies its run config into `train.checkpoint_dir` under this name,
+# and `best_response.py` reads the game back from it.
+CONFIG_FILENAME = "config.yaml"
+
 
 @dataclasses.dataclass
 class NetworkConfig:
@@ -139,8 +143,16 @@ class PPOConfig:
     advantage: str = "monte_carlo"
     gamma: float = 1.0
     vtrace_lambda: float = 0.95
-    vtrace_rho_bar: float = 1.0
+    vtrace_rho_bar: float = 2.0
     vtrace_c_bar: float = 1.0
+    # What V-trace does with the opponent's exploration (`training.mixture.
+    # build_mixture_ppo_loss_fn`): "none" leaves it as environment; "future"
+    # importance-weights the opponent's moves after each own decision; and
+    # "future_and_past" also weights each decision by the opponent's moves
+    # before it, floored at `vtrace_opponent_past_floor` so states only
+    # exploration reaches keep being trained on. V-trace only.
+    vtrace_opponent_correction: str = "none"
+    vtrace_opponent_past_floor: float = 0.05
 
     # Entropy bonus, split per head.
     category_entropy_coef: float = 0.1
@@ -357,6 +369,7 @@ def _build_dataclass(cls: type, data: dict) -> Any:
 
 
 ADVANTAGES = ("monte_carlo", "vtrace")
+OPPONENT_CORRECTIONS = ("none", "future", "future_and_past")
 
 
 def _check_advantage(ppo: PPOConfig) -> PPOConfig:
@@ -372,6 +385,18 @@ def _check_advantage(ppo: PPOConfig) -> PPOConfig:
     for name in ("vtrace_rho_bar", "vtrace_c_bar"):
         if values[name] <= 0.0:
             raise ValueError(f"ppo.{name} must be positive, got {values[name]}")
+    if ppo.vtrace_opponent_correction not in OPPONENT_CORRECTIONS:
+        raise ValueError(
+            f"unknown ppo.vtrace_opponent_correction {ppo.vtrace_opponent_correction!r}, "
+            f"choices: {list(OPPONENT_CORRECTIONS)}"
+        )
+    if ppo.vtrace_opponent_correction != "none" and ppo.advantage != "vtrace":
+        raise ValueError("ppo.vtrace_opponent_correction needs ppo.advantage: vtrace")
+    values["vtrace_opponent_past_floor"] = float(ppo.vtrace_opponent_past_floor)
+    if not 0.0 < values["vtrace_opponent_past_floor"] <= 1.0:
+        raise ValueError(
+            f"ppo.vtrace_opponent_past_floor must lie in (0, 1], got {values['vtrace_opponent_past_floor']}"
+        )
     return dataclasses.replace(ppo, **values)
 
 

@@ -2,8 +2,8 @@
 
 The v2 machinery it inherits (archetype dealing, hidden types, stamina) is
 covered by `tests/test_disk_sumo_v2.py`; this re-checks the contract on the new
-integrator and then the three things v3 adds: the motor curve, the quadratic
-brace and the shrinking ring.
+integrator and then the two things v3 adds: the grip cut-out and the impact
+brace.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def _apart(game, state):
 
 
 def test_random_play_terminates_with_bounded_payoffs():
-    game = DiskSumoV3(horizon=20, margin_weight=0.5, ring_shrink=0.5)
+    game = DiskSumoV3(horizon=20, margin_weight=0.5)
     finals, payoffs = jax.vmap(
         lambda key: game.play_episode((game.random_action_fn(0), game.random_action_fn(1)), key)
     )(jax.random.split(jax.random.PRNGKey(0), BATCH))
@@ -61,7 +61,7 @@ def test_random_play_terminates_with_bounded_payoffs():
 
 
 def test_shapes_and_dtypes_survive_a_step():
-    game = DiskSumoV3(ring_shrink=0.3)
+    game = DiskSumoV3()
     state = game.initial_state(jax.random.PRNGKey(0))
     stepped = _control_step(game, state, (0.3, -0.2), (1.0, 0.0))
     for before, after in zip(jax.tree_util.tree_leaves(state), jax.tree_util.tree_leaves(stepped)):
@@ -72,8 +72,8 @@ def test_shapes_and_dtypes_survive_a_step():
 
 
 def test_config_builds_the_game_and_leaves_v2_alone():
-    game = GAME_CONFIGS["disk_sumo_v3"](ring_shrink=0.25).build()
-    assert isinstance(game, DiskSumoV3) and game.ring_shrink == 0.25
+    game = GAME_CONFIGS["disk_sumo_v3"](grip_width=0.1).build()
+    assert isinstance(game, DiskSumoV3) and game.grip_width == 0.1
     assert game.archetype_names == tuple(DEFAULT_ARCHETYPES) == ("rammer", "grinder", "anchor")
     v2 = GAME_CONFIGS["disk_sumo_v2"]().build()
     assert not isinstance(v2, DiskSumoV3) and len(v2.archetype_names) == 7
@@ -81,7 +81,7 @@ def test_config_builds_the_game_and_leaves_v2_alone():
 
 
 def test_random_play_is_fair_on_average():
-    game = DiskSumoV3(horizon=30, margin_weight=0.5, ring_shrink=0.4)
+    game = DiskSumoV3(horizon=30, margin_weight=0.5)
     _, payoffs = jax.vmap(
         lambda key: game.play_episode((game.random_action_fn(0), game.random_action_fn(1)), key)
     )(jax.random.split(jax.random.PRNGKey(1), 2000))
@@ -92,7 +92,7 @@ def test_random_play_is_fair_on_average():
 
 
 def test_without_new_traits_the_physics_is_v2s():
-    """Neutral `top_speed` and `brace_quadratic` and no shrink reproduce v2 exactly."""
+    """Neutral `top_speed`, `impact_brace` and `brace_speed` reproduce v2 exactly."""
     traits = {"a": {"force": 1.2, "mass": 1.3, "brace": 2.0}, "b": {"drag": 0.7, "drain": 1.4}}
     kwargs = dict(archetypes=["a", "b"], archetype_traits=traits, horizon=15)
     v2, v3 = DiskSumoV2(**kwargs), DiskSumoV3(**kwargs)
@@ -105,16 +105,20 @@ def test_without_new_traits_the_physics_is_v2s():
     np.testing.assert_allclose(np.asarray(v3.observation(0, s3)), np.asarray(v2.observation(0, s2)), atol=1e-5)
 
 
-def test_motor_curve_caps_speed_below_top_speed():
+def test_grip_is_full_below_top_speed_and_cuts_out_at_it():
     traits = {"slow": {"top_speed": 0.25}, "free": {}}
     game = _deterministic(archetypes=["slow", "free"], archetype_traits=traits, egocentric=False,
                           ring_radius=100.0, stamina_drain_rate=0.0)
     state = _with(game, _apart(game, game.initial_state(jax.random.PRNGKey(0))), "slow", "free")
+    early = _control_step(game, state, (0.0, 1.0), (0.0, 1.0))
+    # From rest both disks accelerate identically: no grip is lost well below top_speed.
+    np.testing.assert_allclose(np.asarray(early.vel[0]), np.asarray(early.vel[1]), rtol=1e-4)
     for _ in range(30):
         state = _control_step(game, state, (0.0, 1.0), (0.0, 1.0))
     speed = np.linalg.norm(np.asarray(state.vel), axis=-1)
-    # Equilibrium of the capped disk: F (1 - v / (0.25 * F / drag)) = drag * v, i.e. v = 0.2 F / drag.
-    assert speed[0] == pytest.approx(0.2 * game._speed_scale, rel=0.02)
+    cap = 0.25 * game._speed_scale
+    # Thrust fades over a band `grip_width` wide, so the disk settles just past top_speed.
+    assert 0.95 * cap < speed[0] < (1.0 + 2.0 * game.grip_width) * cap
     assert speed[1] > 0.75 * game._speed_scale
 
 
@@ -131,8 +135,8 @@ def test_a_disk_knocked_back_past_top_speed_cannot_brake():
     assert float(still.vel[0, 1]) > 0.0
 
 
-def test_quadratic_brace_resists_fast_motion_far_more_than_slow():
-    traits = {"anchor": {"brace_quadratic": 8.0}, "plain": {}}
+def test_impact_brace_ignores_slow_motion_and_soaks_up_fast_motion():
+    traits = {"anchor": {"impact_brace": 8.0, "brace_speed": 0.5}, "plain": {}}
     game = _deterministic(archetypes=["anchor", "plain"], archetype_traits=traits, egocentric=False)
     state = _apart(game, game.initial_state(jax.random.PRNGKey(0)))
 
@@ -141,41 +145,19 @@ def test_quadratic_brace_resists_fast_motion_far_more_than_slow():
         stepped = _control_step(game, s, (0.0, effort), (0.0, 0.0))
         return float(stepped.vel[0, 0]) / speed
 
-    # Braced (idle) decay is much stronger at speed; thrusting switches it off.
-    assert decay("anchor", 2.0, 0.0) < decay("anchor", 0.1, 0.0) < decay("plain", 0.1, 0.0) + 1e-6
-    assert decay("anchor", 2.0, 1.0) == pytest.approx(decay("plain", 2.0, 1.0), abs=1e-5)
-
-
-def test_ring_shrinks_linearly_and_pushes_a_still_disk_out():
-    game = _deterministic(horizon=10, ring_shrink=0.5)
-    state = game.initial_state(jax.random.PRNGKey(0))
-    assert float(game.ring_radius_at(state)) == pytest.approx(1.0)
-    assert float(game.ring_radius_at(state.replace(turn=jnp.asarray(10)))) == pytest.approx(0.75)
-    assert float(game.ring_radius_at(state.replace(turn=jnp.asarray(20)))) == pytest.approx(0.5)
-
-    state = state.replace(pos=jnp.asarray([[-0.78, 0.0], [0.3, 0.0]]))
-    for _ in range(game.horizon):
-        if bool(state.done):
-            break
-        state = _control_step(game, state, (0.0, 0.0), (0.0, 0.0))
-    # Player 0 sits at radius 0.78; the ring (0.75) first passes it in control step 5.
-    assert bool(state.done) and float(state.result) == -1.0 and int(state.turn) == 2 * 6
-
-
-def test_observed_margins_follow_the_shrinking_ring():
-    game = _deterministic(horizon=10, ring_shrink=0.5, egocentric=False)
-    state = game.initial_state(jax.random.PRNGKey(0)).replace(
-        pos=jnp.asarray([[-0.4, 0.0], [0.3, 0.0]]), turn=jnp.asarray(10)
-    )
-    obs = np.asarray(game.observation(0, state))
-    np.testing.assert_allclose(obs[0:2], [-0.4, 0.0], atol=1e-6)  # positions: initial ring units
-    np.testing.assert_allclose(obs[8:10], [1.0 - 0.4 / 0.75, 1.0 - 0.3 / 0.75], atol=1e-6)
+    slow, fast = 0.4 * game._speed_scale, 2.0 * game._speed_scale
+    # Below brace_speed the anchor is an ordinary disk; above it an idle anchor stops hard.
+    assert decay("anchor", slow, 0.0) == pytest.approx(decay("plain", slow, 0.0), abs=1e-6)
+    assert decay("anchor", fast, 0.0) < 0.5 * decay("plain", fast, 0.0)
+    # Thrusting switches the brace off.
+    assert decay("anchor", fast, 1.0) == pytest.approx(decay("plain", fast, 1.0), abs=1e-5)
 
 
 @pytest.mark.parametrize("kwargs", [
-    dict(ring_shrink=1.0), dict(ring_shrink=-0.1),
+    dict(grip_width=0.0),
     dict(archetype_traits={"rammer": {"top_speed": 0.0}}),
-    dict(archetype_traits={"anchor": {"brace_quadratic": -1.0}}),
+    dict(archetype_traits={"anchor": {"impact_brace": -1.0}}),
+    dict(archetype_traits={"anchor": {"brace_speed": -0.1}}),
     dict(archetype_traits={"anchor": {"radius": 1.0}}),
     dict(archetypes=["quick"]),
 ])

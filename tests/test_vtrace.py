@@ -26,7 +26,7 @@ from training.mixture import (
 )
 from training.run_config import run_config_from_dict
 from training.sequential_rollout import build_episode_sampler, collect_sequential_batch
-from training.vtrace import reverse_linear_recurrence, vtrace
+from training.vtrace import opponent_past_weight, reverse_linear_recurrence, vtrace
 
 NUM_ENVS = 64
 
@@ -50,8 +50,11 @@ def test_reverse_linear_recurrence_matches_a_loop(shape):
 # ---- the targets -------------------------------------------------------------
 
 
-def _reference(own, rewards, values, log_rhos, gamma, lambda_, rho_bar, c_bar):
-    """V-trace straight from the definition, on one episode's own decisions."""
+def _reference(own, rewards, values, log_rhos, gamma, lambda_, rho_bar, c_bar, opponent_log_rhos=None):
+    """V-trace straight from the definition, on one episode's own decisions.
+
+    With `opponent_log_rhos`, the opponent rows of each segment are part of its action.
+    """
     T = len(own)
     idx = [t for t in range(T) if own[t]]
     vs, adv = np.zeros(T), np.zeros(T)
@@ -60,7 +63,9 @@ def _reference(own, rewards, values, log_rhos, gamma, lambda_, rho_bar, c_bar):
     bounds = idx[1:] + [T]
     seg = [rewards[s:e].sum() for s, e in zip(idx, bounds)]
     V = [values[s] for s in idx] + [0.0]
-    ratio = [np.exp(log_rhos[s]) for s in idx]
+    opponent = np.zeros(T) if opponent_log_rhos is None else opponent_log_rhos
+    q = [np.exp(opponent[s + 1:e].sum()) for s, e in zip(idx, bounds)]
+    ratio = [np.exp(log_rhos[s]) * q[k] for k, s in enumerate(idx)]
     rho = [min(rho_bar, r) for r in ratio]
     c = [lambda_ * min(c_bar, r) for r in ratio]
     n = len(idx)
@@ -70,7 +75,7 @@ def _reference(own, rewards, values, log_rhos, gamma, lambda_, rho_bar, c_bar):
         v[k] = V[k] + delta + gamma * c[k] * (v[k + 1] - V[k + 1])
     for k, s in enumerate(idx):
         vs[s] = v[k]
-        adv[s] = seg[k] + gamma * v[k + 1] - V[k]
+        adv[s] = min(rho_bar, q[k]) * (seg[k] + gamma * v[k + 1] - V[k])
     return vs, adv
 
 
@@ -97,6 +102,47 @@ def test_vtrace_matches_the_definition_on_interleaved_rows(gamma, lambda_, rho_b
         vs, adv = _reference(own[e], rewards[e], values[e], log_rhos[e], gamma, lambda_, rho_bar, c_bar)
         np.testing.assert_allclose(np.asarray(out.vs[e]), vs, rtol=1e-5, atol=1e-5)
         np.testing.assert_allclose(np.asarray(out.pg_advantage[e]), adv, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("gamma,lambda_,rho_bar,c_bar", [(1.0, 0.95, 2.0, 1.0), (0.9, 1.0, 1.0, 0.5)])
+def test_opponent_future_correction_matches_the_definition(gamma, lambda_, rho_bar, c_bar):
+    own, rewards, values, log_rhos = _random_inputs(seed=4)
+    opponent = np.random.default_rng(5).normal(scale=0.5, size=own.shape)
+    out = vtrace(jnp.asarray(own), jnp.asarray(rewards), jnp.asarray(values), jnp.asarray(log_rhos),
+                 gamma=gamma, lambda_=lambda_, rho_bar=rho_bar, c_bar=c_bar,
+                 opponent_log_rhos=jnp.asarray(opponent))
+    for e in range(own.shape[0]):
+        # Own rows' entries must be ignored.
+        masked = np.where(own[e], 0.0, opponent[e])
+        vs, adv = _reference(own[e], rewards[e], values[e], log_rhos[e], gamma, lambda_, rho_bar, c_bar,
+                             opponent_log_rhos=masked)
+        np.testing.assert_allclose(np.asarray(out.vs[e]), vs, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(np.asarray(out.pg_advantage[e]), adv, rtol=1e-5, atol=1e-5)
+
+
+def test_zero_opponent_ratios_change_nothing():
+    own, rewards, values, log_rhos = _random_inputs(seed=6)
+    args = (jnp.asarray(own), jnp.asarray(rewards), jnp.asarray(values), jnp.asarray(log_rhos))
+    plain = vtrace(*args, lambda_=0.9)
+    corrected = vtrace(*args, lambda_=0.9, opponent_log_rhos=jnp.zeros(own.shape))
+    np.testing.assert_allclose(np.asarray(corrected.vs), np.asarray(plain.vs), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(corrected.pg_advantage), np.asarray(plain.pg_advantage), rtol=1e-6, atol=1e-6
+    )
+
+
+def test_opponent_past_weight_is_the_floored_product_of_earlier_opponent_rows():
+    own, _, _, _ = _random_inputs(seed=7)
+    opponent = np.random.default_rng(8).normal(scale=1.5, size=own.shape)
+    floor = 0.05
+    got = np.asarray(opponent_past_weight(jnp.asarray(own), jnp.asarray(opponent), floor))
+    for e in range(own.shape[0]):
+        for t in range(own.shape[1]):
+            if not own[e, t]:
+                assert got[e, t] == 0.0
+                continue
+            past = sum(opponent[e, k] for k in range(t) if not own[e, k])
+            np.testing.assert_allclose(got[e, t], max(floor, np.exp(past)), rtol=1e-5)
 
 
 def test_on_policy_lambda_one_is_the_monte_carlo_return():
@@ -253,12 +299,53 @@ def test_on_policy_lambda_one_vtrace_is_exactly_the_monte_carlo_loss(make_game, 
 def test_an_exploring_batch_is_importance_weighted(make_game):
     game = make_game()
     networks, params, batch, _ = _batch(game, explore_eps=(0.3, 0.3))
-    loss_fn = jax.value_and_grad(_loss_fn(0, "vtrace"), has_aux=True)
+    # rho <= 1 / (1 - eps) under exploration, so only a rho_bar below that clips.
+    loss_fn = jax.value_and_grad(_loss_fn(0, "vtrace", vtrace_rho_bar=1.0), has_aux=True)
     (loss, metrics), grads = loss_fn(params[0], networks[0], batch, 0.1, 0.5, 0.0)
     assert np.isfinite(float(loss))
     assert all(np.all(np.isfinite(np.asarray(g))) for g in jax.tree_util.tree_leaves(grads))
     # Exploration moves the ratio off one, and the truncation bites somewhere.
     assert float(metrics["vtrace_rho_clip_frac"]) > 0.0
+
+
+def test_exploring_rollout_records_bounded_behavior_log_ratios():
+    game = ContinuousKuhnPoker()
+    eps = 0.3
+    _, _, batch, _ = _batch(game, explore_eps=(eps, eps))
+    ratio = np.asarray(batch.behavior_log_ratio)
+    real = np.asarray(batch.actor) != TERMINAL
+    assert np.all(np.isfinite(ratio))
+    assert np.all(ratio <= -np.log1p(-eps) + 1e-5)
+    assert np.all(ratio[~real] == 0.0)
+    assert np.any(ratio[real] != 0.0)
+
+
+@pytest.mark.parametrize("correction", ["future", "future_and_past"])
+def test_opponent_correction_on_an_on_policy_batch_changes_nothing(correction):
+    game = _sumo()
+    networks, params, batch, _ = _batch(game)
+    args = (params[1], networks[1], batch, 0.1, 0.5, 0.0)
+    base, _ = _loss_fn(1, "vtrace")(*args)
+    corrected, metrics = _loss_fn(1, "vtrace", vtrace_opponent_correction=correction)(*args)
+    assert float(corrected) == pytest.approx(float(base), rel=1e-6)
+    assert float(metrics["vtrace_opponent_rho"]) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("make_game", [ContinuousKuhnPoker, _sumo])
+@pytest.mark.parametrize("correction", ["future", "future_and_past"])
+def test_opponent_correction_reweights_an_exploring_batch(make_game, correction):
+    game = make_game()
+    networks, params, batch, _ = _batch(game, explore_eps=(0.3, 0.3))
+    # Player 0: in Kuhn, player 1's later moves can be explored bet sizes, while
+    # everything after player 1's decision is a call/fold atom with ratio one.
+    args = (params[0], networks[0], batch, 0.1, 0.5, 0.0)
+    base, _ = _loss_fn(0, "vtrace")(*args)
+    fn = jax.value_and_grad(_loss_fn(0, "vtrace", vtrace_opponent_correction=correction), has_aux=True)
+    (loss, metrics), grads = fn(*args)
+    assert np.isfinite(float(loss)) and float(loss) != pytest.approx(float(base), rel=1e-6)
+    assert all(np.all(np.isfinite(np.asarray(g))) for g in jax.tree_util.tree_leaves(grads))
+    if correction == "future_and_past":
+        assert 0.0 < float(metrics["opponent_past_ess_frac"]) <= 1.0 + 1e-6
 
 
 def test_vtrace_ignores_whatever_sits_on_rows_that_are_not_the_players():
@@ -287,6 +374,9 @@ def test_vtrace_on_a_one_shot_batch_is_rejected():
 @pytest.mark.parametrize("ppo", [
     dict(advantage="gae"), dict(advantage="vtrace", gamma=0.0), dict(advantage="vtrace", vtrace_lambda=1.5),
     dict(advantage="vtrace", vtrace_rho_bar=0.0),
+    dict(advantage="vtrace", vtrace_opponent_correction="past"),
+    dict(advantage="monte_carlo", vtrace_opponent_correction="future"),
+    dict(advantage="vtrace", vtrace_opponent_correction="future_and_past", vtrace_opponent_past_floor=0.0),
 ])
 def test_bad_vtrace_settings_are_rejected(ppo):
     with pytest.raises(ValueError):
@@ -297,7 +387,11 @@ def test_vtrace_settings_reach_the_hyperparams():
     import train
     config = run_config_from_dict({
         "game": {"name": "disk_sumo"},
-        "ppo": {"advantage": "vtrace", "gamma": 0.99, "vtrace_lambda": 0.8},
+        "ppo": {"advantage": "vtrace", "gamma": 0.99, "vtrace_lambda": 0.8,
+                "vtrace_opponent_correction": "future_and_past", "vtrace_opponent_past_floor": 0.1},
     })
     hyperparams = train.build_hyperparams(config.game.build(), 0, config)
     assert (hyperparams.advantage, hyperparams.gamma, hyperparams.vtrace_lambda) == ("vtrace", 0.99, 0.8)
+    assert (hyperparams.vtrace_opponent_correction, hyperparams.vtrace_opponent_past_floor) == (
+        "future_and_past", 0.1
+    )

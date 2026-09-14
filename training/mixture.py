@@ -34,7 +34,7 @@ from .gaussian import (
     scale_param_size,
     scale_tril_from_log_diag,
 )
-from .vtrace import vtrace
+from .vtrace import opponent_past_weight, vtrace
 
 SCALE_PARAMETERIZATIONS = ("linear", "log")
 
@@ -393,6 +393,12 @@ class Episode:
     # loss then scores exactly as before; set, it switches the loss to its
     # importance-weighted form (see `behavior_gaussian_log_prob`).
     behavior_eps: chex.Array | None = None
+    # `()` float per decision, set together with `behavior_eps`: the acting
+    # player's `log pi_old(a) - log mu(a)` of the action it played, the policy
+    # and behavior densities both at sampling time (see `behavior_log_ratio`).
+    # Zero on atoms and padding. What the *opponent's* correction reads, since
+    # the loss has only its own player's network (and boxes) to hand.
+    behavior_log_ratio: chex.Array | None = None
     # `()` float per decision, sequential rollouts only: player 0's reward for
     # this row's transition, the terminal payoff included on the episode's last
     # decision (see `training.sequential_rollout`). What `training.vtrace`
@@ -568,6 +574,31 @@ def hybrid_action_log_prob(
             jnp.log(explore_eps) + jax.nn.logsumexp(log_probs[num_atoms:] + log_uniform),
         )
     return jnp.where(component >= num_atoms, continuous, log_probs[component])
+
+
+def behavior_log_ratio(
+    logits: chex.Array,
+    means: chex.Array,
+    scale_trils: chex.Array,
+    mask: chex.Array,
+    component: chex.Array,
+    raw_action: chex.Array,
+    num_atoms: int,
+    explore_eps: chex.Array,
+    low: chex.Array,
+    high: chex.Array,
+) -> chex.Array:
+    """`log pi(a) - log mu(a)` of one hybrid action: the policy's marginal density over
+    the exploring behavior's (see `hybrid_action_log_prob`). At most
+    `-log(1 - explore_eps)`; floored at `-50` so a uniform draw far into a narrow
+    Gaussian's tail stays finite."""
+    target = hybrid_action_log_prob(
+        logits, means, scale_trils, mask, component, raw_action, num_atoms
+    )
+    behavior = hybrid_action_log_prob(
+        logits, means, scale_trils, mask, component, raw_action, num_atoms, explore_eps, low, high
+    )
+    return jnp.maximum(target - behavior, -50.0)
 
 
 def _sample_mixture_one(
@@ -989,6 +1020,9 @@ def mixture_ppo_loss(
     )
 
 
+OPPONENT_CORRECTIONS = ("none", "future", "future_and_past")
+
+
 def build_mixture_ppo_loss_fn(
     player: int,
     category_entropy_coef: float,
@@ -1002,8 +1036,10 @@ def build_mixture_ppo_loss_fn(
     advantage_estimator: str = "monte_carlo",
     gamma: float = 1.0,
     vtrace_lambda: float = 0.95,
-    vtrace_rho_bar: float = 1.0,
+    vtrace_rho_bar: float = 2.0,
     vtrace_c_bar: float = 1.0,
+    vtrace_opponent_correction: str = "none",
+    vtrace_opponent_past_floor: float = 0.05,
 ):
     """`player`'s PPO loss over a whole `Episode` batch, one-shot or sequential alike.
 
@@ -1049,6 +1085,20 @@ def build_mixture_ppo_loss_fn(
         `hybrid_action_log_prob`). The PPO surrogate gets the V-trace advantage
         and the value head regresses on `v_s`. Sequential batches only -- a
         one-shot batch has no time axis to bootstrap along.
+
+    `vtrace_opponent_correction` (V-trace only) says what happens to the
+    opponent's exploration, read from its rows' `Episode.behavior_log_ratio`:
+
+      * `"none"` -- it is environment, uncorrected.
+      * `"future"` -- the opponent's rows after each own decision are folded
+        into that decision's importance weight (`vtrace(opponent_log_rhos=...)`),
+        so the targets are values against the opponent's policy.
+      * `"future_and_past"` -- additionally every own decision's loss is
+        weighted by `opponent_past_weight`, the product of the opponent's
+        ratios before it floored at `vtrace_opponent_past_floor`, and the loss
+        is the self-normalized weighted mean. Moves the state distribution
+        (and, with hidden information, the beliefs) towards the opponent's
+        policy while exploration-only states keep some weight.
     """
     if player not in (0, 1):
         raise ValueError(f"player must be 0 or 1, got {player}")
@@ -1056,6 +1106,15 @@ def build_mixture_ppo_loss_fn(
         raise ValueError(
             f"advantage_estimator must be 'monte_carlo' or 'vtrace', got {advantage_estimator!r}"
         )
+    if vtrace_opponent_correction not in OPPONENT_CORRECTIONS:
+        raise ValueError(
+            f"vtrace_opponent_correction must be one of {OPPONENT_CORRECTIONS}, "
+            f"got {vtrace_opponent_correction!r}"
+        )
+    if vtrace_opponent_correction != "none" and advantage_estimator != "vtrace":
+        raise ValueError("vtrace_opponent_correction needs advantage_estimator='vtrace'")
+    if not 0.0 < vtrace_opponent_past_floor <= 1.0:
+        raise ValueError(f"vtrace_opponent_past_floor must lie in (0, 1], got {vtrace_opponent_past_floor}")
     if advantage_estimator == "vtrace" and shared_obs:
         raise ValueError("advantage_estimator='vtrace' needs per-decision observations; shared_obs is one-shot only")
 
@@ -1152,6 +1211,17 @@ def build_mixture_ppo_loss_fn(
               flat.raw_action, network.num_atoms, flat.behavior_eps, low, high)
         log_rhos = (target_log_prob - behavior_log_prob).reshape(weight.shape)
 
+        # The opponent's `log pi_j - log mu_j`, on its own rows only.
+        opponent_log_rhos = None
+        if vtrace_opponent_correction != "none":
+            if batch.behavior_log_ratio is None:  # nobody explored: every ratio is one
+                opponent_log_rhos = jnp.zeros(weight.shape)
+            else:
+                opponent_log_rhos = jnp.where(
+                    batch.actor == 1 - player, batch.behavior_log_ratio, 0.0
+                )
+            opponent_log_rhos = jax.lax.stop_gradient(opponent_log_rhos)
+
         sign = 1.0 if player == 0 else -1.0
         targets = vtrace(
             own=weight > 0,
@@ -1162,6 +1232,7 @@ def build_mixture_ppo_loss_fn(
             lambda_=vtrace_lambda,
             rho_bar=vtrace_rho_bar,
             c_bar=vtrace_c_bar,
+            opponent_log_rhos=opponent_log_rhos,
         )
         targets = jax.tree_util.tree_map(jax.lax.stop_gradient, targets)
         flat_advantage = normalized_advantage(targets.pg_advantage, weight).reshape(-1)
@@ -1177,9 +1248,23 @@ def build_mixture_ppo_loss_fn(
         per_sample_loss, metrics = jax.vmap(per_sample)(
             logits, means, scale_trils, value_pred, scored, flat_advantage, mean_box_penalty
         )
-        loss = masked_mean(per_sample_loss, flat_weight)
+        if vtrace_opponent_correction == "future_and_past":
+            past = opponent_past_weight(weight > 0, opponent_log_rhos, vtrace_opponent_past_floor)
+            past = jax.lax.stop_gradient(past).reshape(-1)
+            # Self-normalized: the weights are unbounded above and need not sum to the count.
+            loss = jnp.sum(past * per_sample_loss) / jnp.maximum(jnp.sum(past), 1e-8)
+        else:
+            loss = masked_mean(per_sample_loss, flat_weight)
         metrics = jax.tree_util.tree_map(lambda m: masked_mean(m, flat_weight), metrics)
         metrics["decisions_per_episode"] = jnp.mean(jnp.sum(weight, axis=-1))
+        if vtrace_opponent_correction != "none":
+            metrics["vtrace_opponent_rho"] = masked_mean(targets.opponent_rho.reshape(-1), flat_weight)
+        if vtrace_opponent_correction == "future_and_past":
+            at_floor = past <= vtrace_opponent_past_floor * (1.0 + 1e-5)
+            metrics["opponent_past_floor_frac"] = masked_mean(at_floor.astype(jnp.float32), flat_weight)
+            # Effective sample size of the past weights, as a fraction of the decisions.
+            ess = jnp.square(jnp.sum(past)) / jnp.maximum(jnp.sum(jnp.square(past)), 1e-8)
+            metrics["opponent_past_ess_frac"] = ess / jnp.maximum(jnp.sum(flat_weight), 1.0)
         # How off-policy the batch is: the untruncated ratio and how often it is cut.
         raw_rho = jnp.exp(jnp.minimum(log_rhos, 20.0)).reshape(-1)
         metrics["vtrace_rho"] = masked_mean(raw_rho, flat_weight)

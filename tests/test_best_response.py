@@ -338,9 +338,19 @@ def test_responder_iterates_parses_every_spelling():
 # ---- the entry point -----------------------------------------------------
 
 
+def _with_trained_game(br_path: str, trained_path: str) -> dict:
+    """A best-response config with the game of the training config it responds to, as `load_config` builds it."""
+    raw = yaml.safe_load(open(br_path))
+    assert "game" not in raw, f"{br_path} should take its game from the checkpoint directory"
+    return {**raw, "game": yaml.safe_load(open(trained_path))["game"]}
+
+
 def test_the_shipped_best_response_configs_load():
-    for path in ("configs/kuhn_br.yaml", "configs/leduc_br.yaml"):
-        config = run_config_from_dict(yaml.safe_load(open(path)))
+    for br_path, trained_path in (
+        ("configs/kuhn_br.yaml", "configs/kuhn_classic.yaml"),
+        ("configs/leduc_br.yaml", "configs/leduc.yaml"),
+    ):
+        config = run_config_from_dict(_with_trained_game(br_path, trained_path))
         # The point of these files: no regularizer may weaken the responder.
         assert warn_if_regularized(build_hyperparams(config.game.build(), 0, config)) == []
 
@@ -354,7 +364,7 @@ def test_a_short_run_completes_through_the_entry_point(tmp_path, capsys):
     )
     self_play.save(tmp_path, 1)
 
-    raw = yaml.safe_load(open("configs/leduc_br.yaml"))
+    raw = _with_trained_game("configs/leduc_br.yaml", "configs/leduc.yaml")
     raw["train"].update(steps=1, epochs=2)
     raw["best_response"].update(
         checkpoint_dir=str(tmp_path),
@@ -388,9 +398,41 @@ def test_a_short_run_completes_through_the_entry_point(tmp_path, capsys):
     assert all(set(v) == {"sampled", "greedy"} for v in results.values())
 
 
-def test_the_entry_point_refuses_a_one_shot_game(monkeypatch):
-    monkeypatch.setattr("sys.argv", ["best_response.py", "configs/quadratic.yaml"])
+def test_the_entry_point_refuses_a_one_shot_game(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(open("configs/quadratic.yaml").read())
+    monkeypatch.setattr(
+        "sys.argv", ["best_response.py", "configs/quadratic.yaml", "--checkpoint-dir", str(tmp_path)]
+    )
     with pytest.raises(ValueError, match="sequential game"):
+        script.main()
+
+
+def test_the_entry_point_needs_the_saved_training_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv", ["best_response.py", "configs/leduc_br.yaml", "--checkpoint-dir", str(tmp_path)]
+    )
+    with pytest.raises(FileNotFoundError, match="config.yaml"):
+        script.main()
+
+
+def test_the_game_comes_from_the_checkpoint_directory(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(open("configs/leduc.yaml").read())
+    monkeypatch.setattr(
+        "sys.argv", ["best_response.py", "configs/leduc_br.yaml", "--checkpoint-dir", str(tmp_path)]
+    )
+    config = script.load_config(script.parse_args())
+    assert config.game == _config("configs/leduc.yaml").game
+    assert config.best_response.checkpoint_dir == str(tmp_path)
+
+
+def test_a_mismatched_game_block_is_rejected(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(open("configs/leduc.yaml").read())
+    br_path = tmp_path / "br.yaml"
+    br_path.write_text(yaml.safe_dump(_with_trained_game("configs/kuhn_br.yaml", "configs/kuhn_classic.yaml")))
+    monkeypatch.setattr(
+        "sys.argv", ["best_response.py", str(br_path), "--checkpoint-dir", str(tmp_path)]
+    )
+    with pytest.raises(ValueError, match="differs"):
         script.main()
 
 

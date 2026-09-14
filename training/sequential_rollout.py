@@ -27,12 +27,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from games.mjx_sumo import MjxSumoBase
 from games.sequential import TERMINAL, SequentialZeroSumGame, select_by_player
 from games.spaces import HybridAction
 
 from .mixture import (
     Episode,
     MixtureActorCritic,
+    behavior_log_ratio,
     component_boxes,
     component_to_kind,
     expand_kind_mask,
@@ -117,6 +119,11 @@ def build_episode_sampler(
             )
     exploring = any(eps > 0.0 for eps in explore_eps)
 
+    if isinstance(game, MjxSumoBase):
+        return _build_mjx_episode_sampler(
+            game, network_0, network_1, explore_eps, exploring
+        )
+
     def sample_episode(params_0, magnet_params_0, params_1, magnet_params_1, key: chex.PRNGKey):
         params = (params_0, params_1)
         magnet_params = (magnet_params_0, magnet_params_1)
@@ -181,28 +188,144 @@ def build_episode_sampler(
             )
             if exploring:
                 record["behavior_eps"] = eps
+                log_ratio = behavior_log_ratio(
+                    logits, means, scale_trils, mask, component, raw_action, num_atoms,
+                    eps, low, high,
+                )
+                record["behavior_log_ratio"] = jnp.where(actor == TERMINAL, 0.0, log_ratio)
             return next_state, record
 
         init_key, scan_key = jax.random.split(key)
         step_keys = jax.random.split(scan_key, game.max_steps)
         final_state, record = jax.lax.scan(step, game.initial_state(init_key), step_keys)
 
-        # The terminal payoff is credited to the last real decision: the row
-        # whose transition ended the episode. (Decisions are a prefix of the
-        # scan -- once terminal, a state stays terminal.)
-        # `payoff` is the episode's total to player 0: dense rewards plus leaf.
-        terminal_payoff = game.payoff(final_state)
-        payoff = jnp.sum(record["step_reward"]) + terminal_payoff
-        num_decisions = jnp.sum(record["actor"] != TERMINAL)
-        last_decision = jax.nn.one_hot(num_decisions - 1, game.max_steps, dtype=jnp.float32)
-        record["step_reward"] = record["step_reward"] + last_decision * terminal_payoff
+        return _finish_episode(game, final_state, record)
 
-        # The Monte Carlo return of each decision: player 0's rewards-to-go from
-        # that row on, signed for whoever made it. With no per-step rewards this
-        # is the one leaf value, shared by every decision in the episode.
-        to_go = jnp.cumsum(record["step_reward"][::-1])[::-1]
-        reward = jnp.where(record["actor"] == 0, to_go, -to_go)
-        return Episode(**record, reward=reward), payoff
+    return sample_episode
+
+
+def _finish_episode(game: SequentialZeroSumGame, final_state, record: dict):
+    """Attach terminal reward and returns to a sampler's per-decision records."""
+    # The terminal payoff is credited to the last real decision: the row whose
+    # transition ended the episode. Decisions are a prefix of the fixed scan.
+    terminal_payoff = game.payoff(final_state)
+    payoff = jnp.sum(record["step_reward"]) + terminal_payoff
+    num_decisions = jnp.sum(record["actor"] != TERMINAL)
+    last_decision = jax.nn.one_hot(num_decisions - 1, game.max_steps, dtype=jnp.float32)
+    record["step_reward"] = record["step_reward"] + last_decision * terminal_payoff
+
+    to_go = jnp.cumsum(record["step_reward"][::-1])[::-1]
+    reward = jnp.where(record["actor"] == 0, to_go, -to_go)
+    return Episode(**record, reward=reward), payoff
+
+
+def _build_mjx_episode_sampler(
+    game: MjxSumoBase,
+    network_0: MixtureActorCritic,
+    network_1: MixtureActorCritic,
+    explore_eps: tuple[float, float],
+    exploring: bool,
+):
+    """MJX sampler with one physics solve per pair of player decisions.
+
+    MJX sumo encodes a simultaneous control as two tree decisions: player 0
+    parks a control and player 1 resolves it.  Scanning those decisions through
+    the generic traced ``game.step`` computes and discards a full MJX solve on
+    player 0's turn.  Here the pair structure is static, so the rollout also
+    evaluates only the player whose record it is producing.
+    """
+    networks = (network_0, network_1)
+    spaces = (game.action_space(0), game.action_space(1))
+    num_atoms = network_0.num_atoms
+
+    def sample_player(index, params, magnet_params, state, key):
+        # Match the generic decision sampler's RNG stream: its second split key
+        # is reserved for stochastic game transitions (MJX dynamics need none).
+        sample_key, _ = jax.random.split(key)
+        obs = game.observation(index, state)
+        mask = expand_kind_mask(game.action_mask(index, state), network_0.num_components)
+        logits, means, scale_trils, value = networks[index].apply(params, obs)
+        magnet_logits, magnet_means, magnet_scale_trils, _ = networks[index].apply(
+            magnet_params, obs
+        )
+
+        if exploring:
+            low, high = component_boxes(networks[index])
+            component, raw_action = sample_mixture_component(
+                logits, means, scale_trils, mask, num_atoms, sample_key,
+                explore_eps=jnp.asarray(explore_eps[index], dtype=jnp.float32),
+                low=low, high=high,
+            )
+        else:
+            component, raw_action = sample_mixture_component(
+                logits, means, scale_trils, mask, num_atoms, sample_key
+            )
+        action_kind = component_to_kind(component, num_atoms)
+        action_value = spaces[index].box.clip(raw_action)
+        action = HybridAction(kind=action_kind, value=action_value)
+        record = dict(
+            actor=game.current_player(state), obs=obs, action_mask=mask,
+            logits=logits, means=means, scale_trils=scale_trils,
+            magnet_logits=magnet_logits, magnet_means=magnet_means,
+            magnet_scale_trils=magnet_scale_trils, component=component,
+            raw_action=raw_action, action_kind=action_kind,
+            action_value=action_value, value=value,
+        )
+        if exploring:
+            eps = jnp.asarray(explore_eps[index], dtype=jnp.float32)
+            record["behavior_eps"] = eps
+            log_ratio = behavior_log_ratio(
+                logits, means, scale_trils, mask, component, raw_action, num_atoms,
+                eps, low, high,
+            )
+            record["behavior_log_ratio"] = jnp.where(
+                record["actor"] == TERMINAL, 0.0, log_ratio
+            )
+        return action, record
+
+    def sample_episode(params_0, magnet_params_0, params_1, magnet_params_1, key):
+        def control_step(state, pair_key):
+            key_0, key_1 = pair_key
+
+            action_0, record_0 = sample_player(
+                0, params_0, magnet_params_0, state, key_0
+            )
+            parked = game.park_action(state, action_0)
+            record_0["step_reward"] = jnp.where(
+                record_0["actor"] == TERMINAL,
+                0.0,
+                game.reward(state, action_0, parked),
+            ).astype(jnp.float32)
+
+            action_1, record_1 = sample_player(
+                1, params_1, magnet_params_1, parked, key_1
+            )
+            next_state = game.resolve_action(parked, action_1)
+            record_1["step_reward"] = jnp.where(
+                record_1["actor"] == TERMINAL,
+                0.0,
+                game.reward(parked, action_1, next_state),
+            ).astype(jnp.float32)
+
+            pair_record = jax.tree_util.tree_map(
+                lambda first, second: jnp.stack([first, second]), record_0, record_1
+            )
+            return next_state, pair_record
+
+        init_key, scan_key = jax.random.split(key)
+        # Group the generic sampler's decision keys into adjacent player pairs,
+        # preserving seeded runs across the optimization.
+        decision_keys = jax.random.split(scan_key, game.max_steps)
+        pair_keys = decision_keys.reshape(
+            (game.horizon, 2) + decision_keys.shape[1:]
+        )
+        final_state, paired_record = jax.lax.scan(
+            control_step, game.initial_state(init_key), pair_keys
+        )
+        record = jax.tree_util.tree_map(
+            lambda x: x.reshape((game.max_steps,) + x.shape[2:]), paired_record
+        )
+        return _finish_episode(game, final_state, record)
 
     return sample_episode
 
