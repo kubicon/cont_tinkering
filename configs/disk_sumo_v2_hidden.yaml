@@ -1,0 +1,94 @@
+# Archetype disk sumo with the opponent's archetype (and stamina) hidden.
+#
+#   python train.py configs/disk_sumo_v2_hidden.yaml
+#   python scripts/balance_disk_sumo_v2.py configs/disk_sumo_v2_hidden.yaml
+#
+# Physics matches configs/disk_sumo_asymmetric.yaml; the force asymmetry is
+# replaced by archetypes (see games/disk_sumo_v2.py for the trait table).
+
+game:
+  name: disk_sumo_v2
+  horizon: 100
+  ring_radius: 1.0
+  disk_radius: 0.15
+  start_distance: 0.45
+  start_jitter: 0.04
+  random_orientation: true
+  random_start: false
+  egocentric: true
+
+  dt: 0.1
+  substeps: 10
+  mass: 1.0
+  max_force: 1.0
+  stamina_drain_rate: 0.5
+  stamina_recovery_rate: 0.25
+  stamina_min_force: 0.25
+  drag: 0.5
+  stiffness: 400.0
+  contact_damping: 10.0
+
+  margin_weight: 0.3
+  shaping_weight: 0.5
+
+  # null enables all of: quick, strong, endurance, heavy, nimble, burst, brace.
+  archetypes: null
+  # Per-archetype trait overrides, e.g. {quick: {force: 0.9, drag: 0.7}}.
+  archetype_traits: null
+
+  # Hidden-type variant: set observe_opponent_archetype false. Opponent stamina
+  # follows it unless set explicitly, and observe_velocity_change gives a
+  # memoryless policy single-frame evidence of the opponent's body.
+  observe_opponent_archetype: false
+  observe_opponent_stamina: null
+  observe_velocity_change: true
+
+network:
+  policy: gaussian_mixture
+  hidden_dims: [128, 128]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 4
+  full_covariance: false
+  scale_parameterization: log
+  max_correlation: 0.0
+  sigma_min: 0.1
+  sigma_max: null
+  bucket_means: true
+  clip_means: true
+  mean_box_penalty_coef: 1.0
+
+optimizer:
+  learning_rate: 0.0003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 4000
+  explore_eps: 0.05
+
+  advantage: vtrace
+  gamma: 1.0
+  vtrace_lambda: 0.95
+  vtrace_rho_bar: 1.0
+  vtrace_c_bar: 1.0
+
+  category_entropy_coef: 0.04
+  gaussian_entropy_coef: 0.04
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  mode: self_play
+  steps: 10
+  epochs: 4000
+  checkpoint_dir: data/disk_sumo_v2_hidden
+  seed: 0
