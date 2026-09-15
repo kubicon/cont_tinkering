@@ -18,6 +18,7 @@ from nets import Activation, Normalization
 
 from .actor_critic import (
     categorical_kl,
+    gaussian_entropy,
     gaussian_kl,
     gaussian_log_prob,
     gaussian_sample,
@@ -877,11 +878,9 @@ def mixture_ppo_loss_from_outputs(
     still acts around the sampling-time policy. The categorical factor's sample
     is the entry `k`, weighted by `pi_old(k) / mu(k)`; the Gaussian factor's is
     the pair `(k, x)`, weighted by the joint `pi_old(k) N_k(x) / mu(k, x)` (see
-    `behavior_log_probs`). Both are at most `1 / (1 - eps)`. The sampled-action
-    entropy estimate `-log p(x)` gets the Gaussian factor's `w`, turning it back
-    into an estimate under `pi_old`; without it a uniform draw deep in a
-    Gaussian's tail would dominate the bonus. The KLs are closed forms over the
-    components and need no correction. Only this decision's own action is
+    `behavior_log_probs`). Both are at most `1 / (1 - eps)`. The Gaussian
+    entropy bonus and the KLs are closed forms over the components and need no
+    correction. Only this decision's own action is
     reweighted: the return still reflects the rest of the behavior trajectory
     -- in particular the *opponent's* exploration, which is exactly what the
     responder is meant to learn from.
@@ -1003,16 +1002,21 @@ def mixture_ppo_loss_from_outputs(
 
     value_loss = jnp.square(value_pred - episode.reward)
 
-    category_entropy = masked_categorical_entropy(logits, mask)
-    action_entropy = -is_gaussian * is_weight * mixture_marginal_log_prob(
-        logits, means, scale_trils, mask, episode.raw_action, num_atoms
-    )
-    entropy = category_entropy + action_entropy
-
     # Weight of each Gaussian component under the policy the component was drawn
     # from; sums to `P(drew a Gaussian)` rather than to one, which is what makes
-    # the two sums below match the sampled-component estimator in expectation.
+    # the sums below match the sampled-component estimator in expectation.
     component_weight = jnp.exp(masked_log_softmax(episode.logits, mask))[num_atoms:]
+
+    category_entropy = masked_categorical_entropy(logits, mask)
+    # The components' differential entropies in closed form, `P(bet)`-weighted: a
+    # lower bound on the mixture's, tight up to the component entropy `H(pi)`.
+    # A sampled `-log p(raw_action)` estimates the right *value*, but with the
+    # action held fixed its gradient is the score, whose expectation is zero --
+    # it put no force on any sigma at all. Here every `log sigma_k` gets a
+    # constant `pi_old(k)` push. The weights carry no gradient, so the
+    # categorical head is left to its own entropy term (or NeuRD's).
+    action_entropy = jnp.sum(component_weight * gaussian_entropy(scale_trils))
+    entropy = category_entropy + action_entropy
 
     trpo_category_kl = categorical_kl(episode.logits, logits, mask)
     trpo_gaussian_kl = jnp.sum(
@@ -1060,7 +1064,7 @@ def mixture_ppo_loss_from_outputs(
         "value_loss": value_loss,
         "entropy": entropy,
         "category_entropy": category_entropy,
-        "gaussian_entropy": action_entropy,  # marginal mixture entropy estimate (weighted by gaussian_entropy_coef)
+        "gaussian_entropy": action_entropy,  # P(bet)-weighted component entropies (weighted by gaussian_entropy_coef)
         "atom_frac": 1.0 - is_gaussian,  # share of samples that drew a discrete atom
         "approx_kl": category_approx_kl + gaussian_approx_kl,
         "category_approx_kl": category_approx_kl,
