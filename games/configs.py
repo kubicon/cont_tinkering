@@ -215,6 +215,10 @@ class KuhnConfig:
     # exploitability (see `games.kuhn_best_response`). Finer is a tighter lower
     # bound; the cost is one batched forward pass either way.
     exploitability_grid_points: int = 1025
+    # Measure exploitability with every Gaussian's sigma at zero -- each component
+    # bets its (clipped) mean -- while check/bet, the component weights and
+    # fold/call stay distributions (see `training.kuhn_evaluation`).
+    exploitability_greedy_gaussians: bool = False
 
     def build(self) -> SequentialZeroSumGame:
         return ContinuousKuhnPoker(

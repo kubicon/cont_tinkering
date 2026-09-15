@@ -368,3 +368,15 @@ def test_gaussian_kls_match_the_sampled_component_estimator_in_expectation():
         means[index], scale_trils[index], magnet_means[index], magnet_scale_trils[index]
     )
     assert float(jnp.mean(per_draw)) == pytest.approx(exact, rel=0.05)
+
+
+def test_gaussian_entropy_bonus_pushes_every_legal_sigma_up():
+    """The bonus is a closed form, so every component's spread gets a push on every batch.
+
+    A sampled `-log p(raw_action)` has the right value but, with the action held
+    fixed, a zero-mean gradient -- it left sigma to drift down unopposed.
+    """
+    network, params = _network(num_atoms=2, num_components=3)
+    episode = _episode(network, params, jnp.array([True, False, True]), batch=8)
+    grads = jax.grad(lambda p: _loss(network, p, episode)[1]["gaussian_entropy"])(params)
+    assert bool(jnp.all(grads["params"]["scale_head"]["bias"] > 0.0))

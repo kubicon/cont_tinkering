@@ -15,7 +15,7 @@ import pytest
 
 from training.config import MixturePPOHyperparams
 from training.mixture import (
-    behavior_gaussian_log_prob,
+    behavior_log_probs,
     bucket_bounds,
     build_mixture_network,
     component_boxes,
@@ -117,8 +117,8 @@ def test_exploration_draws_inside_the_sampled_bucket():
     mask = jnp.ones_like(logits, dtype=bool)
 
     def one(key):
-        # explore_eps = 1: every continuous action is the uniform draw (the
-        # sampler itself accepts it; only the loss's density needs eps < 1).
+        # explore_eps = 1: every action is the uniform draw, component included
+        # (the sampler itself accepts it; only the loss's density needs eps < 1).
         return sample_mixture_component(
             logits, means, scale_trils, mask, 0, key, explore_eps=jnp.float32(1.0),
             low=lows, high=highs,
@@ -140,5 +140,7 @@ def test_behavior_density_uses_the_bucket_width():
     x = jnp.array([0.5])
     log_gauss = jnp.float32(-jnp.inf)  # isolate the uniform part
     eps = jnp.float32(0.5)
-    lp = behavior_gaussian_log_prob(log_gauss, x, eps, jnp.array([0.25]), jnp.array([0.6875]))
+    _, lp = behavior_log_probs(
+        jnp.float32(0.0), log_gauss, jnp.float32(0.0), x, eps, jnp.array([0.25]), jnp.array([0.6875])
+    )
     np.testing.assert_allclose(lp, jnp.log(0.5) - jnp.log(0.4375), rtol=1e-5)

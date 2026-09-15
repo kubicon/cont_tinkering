@@ -800,6 +800,9 @@ def mixture_ppo_loss_from_outputs(
     category_update: str = "ppo",
     neurd_beta: float = 2.0,
     neurd_clip: float = 10.0,
+    category_floor: float = 0.0,
+    category_floor_coef: float = 0.01,
+    category_floor_mode: str = "kind",
 ) -> tuple[chex.Array, dict[str, chex.Array]]:
     """Clipped-surrogate PPO loss plus KL penalties, for a single (unbatched) `Episode`,
     given the current policy's already-computed forward pass at `episode.obs`.
@@ -905,6 +908,11 @@ def mixture_ppo_loss_from_outputs(
     proportional to `magnet^(tau_mag / tau) exp(Q / tau)`, `tau = tau_ent + tau_mag`.
     The trust-region KL stays a loss term, and the Gaussian factor is the PPO
     surrogate either way.
+
+    **Probability floor.** With `category_floor > 0`, `category_floor_coef` times
+    `category_floor_penalty` is added under either update: zero while every
+    legal kind (or entry, see `category_floor_mode`) keeps at least that
+    probability, and below it a push back up that does not shrink with `pi_k`.
     """
     mask = episode.action_mask
 
@@ -1033,6 +1041,12 @@ def mixture_ppo_loss_from_outputs(
     # per-entry advantages; as loss terms their gradients would carry the very
     # `pi` factor NeuRD exists to remove.
     category_regularized = 0.0 if category_update == "neurd" else 1.0
+    if category_floor > 0.0:
+        floor_penalty, floor_frac = category_floor_penalty(
+            logits, mask, num_atoms, category_floor, category_floor_mode
+        )
+    else:
+        floor_penalty, floor_frac = jnp.zeros(()), jnp.zeros(())
     loss = (
         policy_loss
         + value_coef * value_loss
@@ -1043,6 +1057,7 @@ def mixture_ppo_loss_from_outputs(
         + category_regularized * magnet_category_kl_coef * magnet_category_kl
         + magnet_gaussian_kl_coef * magnet_gaussian_kl
         + mean_box_penalty
+        + category_floor_coef * floor_penalty
     )
 
     # Every diagnostic is an expectation under `pi_old`, so each carries its
@@ -1081,6 +1096,9 @@ def mixture_ppo_loss_from_outputs(
         "mean_box_penalty": jnp.asarray(mean_box_penalty, dtype=jnp.float32),
         # Share of legal entries whose NeuRD update was dropped at the logit bound.
         "neurd_gated_frac": neurd_gated_frac,
+        "category_floor_penalty": floor_penalty,
+        # Share of legal kinds (or entries) below `category_floor`.
+        "category_floor_frac": floor_frac,
     }
     return loss, metrics
 
@@ -1123,6 +1141,9 @@ def mixture_ppo_loss(
     category_update: str = "ppo",
     neurd_beta: float = 2.0,
     neurd_clip: float = 10.0,
+    category_floor: float = 0.0,
+    category_floor_coef: float = 0.01,
+    category_floor_mode: str = "kind",
 ) -> tuple[chex.Array, dict[str, chex.Array]]:
     """`mixture_ppo_loss_from_outputs`, forward-passing `params` at `episode.obs` first."""
     logits, raw_means, scale_trils, value_pred = network.apply(
@@ -1138,12 +1159,48 @@ def mixture_ppo_loss(
         trpo_category_kl_coef, trpo_gaussian_kl_coef,
         magnet_category_kl_coef, magnet_gaussian_kl_coef, mean_box_penalty,
         low=lows, high=highs, raw_advantage=raw_advantage, category_update=category_update,
-        neurd_beta=neurd_beta, neurd_clip=neurd_clip,
+        neurd_beta=neurd_beta, neurd_clip=neurd_clip, category_floor=category_floor,
+        category_floor_coef=category_floor_coef, category_floor_mode=category_floor_mode,
     )
 
 
 OPPONENT_CORRECTIONS = ("none", "future", "future_and_past")
 CATEGORY_UPDATES = ("ppo", "neurd")
+CATEGORY_FLOOR_MODES = ("kind", "entry")
+
+
+def category_floor_penalty(
+    logits: chex.Array, mask: chex.Array, num_atoms: int, floor: float, mode: str = "kind"
+) -> tuple[chex.Array, chex.Array]:
+    """`sum_k relu(log floor - log pi_k)` over the legal `k` at one state, and the share below `floor`.
+
+    A hinge log-barrier: exactly zero while every probability is at least
+    `floor`, so nothing above it is biased. Below it, the gradient on that
+    entry's logit is `pi_k - 1` -- a push back up of nearly constant size however
+    small `pi_k` has become, where the entropy bonus's `-pi_k (log pi_k + H)`
+    and the PPO surrogate both carry a `pi_k` factor that lets it vanish. The
+    mass comes out of the other entries in proportion to their probability.
+    It holds an action whose normalized advantage is `-A` near the floor as long
+    as the coefficient exceeds about `floor * A`.
+
+    `mode="kind"` floors each atom and the continuous kind as a whole (its
+    components' probabilities summed): the check/bet and fold/call decisions.
+    `mode="entry"` floors every legal categorical entry, each Gaussian
+    component included, which also keeps every bet-size component in play.
+    """
+    log_probs = masked_log_softmax(logits, mask)
+    legal = mask
+    if mode == "kind":
+        log_probs = jnp.concatenate(
+            [log_probs[:num_atoms], jax.nn.logsumexp(log_probs[num_atoms:], keepdims=True)]
+        )
+        legal = jnp.concatenate([mask[:num_atoms], jnp.any(mask[num_atoms:], keepdims=True)])
+    elif mode != "entry":
+        raise ValueError(f"mode must be one of {CATEGORY_FLOOR_MODES}, got {mode!r}")
+    log_floor = math.log(floor)
+    shortfall = jnp.where(legal, jnp.maximum(log_floor - log_probs, 0.0), 0.0)
+    below = legal & (log_probs < log_floor)
+    return jnp.sum(shortfall), jnp.sum(below) / jnp.maximum(jnp.sum(legal), 1)
 
 
 def neurd_category_loss(
@@ -1211,6 +1268,10 @@ def build_mixture_ppo_loss_fn(
     category_update: str = "ppo",
     neurd_beta: float = 2.0,
     neurd_clip: float = 10.0,
+    category_floor: float = 0.0,
+    category_floor_coef: float = 0.01,
+    category_floor_mode: str = "kind",
+    normalize_advantage: bool = True,
 ):
     """`player`'s PPO loss over a whole `Episode` batch, one-shot or sequential alike.
 
@@ -1275,6 +1336,14 @@ def build_mixture_ppo_loss_fn(
     surrogate, or `"neurd"` (see `mixture_ppo_loss_from_outputs` and
     `neurd_category_loss`), which reads the unnormalized advantage. `neurd_beta`
     bounds its centered logits and `neurd_clip` its importance-weighted advantage.
+
+    `category_floor` (0 disables) adds `category_floor_coef` times
+    `category_floor_penalty` under either update, flooring each legal kind's
+    probability (`category_floor_mode="kind"`) or each entry's (`"entry"`).
+
+    `normalize_advantage` standardizes the surrogate's advantage over the
+    player's decisions in the batch; False uses the raw advantage against the
+    critic, in payoff units. NeuRD reads the raw advantage either way.
     """
     if player not in (0, 1):
         raise ValueError(f"player must be 0 or 1, got {player}")
@@ -1295,6 +1364,15 @@ def build_mixture_ppo_loss_fn(
         raise ValueError(f"category_update must be one of {CATEGORY_UPDATES}, got {category_update!r}")
     if neurd_beta <= 0.0 or neurd_clip <= 0.0:
         raise ValueError(f"neurd_beta and neurd_clip must be positive, got {neurd_beta} and {neurd_clip}")
+    if category_floor_mode not in CATEGORY_FLOOR_MODES:
+        raise ValueError(
+            f"category_floor_mode must be one of {CATEGORY_FLOOR_MODES}, got {category_floor_mode!r}"
+        )
+    if not 0.0 <= category_floor < 1.0 or category_floor_coef < 0.0:
+        raise ValueError(
+            f"category_floor must lie in [0, 1) and category_floor_coef be nonnegative, "
+            f"got {category_floor} and {category_floor_coef}"
+        )
     if advantage_estimator == "vtrace" and shared_obs:
         raise ValueError("advantage_estimator='vtrace' needs per-decision observations; shared_obs is one-shot only")
 
@@ -1304,7 +1382,9 @@ def build_mixture_ppo_loss_fn(
         magnet_category_kl_coef, magnet_gaussian_kl_coef,
     )
     category_update_kwargs = dict(
-        category_update=category_update, neurd_beta=neurd_beta, neurd_clip=neurd_clip
+        category_update=category_update, neurd_beta=neurd_beta, neurd_clip=neurd_clip,
+        category_floor=category_floor, category_floor_coef=category_floor_coef,
+        category_floor_mode=category_floor_mode,
     )
 
     def loss_fn(
@@ -1324,7 +1404,7 @@ def build_mixture_ppo_loss_fn(
         # Normalized over the player's own decisions, across the whole batch:
         # a batch statistic, so it has to be computed before the per-sample vmap.
         raw_advantage = batch.reward - batch.value
-        advantage = normalized_advantage(raw_advantage, weight)
+        advantage = normalized_advantage(raw_advantage, weight) if normalize_advantage else raw_advantage
 
         flat = flatten_batch_axes(batch)
         flat_weight, flat_advantage = weight.reshape(-1), advantage.reshape(-1)
@@ -1420,7 +1500,10 @@ def build_mixture_ppo_loss_fn(
             opponent_log_rhos=opponent_log_rhos,
         )
         targets = jax.tree_util.tree_map(jax.lax.stop_gradient, targets)
-        flat_advantage = normalized_advantage(targets.pg_advantage, weight).reshape(-1)
+        pg_advantage = targets.pg_advantage
+        if normalize_advantage:
+            pg_advantage = normalized_advantage(pg_advantage, weight)
+        flat_advantage = pg_advantage.reshape(-1)
         # The value head regresses on `reward`; here that is the V-trace target.
         scored = flat.replace(reward=targets.vs.reshape(-1))
 

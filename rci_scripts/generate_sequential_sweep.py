@@ -88,8 +88,8 @@ TRAIN = "train_sequential.py"
 
 DEFAULT_GAMES = (
     "configs/kuhn_solvers.yaml",
-    "configs/leduc_solvers.yaml",
-    "configs/sequential_blotto_solvers.yaml",
+    # "configs/leduc_solvers.yaml",
+    # "configs/sequential_blotto_solvers.yaml",
 )
 DEFAULT_SEEDS = (0, 1, 2, 3, 4)
 DEFAULT_TIME_H = 4
@@ -117,24 +117,35 @@ SECTIONS = {
 # Bare value = fixed default written into every run. list = axis to sweep
 # (cartesian product). tuple = fixed list-valued field (e.g. hidden widths).
 # Merge order for one (game, solver) cell: COMMON < SOLVERS[solver] <
-# GAME_OVERRIDES[game]. Numbers below match `configs/kuhn_solvers.yaml`; Leduc
-# differences live in GAME_OVERRIDES. `train.solver` / `train.seed` /
+# GAME_OVERRIDES[game]. Shared numbers below match `configs/kuhn.yaml`; per-game
+# differences, if any, live in GAME_OVERRIDES. `train.solver` / `train.seed` /
 # `train.checkpoint_dir` are set per run and must not appear here.
 
 COMMON: dict[str, object] = {
+    # Everything below network/optimizer/ppo/train mirrors `configs/kuhn.yaml`,
+    # the setting known to work, and is applied to every game.
+
     # network -- shared policy architecture for every solver but rpn (which only
     # reads hidden_dims / activation)
+    "network.policy": "gaussian_mixture",
     "network.hidden_dims": (128, 128),
     "network.activation": "gelu",
     "network.normalization": "rms_norm",
-    "network.num_components": 4,
+    "network.num_components": 2,
+    "network.full_covariance": False,
+    "network.scale_parameterization": "log",
+    "network.max_correlation": 0.0,
+    "network.sigma_min": 0.1,
+    "network.sigma_max": None,
+    "network.bucket_means": False,
     "network.clip_means": True,
+    "network.mean_box_penalty_coef": 1.0,
 
     # optimizer
-    "optimizer.learning_rate": 0.0003,
+    "optimizer.learning_rate": 0.001,
     "optimizer.max_grad_norm": 0.5,
-    "optimizer.optimizer": "adamw",
-    "optimizer.weight_decay": 0.01,
+    "optimizer.optimizer": "adam",
+    "optimizer.weight_decay": 0.0,
 
     # ppo -- self_play / discrete_mmd read the entropy/KL terms in full; NFSP's
     # and PSRO's inner best responses zero them (see `so.br_hyperparams`)
@@ -143,19 +154,34 @@ COMMON: dict[str, object] = {
     "ppo.batch_size": 512,
     "ppo.ppo_epochs": 1,
     "ppo.target_tau": 0.001,
-    "ppo.magnet_interval": 3000,
+    "ppo.magnet_interval": 1000,
+    "ppo.explore_eps": 0.2,
+    "ppo.advantage": "vtrace",
+    "ppo.gamma": 1.0,
+    "ppo.vtrace_lambda": 0.95,
+    "ppo.vtrace_rho_bar": 2.0,
+    "ppo.vtrace_c_bar": 1.0,
+    "ppo.vtrace_opponent_correction": "future_and_past",
+    "ppo.vtrace_opponent_past_floor": 0.1,
     "ppo.category_entropy_coef": 0.04,
     "ppo.gaussian_entropy_coef": 0.04,
     "ppo.trpo_category_kl_coef": 0.05,
     "ppo.trpo_gaussian_kl_coef": 0.05,
     "ppo.magnet_category_kl_coef": 0.2,
     "ppo.magnet_gaussian_kl_coef": 0.2,
+    "ppo.category_update": "ppo",
+    "ppo.neurd_beta": 2.5,
+    "ppo.neurd_clip": 10.0,
+    "ppo.normalize_advantage": True,
+    "ppo.category_floor": 0.01,
+    "ppo.category_floor_coef": 0.05,
+    "ppo.category_floor_mode": "entry",
 
     # train -- steps/epochs schedule self_play and discrete_mmd; other solvers
     # bring their own budget in SOLVERS
     "train.mode": "self_play",
-    "train.steps": 100,
-    "train.epochs": 3000,
+    "train.steps": 200,
+    "train.epochs": 1000,
 
     # scoring -- Kuhn's exact tree BR makes `expl` free; score_every stays 0
     "scoring.exact_grid": None,
@@ -176,19 +202,10 @@ SOLVER_ALIASES: dict[str, str] = {
 # "this solver, on COMMON alone" -- worth keeping in, since a sweep of one
 # solver is only readable next to the others on their usual budgets.
 SOLVERS: dict[str, dict[str, object]] = {
-    # The method under test. `steps * epochs` is the whole budget and the entropy
-    # bonus is what keeps the mixture from collapsing onto one bet size early.
-    # Each of the 4 components is confined to its own quarter of the bet range
-    # (mean started at the bucket's center), and exploration is drawn inside the
-    # sampled component's bucket, so off-path sizes stay reachable by a
-    # component-weight change instead of a mean crossing the box. The sigma
-    # floor is ~ a quarter of Kuhn's bucket width (1.75 / 4 / 4), so a component
-    # keeps covering its bucket rather than collapsing to a point.
-    "self_play": {
-        "network.bucket_means": True,
-        "network.sigma_min": 0.1,
-        "ppo.batch_size": 512
-    },
+    # The method under test, on COMMON alone (= `configs/kuhn.yaml`).
+    # `steps * epochs` is the whole budget and the entropy bonus is what keeps
+    # the mixture from collapsing onto one bet size early.
+    "self_play": {},
     # Soft-Actor-Critic ablation of self_play: one Gaussian, no KL / magnet
     # pull -- entropy remains. Same schedule and entropy sweep as self_play so
     # the comparison is the mixture + KL regularizers, nothing else.
@@ -261,16 +278,7 @@ SOLVERS: dict[str, dict[str, object]] = {
 # `network.num_components` here: `sac` sets it to 1 in SOLVERS, and GAME wins
 # last so a game-level 3 would silently undo the ablation.
 GAME_OVERRIDES: dict[str, dict[str, object]] = {
-    "configs/leduc_solvers.yaml": {
-        "optimizer.learning_rate": 0.0003,
-    },
-    # Short tree (2 * num_fields decisions) but mixture collapse is the failure
-    # mode -- keep entropy / magnet closer to `configs/sequential_blotto_solvers.yaml`
-    # than to COMMON's larger Kuhn-ish sweep budget. No exact `expl`; leave
-    # score_every at 0 (measure offline with best_response.py).
-    "configs/sequential_blotto_solvers.yaml": {
-        "optimizer.learning_rate": 0.0003,
-    },
+    # Empty on purpose: every game runs the `configs/kuhn.yaml` setting in COMMON.
 }
 
 # Sections that every solver reads, vs. the private section each solver owns.

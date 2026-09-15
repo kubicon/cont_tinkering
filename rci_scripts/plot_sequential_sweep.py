@@ -17,9 +17,11 @@ arrays the scorer copies out of each run's ``metrics.jsonl``. Checkpoint 0 is
 the untrained policy, saved before the clock starts, so its missing values
 are taken as 0.
 
-Seeds are pooled by linearly interpolating each seed onto a shared grid that
-ends where the *shortest* seed ends (so every point averages all seeds); the
-line is the seed mean and the band spans seed min..max. Kuhn plots the exact
+Seeds are pooled per checkpoint, with no resampling or fitting: for each
+checkpoint index that every seed has, the point is (mean x over seeds, mean
+exploitability over seeds), and the band is the 95% confidence interval of that
+mean, mean +- t_{0.975, n-1} * std(ddof=1) / sqrt(n). Consecutive points are
+joined by straight lines. Kuhn plots the exact
 exploitability; Leduc / Blotto plot the RL lower bound, which can be <= 0 --
 such points vanish on the default log y-axis, so pass ``--linear-y`` to see
 them.
@@ -43,13 +45,14 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+from scipy import stats
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = REPO_ROOT / "data" / "sequential_sweep"
 RESULT_FILENAME = "exploitability.pkl"
 SEED_SUFFIX_RE = re.compile(r"__seed\d+$")
 BINS_RE = re.compile(r"^discrete_mmd__bins(?P<bins>\d+)$")
-GRID_POINTS = 200
+CI_LEVEL = 0.95
 
 GAME_TITLES = {
     "kuhn_solvers": "Kuhn poker",
@@ -127,8 +130,8 @@ def load_results(out_root: Path, games: list[str] | None,
 
 
 def run_curve(result: dict, x_axis: str, samples: str,
-              target: bool) -> tuple[np.ndarray, np.ndarray]:
-    """One seed's (x, exploitability) with unusable points dropped."""
+              target: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One seed's (checkpoint, x, exploitability) with unusable points dropped."""
     steps = np.asarray(result["steps"], dtype=np.float64)
     if result["exact"]:
         y = np.asarray(result["expl"], dtype=np.float64)
@@ -148,26 +151,34 @@ def run_curve(result: dict, x_axis: str, samples: str,
     x = np.where((steps == 0) & np.isnan(x), 0.0, x)
 
     keep = np.isfinite(x) & np.isfinite(y)
-    order = np.argsort(x[keep], kind="stable")
-    return x[keep][order], y[keep][order]
+    order = np.argsort(steps[keep], kind="stable")
+    return steps[keep][order], x[keep][order], y[keep][order]
 
 
-def pool_seeds(curves: list[tuple[np.ndarray, np.ndarray]]) -> dict | None:
-    """Interpolate seeds onto a shared grid up to the shortest seed's end."""
-    curves = [(x, y) for x, y in curves if len(x) >= 1]
+def pool_seeds(curves: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> dict | None:
+    """Group seeds by checkpoint: mean x, mean exploitability and its t-based CI.
+
+    Only checkpoints every seed has are kept, so each point averages all seeds.
+    """
+    curves = [c for c in curves if len(c[0]) >= 1]
     if not curves:
         return None
-    if len(curves) == 1 or any(len(x) < 2 for x, _ in curves):
-        x, y = max(curves, key=lambda c: len(c[0]))
-        return {"x": x, "mean": y, "lo": y, "hi": y, "n": len(curves)}
-    start = max(x[0] for x, _ in curves)
-    end = min(x[-1] for x, _ in curves)
-    if end <= start:
+    common = curves[0][0]
+    for steps, _, _ in curves[1:]:
+        common = np.intersect1d(common, steps)
+    if len(common) == 0:
         return None
-    grid = np.linspace(start, end, GRID_POINTS)
-    stacked = np.stack([np.interp(grid, x, y) for x, y in curves])
-    return {"x": grid, "mean": stacked.mean(axis=0), "lo": stacked.min(axis=0),
-            "hi": stacked.max(axis=0), "n": len(curves)}
+    xs = np.stack([x[np.searchsorted(steps, common)] for steps, x, _ in curves])
+    ys = np.stack([y[np.searchsorted(steps, common)] for steps, _, y in curves])
+    n = len(curves)
+    mean = ys.mean(axis=0)
+    if n > 1:
+        sem = ys.std(axis=0, ddof=1) / np.sqrt(n)
+        half = stats.t.ppf(0.5 + CI_LEVEL / 2, df=n - 1) * sem
+    else:
+        half = np.zeros_like(mean)
+    return {"x": xs.mean(axis=0), "mean": mean, "lo": mean - half,
+            "hi": mean + half, "n": n}
 
 
 def style_axes(ax) -> None:
@@ -204,7 +215,7 @@ def draw_panel(ax, by_config: dict[str, list[dict]], x_axis: str, *, samples: st
         if pooled is None:
             continue
         if show_seeds:
-            for x, y in curves:
+            for _, x, y in curves:
                 ax.plot(x, y, color=color, linewidth=0.7, alpha=0.3, linestyle=linestyle)
         if pooled["n"] > 1:
             ax.fill_between(pooled["x"], pooled["lo"], pooled["hi"],
@@ -284,7 +295,7 @@ def main() -> None:
             draw_panel(ax, by_config, x_axis, **panel_kwargs)
             ax.set_xlabel(x_label(x_axis, args.samples), color=TEXT)
             ax.set_ylabel(y_label(exact, args.target), color=TEXT)
-            ax.set_title(f"{title}: mean over seeds, band = seed min–max",
+            ax.set_title(f"{title}: mean over seeds, band = 95% CI",
                          color=TEXT, fontsize=11, loc="left")
             ax.legend(fontsize=8, frameon=False, loc="upper left",
                       bbox_to_anchor=(1.01, 1.0), labelcolor=TEXT)

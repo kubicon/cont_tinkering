@@ -78,12 +78,32 @@ def clipped_mixture_grid_probs(
     return weights @ (upper - lower)
 
 
+def greedy_mixture_grid_probs(
+    weights: chex.Array, means: chex.Array, grid: chex.Array
+) -> chex.Array:
+    """`clipped_mixture_grid_probs` in the limit `stds -> 0`: every component bets its mean.
+
+    Each component's whole (joint) weight lands in the grid cell holding
+    `clip(mean)`. Cells are the Voronoi intervals of `grid` and its endpoints are
+    the box's, so that is simply the grid point nearest the unclipped mean -- a
+    mean below `min_bet` snaps to the first point, above `max_bet` to the last.
+    Only the Gaussians are made greedy: the weights, i.e. whether to bet and
+    with which component, stay a distribution.
+    """
+    if grid.shape[0] == 1:
+        return jnp.sum(weights, keepdims=True)
+
+    cell = jnp.argmin(jnp.abs(means[:, None] - grid[None, :]), axis=-1)
+    return jnp.zeros(grid.shape[0], dtype=weights.dtype).at[cell].add(weights)
+
+
 def strategy_from_network(
     game: ContinuousKuhnPoker,
     network: MixtureActorCritic,
     params,
     player: int,
     grid: chex.Array,
+    greedy_gaussians: bool = False,
 ) -> KuhnStrategy:
     """Query `player`'s policy at every Kuhn infoset and tabulate it on `grid`.
 
@@ -91,6 +111,10 @@ def strategy_from_network(
     open node, and one per (card, size) at the node facing a bet, where the
     observed size is part of the infoset. All of it is `vmap`ed into two batched
     calls.
+
+    `greedy_gaussians` evaluates the policy with every Gaussian's sigma set to
+    zero (see `greedy_mixture_grid_probs`); the categorical head -- check/bet,
+    the component weights, fold/call -- is read as the distribution it is.
     """
     open_node, faced_node = game.decision_nodes(player)
     num_atoms = network.num_atoms
@@ -107,9 +131,12 @@ def strategy_from_network(
         # size distribution already carries "and it bet at all".
         # The bet size is action coordinate 0; its *marginal* standard deviation
         # is what a one-dimensional CDF over that coordinate needs.
-        sizes = clipped_mixture_grid_probs(
-            probs[num_atoms:], means[:, 0], marginal_std(scale_trils)[:, 0], grid
-        )
+        if greedy_gaussians:
+            sizes = greedy_mixture_grid_probs(probs[num_atoms:], means[:, 0], grid)
+        else:
+            sizes = clipped_mixture_grid_probs(
+                probs[num_atoms:], means[:, 0], marginal_std(scale_trils)[:, 0], grid
+            )
         return probs[KIND_PASSIVE], sizes
 
     def at_faced(card: chex.Array, bet: chex.Array) -> chex.Array:
@@ -203,6 +230,7 @@ def evaluate_networks(
     networks: tuple[MixtureActorCritic, MixtureActorCritic],
     params: tuple,
     grid: chex.Array | None = None,
+    greedy_gaussians: bool = False,
 ) -> dict[str, chex.Array]:
     """Exploitability, both best-response values, and the game value of a policy pair.
 
@@ -210,10 +238,13 @@ def evaluate_networks(
     Nash equilibrium. It is a *lower bound* -- the responder may only bet one of
     the grid's sizes -- so check it has converged by doubling the grid rather
     than trusting a single resolution.
+
+    `greedy_gaussians` scores both policies with their Gaussians' sigmas at zero
+    (see `strategy_from_network`).
     """
     grid = bet_grid(game) if grid is None else grid
-    strategy_0 = strategy_from_network(game, networks[0], params[0], 0, grid)
-    strategy_1 = strategy_from_network(game, networks[1], params[1], 1, grid)
+    strategy_0 = strategy_from_network(game, networks[0], params[0], 0, grid, greedy_gaussians)
+    strategy_1 = strategy_from_network(game, networks[1], params[1], 1, grid, greedy_gaussians)
 
     br_first = best_response_value_first(game, grid, strategy_1)
     br_second = best_response_value_second(game, grid, strategy_0)
@@ -225,13 +256,18 @@ def evaluate_networks(
     }
 
 
-def build_kuhn_metric_fn(game: ContinuousKuhnPoker, num_grid_points: int | None = None):
+def build_kuhn_metric_fn(
+    game: ContinuousKuhnPoker, num_grid_points: int | None = None, greedy_gaussians: bool = False
+):
     """A `metric_fn` for `SequentialSelfPlayPPOTrainer.train`, reporting exploitability.
 
     Evaluates both the live parameters and the Polyak-averaged `target_params`.
     The averaged iterate is usually the better-behaved of the two in a self-play
     game -- the live one can orbit an equilibrium without ever settling on it --
     so watching only `params` can make a converging run look like a diverging one.
+
+    `greedy_gaussians` scores both with every Gaussian's sigma at zero, the
+    categorical head still a distribution (see `evaluate_networks`).
     """
     grid = bet_grid(game) if num_grid_points is None else bet_grid(game, num_grid_points)
     evaluate = None
@@ -243,7 +279,9 @@ def build_kuhn_metric_fn(game: ContinuousKuhnPoker, num_grid_points: int | None 
             # holding array attributes is not hashable, and the architecture is
             # fixed for the whole run anyway.
             networks = trainer.networks
-            evaluate = jax.jit(lambda params: evaluate_networks(game, networks, params, grid))
+            evaluate = jax.jit(
+                lambda params: evaluate_networks(game, networks, params, grid, greedy_gaussians)
+            )
 
         live = evaluate(trainer.params)
         target = evaluate(trainer.target_params)
@@ -255,51 +293,73 @@ def build_kuhn_metric_fn(game: ContinuousKuhnPoker, num_grid_points: int | None 
     return metric_fn
 
 
-def build_kuhn_strategy_log_fn(game: ContinuousKuhnPoker, num_grid_points: int = 65):
-    """A `strategy_log_fn` for `SequentialSelfPlayPPOTrainer.train`: the whole policy, per card.
+def build_kuhn_strategy_log_fn(game: ContinuousKuhnPoker, num_call_sizes: int = 8):
+    """A `strategy_log_fn` for `SequentialSelfPlayPPOTrainer.train`: both live policies, infoset by infoset.
 
-    Prints, for each player and card, the probability of betting and the mean
-    size conditional on betting, plus the probability of calling a bet of the
-    middle size. A coarse grid is plenty -- this is a readout, not a measurement,
-    and `build_kuhn_metric_fn` is what produces numbers to trust.
+    Each player acts at two kinds of infoset, and each gets its own block:
 
-    Below each player's line, the raw mixture at its opening node, per card:
-    every Gaussian component as `weight x (mean ± sigma)`, the weight joint with
-    betting at all and sigma the (clamped) standard deviation actually sampled.
+      * **no bet outstanding** -- player 0's opening node, player 1's after
+        player 0 checks. One row per card: the probability of checking, then of
+        betting, split into the mixture's Gaussian components as
+        `weight x (mean ± sigma)`. Check and the component weights are the whole
+        categorical head, so `check + bet = 1` and `bet` is the sum of the
+        weights. A drawn size outside `[min_bet, max_bet]` is clipped to the
+        nearer end when played.
+      * **facing a bet** -- player 1's after player 0 bets, player 0's after
+        checking and being bet into. The bet's size is part of the infoset, so
+        one column per size in the header and one row per card: the probability
+        of calling that size. Folding is the rest.
+
+    A readout, not a measurement: `build_kuhn_metric_fn` is what scores the
+    clipped bet-size distribution the game actually sees.
     """
-    grid = bet_grid(game) if game.max_bet <= game.min_bet else bet_grid(game, num_grid_points)
-    middle = grid.shape[0] // 2
     labels = "JQKA23456789"[: game.num_cards]
+    cards = jnp.arange(game.num_cards)
+    sizes = jnp.linspace(
+        game.min_bet, game.max_bet, 1 if game.max_bet <= game.min_bet else num_call_sizes
+    )
+    titles = (
+        ("P0 opens, no bet yet", "P0 checked, P1 bet b"),
+        ("P1 after P0 checks", "P1 facing P0's bet b"),
+    )
 
     def strategy_log_fn(trainer) -> str:
         lines = []
         for player in (0, 1):
-            strategy = strategy_from_network(
-                game, trainer.networks[player], trainer.params[player], player, grid
-            )
-            bet_prob = jnp.sum(strategy.open_bet, axis=-1)
-            mean_size = jnp.sum(strategy.open_bet * grid, axis=-1) / jnp.maximum(bet_prob, 1e-9)
-            cards = "  ".join(
-                f"{labels[c]} bet {float(bet_prob[c]):.2f}@{float(mean_size[c]):.2f}"
-                f" call {float(strategy.call[c, middle]):.2f}"
-                for c in range(game.num_cards)
-            )
-            lines.append(f"  p{player} | {cards}")
-
             network, params = trainer.networks[player], trainer.params[player]
-            open_node, _ = game.decision_nodes(player)
+            num_atoms = network.num_atoms
+            open_node, faced_node = game.decision_nodes(player)
+            open_title, faced_title = titles[player]
+
             open_mask = expand_kind_mask(game.infoset_action_mask(open_node), network.num_components)
+            logits, means, scale_trils, _ = jax.vmap(
+                lambda card: network.apply(params, game.infoset_observation(card, open_node, 0.0))
+            )(cards)
+            probs = jnp.exp(jax.vmap(masked_log_softmax, in_axes=(0, None))(logits, open_mask))
+            sigmas = marginal_std(scale_trils)[..., 0]
+            lines.append(f"  {open_title}: check + bet = 1, bet split as weight x (mean ± sigma)")
             for c in range(game.num_cards):
-                logits, means, scale_trils, _ = network.apply(
-                    params, game.infoset_observation(c, open_node, 0.0)
-                )
-                weights = jnp.exp(masked_log_softmax(logits, open_mask))[network.num_atoms:]
-                sigmas = marginal_std(scale_trils)[:, 0]
+                weights = probs[c, num_atoms:]
                 components = "  ".join(
                     f"{float(w):.2f}x({float(m):.3f}±{float(s):.3f})"
-                    for w, m, s in zip(weights, means[:, 0], sigmas)
+                    for w, m, s in zip(weights, means[c, :, 0], sigmas[c])
                 )
-                lines.append(f"       {labels[c]} | {components}")
+                lines.append(
+                    f"    {labels[c]} | check {float(probs[c, KIND_PASSIVE]):.2f}"
+                    f"  bet {float(jnp.sum(weights)):.2f} = {components}"
+                )
+
+            faced_mask = expand_kind_mask(game.infoset_action_mask(faced_node), network.num_components)
+
+            def call_prob(card, bet):
+                logits, _, _, _ = network.apply(params, game.infoset_observation(card, faced_node, bet))
+                return jnp.exp(masked_log_softmax(logits, faced_mask))[KIND_CALL]
+
+            call = jax.vmap(jax.vmap(call_prob, in_axes=(None, 0)), in_axes=(0, None))(cards, sizes)
+            lines.append(f"  {faced_title}: P(call) for each bet size b, fold = 1 - call")
+            lines.append("    b | " + "  ".join(f"{float(b):.2f}" for b in sizes))
+            for c in range(game.num_cards):
+                lines.append(f"    {labels[c]} | " + "  ".join(f"{float(p):.2f}" for p in call[c]))
         return "\n".join(lines)
 
     return strategy_log_fn

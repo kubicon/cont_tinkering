@@ -175,6 +175,18 @@ class PPOConfig:
     category_update: str = "ppo"
     neurd_beta: float = 2.0
     neurd_clip: float = 10.0
+    # Standardize the policy-gradient advantage over each player's decisions in
+    # the batch. False feeds the surrogate the raw advantage against the critic,
+    # in payoff units, so the entropy/KL coefficients weigh against payoffs.
+    normalize_advantage: bool = True
+    # Probability floor on the categorical head, under either update: the loss
+    # gains `category_floor_coef * sum_k relu(log category_floor - log pi_k)`,
+    # zero above the floor and a push back up that does not shrink with `pi_k`
+    # below it. "kind" floors check/bet and fold/call (a bet's components
+    # summed), "entry" every component too. 0 disables.
+    category_floor: float = 0.0
+    category_floor_coef: float = 0.01
+    category_floor_mode: str = "kind"
 
     # `policy: exp_family` only. A log-linear density has one head, so it has one
     # of each coefficient rather than the mixture's per-head pair. `null` (the
@@ -413,10 +425,11 @@ def _check_advantage(ppo: PPOConfig) -> PPOConfig:
 
 
 CATEGORY_UPDATES = ("ppo", "neurd")
+CATEGORY_FLOOR_MODES = ("kind", "entry")
 
 
 def _check_category_update(ppo: PPOConfig, network: NetworkConfig) -> PPOConfig:
-    """Coerce the NeuRD constants to floats and reject impossible combinations."""
+    """Coerce the categorical-head constants to floats and reject impossible combinations."""
     if ppo.category_update not in CATEGORY_UPDATES:
         raise ValueError(
             f"unknown ppo.category_update {ppo.category_update!r}, choices: {list(CATEGORY_UPDATES)}"
@@ -430,6 +443,21 @@ def _check_category_update(ppo: PPOConfig, network: NetworkConfig) -> PPOConfig:
     for name, value in values.items():
         if value <= 0.0:
             raise ValueError(f"ppo.{name} must be positive, got {value}")
+    values["category_floor"] = float(ppo.category_floor)
+    values["category_floor_coef"] = float(ppo.category_floor_coef)
+    if not 0.0 <= values["category_floor"] < 1.0:
+        raise ValueError(f"ppo.category_floor must lie in [0, 1), got {values['category_floor']}")
+    if values["category_floor_coef"] < 0.0:
+        raise ValueError(f"ppo.category_floor_coef must be nonnegative, got {values['category_floor_coef']}")
+    if ppo.category_floor_mode not in CATEGORY_FLOOR_MODES:
+        raise ValueError(
+            f"unknown ppo.category_floor_mode {ppo.category_floor_mode!r}, "
+            f"choices: {list(CATEGORY_FLOOR_MODES)}"
+        )
+    if values["category_floor"] > 0.0 and network.policy != "gaussian_mixture":
+        raise ValueError(
+            f"ppo.category_floor needs network.policy: gaussian_mixture, got {network.policy!r}"
+        )
     return dataclasses.replace(ppo, **values)
 
 

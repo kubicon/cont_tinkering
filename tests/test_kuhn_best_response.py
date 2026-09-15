@@ -41,6 +41,7 @@ from training.config import MixturePPOHyperparams
 from training.kuhn_evaluation import (
     clipped_mixture_grid_probs,
     evaluate_networks,
+    greedy_mixture_grid_probs,
     strategy_from_network,
 )
 from training.mixture import build_mixture_network
@@ -242,15 +243,47 @@ def test_clipped_mixture_matches_sampling_the_same_clipped_mixture():
     np.testing.assert_allclose(probs, empirical, atol=5e-3)
 
 
+def test_greedy_mixture_is_the_zero_sigma_limit_of_the_clipped_one():
+    """Inside the box, below it and above it -- no mean sits near a cell boundary."""
+    grid = jnp.linspace(0.5, 2.0, 33)
+    weights = jnp.array([0.3, 0.2, 0.1, 0.15])
+    means = jnp.array([0.7, 1.7, -3.0, 5.0])
+    greedy = greedy_mixture_grid_probs(weights, means, grid)
+    limit = clipped_mixture_grid_probs(weights, means, jnp.full(means.shape, 1e-6), grid)
+    np.testing.assert_allclose(greedy, limit, atol=1e-6)
+    assert float(greedy[0]) == pytest.approx(0.1, abs=1e-6)
+    assert float(greedy[-1]) == pytest.approx(0.15, abs=1e-6)
+
+
 # ---- reading a policy out of a network ----------------------------------
 
 
-def test_strategy_from_network_is_a_valid_distribution():
+@pytest.mark.parametrize("greedy_gaussians", [False, True])
+def test_strategy_from_network_is_a_valid_distribution(greedy_gaussians):
     game = ContinuousKuhnPoker(min_bet=0.5, max_bet=2.0)
     grid = bet_grid(game, 129)
     networks, params = _networks(game)
     for player in (0, 1):
-        strategy_from_network(game, networks[player], params[player], player, grid).validate()
+        strategy_from_network(
+            game, networks[player], params[player], player, grid, greedy_gaussians
+        ).validate()
+
+
+def test_greedy_gaussians_leave_the_categorical_head_alone():
+    """Only where the bet mass sits moves: check, total bet and every call stay put."""
+    game = ContinuousKuhnPoker(min_bet=0.5, max_bet=2.0)
+    grid = bet_grid(game, 129)
+    networks, params = _networks(game)
+    for player in (0, 1):
+        stochastic = strategy_from_network(game, networks[player], params[player], player, grid)
+        greedy = strategy_from_network(
+            game, networks[player], params[player], player, grid, greedy_gaussians=True
+        )
+        np.testing.assert_allclose(greedy.open_check, stochastic.open_check, atol=1e-6)
+        np.testing.assert_allclose(greedy.call, stochastic.call, atol=1e-6)
+        np.testing.assert_allclose(
+            jnp.sum(greedy.open_bet, axis=-1), jnp.sum(stochastic.open_bet, axis=-1), atol=1e-5
+        )
 
 
 def test_a_freshly_initialized_pair_is_exploitable_but_finite():

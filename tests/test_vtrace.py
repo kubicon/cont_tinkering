@@ -20,9 +20,15 @@ from games.sequential import TERMINAL
 from games.sequential_examples import ContinuousKuhnPoker
 from training.config import MixturePPOHyperparams
 from training.mixture import (
+    behavior_log_probs,
     build_mixture_network,
     build_mixture_ppo_loss_fn,
+    category_floor_penalty,
     hybrid_action_log_prob,
+    neurd_category_loss,
+    neurd_log_weight,
+    sample_mixture_component,
+    uniform_component_log_probs,
 )
 from training.run_config import run_config_from_dict
 from training.sequential_rollout import build_episode_sampler, collect_sequential_batch
@@ -177,7 +183,7 @@ def test_truncation_caps_the_importance_weights():
 # ---- the action probability ----------------------------------------------------
 
 
-def test_hybrid_log_prob_sums_over_components_and_ignores_eps_on_atoms():
+def test_hybrid_log_prob_sums_over_components_and_mixes_in_uniform_exploration():
     logits = jnp.array([0.3, -0.2, 0.5, 0.1])  # 2 atoms, 2 Gaussians
     mask = jnp.array([True, True, True, True])
     means = jnp.array([[0.2], [0.8]])
@@ -192,10 +198,37 @@ def test_hybrid_log_prob_sums_over_components_and_ignores_eps_on_atoms():
         np.testing.assert_allclose(float(got), float(expected), rtol=1e-5)
     eps = 0.3
     explored = hybrid_action_log_prob(logits, means, scale_trils, mask, 2, x, 2, jnp.array(eps), low, high)
-    mixed = (1 - eps) * jnp.exp(expected) + eps * jnp.sum(probs[2:]) * 1.0
+    # Exploring picks one of the three legal kinds (two atoms, the continuous
+    # one) uniformly, and a continuous value uniformly on the unit box.
+    mixed = (1 - eps) * jnp.exp(expected) + eps * (1 / 3) * 1.0
     np.testing.assert_allclose(float(explored), float(jnp.log(mixed)), rtol=1e-5)
     atom = hybrid_action_log_prob(logits, means, scale_trils, mask, 1, x, 2, jnp.array(eps), low, high)
-    np.testing.assert_allclose(float(atom), float(jnp.log(probs[1])), rtol=1e-5)
+    np.testing.assert_allclose(float(atom), float(jnp.log((1 - eps) * probs[1] + eps / 3)), rtol=1e-5)
+
+
+def test_exploration_draws_the_categorical_uniformly_over_legal_kinds():
+    logits = jnp.array([-30.0, 0.0, 0.0, 0.0])  # 2 atoms, 2 Gaussians; the policy never checks
+    mask = jnp.array([True, False, True, True])  # check or bet
+    means = jnp.array([[0.5], [1.5]])
+    scale_trils = jnp.array([[[0.1]], [[0.1]]])
+    low, high = jnp.array([0.25]), jnp.array([2.0])
+    eps = 0.3
+    # Uniform over {check, bet}, the bet split evenly over its two components.
+    uniform = np.exp(np.asarray(uniform_component_log_probs(mask, 2)))
+    np.testing.assert_allclose(uniform[[0, 2, 3]], [0.5, 0.25, 0.25], rtol=1e-6)
+    components, actions = jax.vmap(
+        lambda k: sample_mixture_component(
+            logits, means, scale_trils, mask, 2, k, jnp.float32(eps), low, high
+        )
+    )(jax.random.split(jax.random.PRNGKey(0), 20000))
+    components = np.asarray(components)
+    assert not np.any(components == 1)
+    assert abs(np.mean(components == 0) - eps / 2) < 0.015
+    assert np.all(np.isfinite(np.asarray(actions)))
+    check = hybrid_action_log_prob(
+        logits, means, scale_trils, mask, 0, jnp.array([1.0]), 2, jnp.array(eps), low, high
+    )
+    np.testing.assert_allclose(float(check), np.log(eps / 2), rtol=1e-5)
 
 
 # ---- the rollout's rewards -------------------------------------------------------
@@ -336,8 +369,8 @@ def test_opponent_correction_on_an_on_policy_batch_changes_nothing(correction):
 def test_opponent_correction_reweights_an_exploring_batch(make_game, correction):
     game = make_game()
     networks, params, batch, _ = _batch(game, explore_eps=(0.3, 0.3))
-    # Player 0: in Kuhn, player 1's later moves can be explored bet sizes, while
-    # everything after player 1's decision is a call/fold atom with ratio one.
+    # Player 0: in Kuhn, player 1's later moves can be explored -- a bet size, or
+    # the check/bet or fold/call choice itself.
     args = (params[0], networks[0], batch, 0.1, 0.5, 0.0)
     base, _ = _loss_fn(0, "vtrace")(*args)
     fn = jax.value_and_grad(_loss_fn(0, "vtrace", vtrace_opponent_correction=correction), has_aux=True)
@@ -358,6 +391,122 @@ def test_vtrace_ignores_whatever_sits_on_rows_that_are_not_the_players():
     corrupted = batch.replace(obs=jnp.where(not_mine, 50.0, batch.obs))
     again, _ = fn(params[0], networks[0], corrupted, 0.1, 0.5, 0.0)
     assert float(again) == pytest.approx(float(base), rel=1e-6)
+
+
+# ---- NeuRD ---------------------------------------------------------------------------
+
+
+def test_neurd_moves_each_logit_by_its_gated_advantage():
+    logits = jnp.array([10.0, -10.0, 0.0, 3.0])
+    mask = jnp.array([True, True, True, False])  # the illegal entry takes no part
+    beta = 2.0
+
+    def gradient(advantages):
+        return np.asarray(jax.grad(lambda z: neurd_category_loss(z, mask, advantages, beta)[0])(logits))
+
+    # Centered legal logits (10, -10, 0): the first sits above beta, the second
+    # below -beta. Pushing the first further up is dropped; pushing the second
+    # back inside goes through in full, however small its probability.
+    force = np.array([0.0, 0.5, -0.3])
+    grad = gradient(jnp.array([1.0, 0.5, -0.3, 7.0]))
+    np.testing.assert_allclose(grad[:3], -(force - force.mean()), atol=1e-6)
+    assert grad[3] == 0.0
+    # Pushing both saturated entries further out is dropped for both.
+    outward = jnp.array([1.0, -0.5, 0.0, 7.0])
+    np.testing.assert_allclose(gradient(outward), 0.0, atol=1e-6)
+    _, gated = neurd_category_loss(logits, mask, outward, beta)
+    assert float(gated) == pytest.approx(2 / 3)
+
+
+def test_neurd_weights_a_bet_by_the_density_of_its_own_size():
+    eps, pi_k, u_k = 0.2, 0.5, 0.25
+    low, high = jnp.array([0.0]), jnp.array([1.0])  # uniform density 1 on the box
+    # A size near the component's mean, and one exploration drew deep in its tail.
+    for x, density in ((jnp.array([0.5]), 1.6), (jnp.array([0.95]), 1e-3)):
+        log_density = jnp.log(density)
+        category, joint = behavior_log_probs(
+            jnp.log(pi_k), log_density, jnp.log(u_k), x, jnp.array(eps), low, high
+        )
+        weight = float(jnp.exp(neurd_log_weight(jnp.array(1.0), log_density, category, joint)))
+        assert weight == pytest.approx(density / ((1 - eps) * pi_k * density + eps * u_k), rel=1e-4)
+    assert weight < 0.05  # the tail draw barely counts towards the component's advantage
+    # An atom is weighted by the probability it was drawn with alone.
+    category, joint = behavior_log_probs(
+        jnp.log(pi_k), jnp.array(0.0), jnp.log(u_k), low, jnp.array(eps), low, high
+    )
+    atom_weight = float(jnp.exp(neurd_log_weight(jnp.array(0.0), jnp.array(0.0), category, joint)))
+    assert atom_weight == pytest.approx(1 / ((1 - eps) * pi_k + eps * u_k), rel=1e-4)
+
+
+@pytest.mark.parametrize(
+    "make_game, advantage, explore_eps",
+    [(ContinuousKuhnPoker, "vtrace", 0.3), (ContinuousKuhnPoker, "monte_carlo", 0.0), (_sumo, "vtrace", 0.3)],
+)
+def test_neurd_loss_trains_on_and_off_policy(make_game, advantage, explore_eps):
+    game = make_game()
+    networks, params, batch, _ = _batch(game, explore_eps=(explore_eps, explore_eps))
+    args = (params[0], networks[0], batch, 0.1, 0.5, 0.0)
+    fn = jax.value_and_grad(_loss_fn(0, advantage, category_update="neurd"), has_aux=True)
+    (loss, metrics), grads = fn(*args)
+    assert np.isfinite(float(loss))
+    assert all(np.all(np.isfinite(np.asarray(g))) for g in jax.tree_util.tree_leaves(grads))
+    assert 0.0 <= float(metrics["neurd_gated_frac"]) <= 1.0
+    ppo_loss, _ = _loss_fn(0, advantage)(*args)
+    assert float(loss) != pytest.approx(float(ppo_loss), rel=1e-6)
+
+
+def test_category_floor_is_zero_above_the_floor_and_pushes_a_rare_entry_up():
+    mask = jnp.ones(4, dtype=bool)
+    logits = jnp.array([0.0, 2.0, -8.0, 1.0])  # entry 2 sits near 3e-5, the rest well above 1e-3
+    probs = np.asarray(jax.nn.softmax(logits))
+    floor = 1e-3
+    penalty, frac = category_floor_penalty(logits, mask, 1, floor, "entry")
+    assert float(penalty) == pytest.approx(np.log(floor) - np.log(probs[2]), rel=1e-4)
+    assert float(frac) == pytest.approx(0.25)
+    # `pi_k - 1` on the rare entry however small it is; the rest give up mass in proportion.
+    grad = np.asarray(jax.grad(lambda z: category_floor_penalty(z, mask, 1, floor, "entry")[0])(logits))
+    np.testing.assert_allclose(grad, probs - np.eye(4)[2], rtol=1e-4, atol=1e-6)
+    assert float(category_floor_penalty(jnp.zeros(4), mask, 1, floor, "entry")[0]) == 0.0
+
+
+def test_category_floor_by_kind_sums_the_components_of_a_bet():
+    # One atom and two components, each component below the floor but the bet above it.
+    mask = jnp.ones(3, dtype=bool)
+    logits = jnp.log(jnp.array([0.9986, 0.0007, 0.0007]))
+    assert float(category_floor_penalty(logits, mask, 1, 1e-3, "kind")[0]) == 0.0
+    assert float(category_floor_penalty(logits, mask, 1, 1e-3, "entry")[0]) > 0.0
+    # An illegal entry never counts, however low its probability.
+    penalty, frac = category_floor_penalty(logits, jnp.array([False, True, True]), 1, 1e-3, "kind")
+    assert float(penalty) == 0.0 and float(frac) == 0.0
+
+
+@pytest.mark.parametrize("category_update", ["ppo", "neurd"])
+def test_category_floor_enters_the_loss_under_either_update(category_update):
+    game = ContinuousKuhnPoker()
+    networks, params, batch, _ = _batch(game, explore_eps=(0.3, 0.3))
+    args = (params[0], networks[0], batch, 0.1, 0.5, 0.0)
+    base, _ = _loss_fn(0, "vtrace", category_update=category_update)(*args)
+    # At initialization the four bet components outweigh check, so check sits below 0.45.
+    fn = jax.value_and_grad(
+        _loss_fn(0, "vtrace", category_update=category_update, category_floor=0.45), has_aux=True
+    )
+    (loss, metrics), grads = fn(*args)
+    assert all(np.all(np.isfinite(np.asarray(g))) for g in jax.tree_util.tree_leaves(grads))
+    assert float(metrics["category_floor_frac"]) > 0.0
+    assert float(loss) > float(base)
+
+
+@pytest.mark.parametrize(
+    "ppo", [{"category_floor": 1.0}, {"category_floor": -0.1}, {"category_floor_mode": "component"}]
+)
+def test_run_config_rejects_a_bad_category_floor(ppo):
+    with pytest.raises(ValueError, match="category_floor"):
+        run_config_from_dict({"game": {"name": "kuhn"}, "ppo": ppo})
+
+
+def test_run_config_rejects_an_unknown_category_update():
+    with pytest.raises(ValueError, match="category_update"):
+        run_config_from_dict({"game": {"name": "kuhn"}, "ppo": {"category_update": "reinforce"}})
 
 
 def test_vtrace_on_a_one_shot_batch_is_rejected():

@@ -49,6 +49,7 @@ from .kuhn_evaluation import (
     build_kuhn_metric_fn,
     clipped_mixture_grid_probs,
     evaluate_networks,
+    greedy_mixture_grid_probs,
     strategy_from_network,
 )
 from .mixture_trainer import MixturePPOTrainer, MixtureSelfPlayPPOTrainer
@@ -135,5 +136,6 @@ __all__ = [
     "build_kuhn_metric_fn",
     "clipped_mixture_grid_probs",
     "evaluate_networks",
+    "greedy_mixture_grid_probs",
     "strategy_from_network",
 ]

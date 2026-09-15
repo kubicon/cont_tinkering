@@ -86,6 +86,10 @@ def build_hyperparams(game: ZeroSumGame, player: int, config: RunConfig) -> Mixt
         category_update=ppo.category_update,
         neurd_beta=ppo.neurd_beta,
         neurd_clip=ppo.neurd_clip,
+        normalize_advantage=ppo.normalize_advantage,
+        category_floor=ppo.category_floor,
+        category_floor_coef=ppo.category_floor_coef,
+        category_floor_mode=ppo.category_floor_mode,
     )
 
 

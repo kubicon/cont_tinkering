@@ -124,7 +124,11 @@ def build_sequential_hooks(game: SequentialZeroSumGame, config: RunConfig) -> di
     """
     if isinstance(game, ContinuousKuhnPoker):
         return {
-            "metric_fn": build_kuhn_metric_fn(game, config.game.exploitability_grid_points),
+            "metric_fn": build_kuhn_metric_fn(
+                game,
+                config.game.exploitability_grid_points,
+                greedy_gaussians=config.game.exploitability_greedy_gaussians,
+            ),
             "strategy_log_fn": build_kuhn_strategy_log_fn(game),
         }
     return {}

@@ -28,7 +28,7 @@ game:
   # Start with Warp's device default. Benchmark `warp_staged` if profiling
   # shows repeated CUDA graph captures inside the training scans.
   warp_graph_mode: auto
-  horizon: 250            # control steps; 2 * horizon decisions, 25 s at dt 0.1
+  horizon: 200            # control steps; 2 * horizon decisions, 25 s at dt 0.1
   ring_radius: 1.0
   disk_radius: 0.15
   start_distance: 0.6     # centre-to-centre at the start
@@ -55,7 +55,7 @@ game:
   # There is one contact in the model, so it converges in far fewer than
   # MuJoCo's default 100 iterations. Raising these costs time for nothing here.
   solver_iterations: 4
-  solver_ls_iterations: 8
+  solver_ls_iterations: 6
   # Random play pushes somebody out in only ~7% of bouts, so pure sumo starts
   # with almost no signal. Two ways to add one, on the same distance gap
   # `phi = (d_1 - d_0) / ring_radius` (distances from the centre):

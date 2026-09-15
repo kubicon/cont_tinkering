@@ -15,16 +15,25 @@ game:
   min_bet: 0.25
   max_bet: 2.0
   exploitability_grid_points: 1025
+  exploitability_greedy_gaussians: false   # true: score each Gaussian at sigma = 0 (bets its mean); the categorical head stays a distribution
 
 network:
-  hidden_dims: [64, 64]
+  policy: gaussian_mixture   # the only policy a sequential game accepts
+  hidden_dims: [128, 128]
   activation: gelu
   normalization: rms_norm
-  num_components: 2
+  num_components: 4
+  full_covariance: false     # only meaningful for a multi-dim action; the bet size here is 1-D
+  scale_parameterization: log
+  max_correlation: 0.0       # full_covariance + "log" only
+  sigma_min: 0.1            # null keeps training.gaussian.SIGMA_MIN (1e-3)
+  sigma_max: null            # null keeps the box width
+  bucket_means: false
   clip_means: true    # the action *is* the bet size, so keep the means in the betting range
+  mean_box_penalty_coef: 1.0   # only bites with clip_means on
 
 optimizer:
-  learning_rate: 0.003
+  learning_rate: 0.001
   max_grad_norm: 0.5
   optimizer: adam
   weight_decay: 0.0
@@ -35,7 +44,20 @@ ppo:
   batch_size: 512
   ppo_epochs: 1
   target_tau: 0.001
-  magnet_interval: 300
+  magnet_interval: 1000
+
+  explore_eps: 0.2    # with this probability, play a uniform action: check/bet (fold/call) uniformly, a bet's size uniform on the box
+
+  # advantage: monte_carlo regresses on the episode's return; vtrace bootstraps
+  # along each player's own decisions instead. The vtrace_* fields below only
+  # apply when advantage is switched to "vtrace".
+  advantage: vtrace
+  gamma: 1.0
+  vtrace_lambda: 0.95
+  vtrace_rho_bar: 2.0
+  vtrace_c_bar: 1.0
+  vtrace_opponent_correction: future_and_past
+  vtrace_opponent_past_floor: 0.1
 
   # The categorical head now carries the fold/check/call decision, so its
   # entropy is what keeps the policy from collapsing to pure play.
@@ -47,9 +69,32 @@ ppo:
   magnet_category_kl_coef: 0.2
   magnet_gaussian_kl_coef: 0.2
 
+  # Categorical head update: "ppo" (clipped surrogate) or "neurd" (Neural
+  # Replicator Dynamics: logits move by the advantage itself, no pi factor, and
+  # stay within [-neurd_beta, neurd_beta]). Under "neurd" the two category_*
+  # entropy/magnet coefficients above act inside the advantage, in payoff units.
+  category_update: ppo
+  neurd_beta: 2.5
+  neurd_clip: 10.0
+
+  # true: standardize the policy-gradient advantage per player over the batch.
+  # false: use the raw advantage against the critic, in payoff units, so the
+  # entropy/KL/magnet coefficients above weigh directly against payoffs.
+  normalize_advantage: true
+
+  # Probability floor on the categorical head, under either update: a hinge
+  # log-barrier category_floor_coef * sum_k relu(log category_floor - log pi_k),
+  # zero above the floor and a push back up that does not shrink with pi_k below
+  # it. It holds while category_floor_coef > category_floor * |advantage|.
+  # "kind" floors check/bet and fold/call (a bet's components summed); "entry"
+  # floors every Gaussian component too. 0 disables.
+  category_floor: 0.01
+  category_floor_coef: 0.05
+  category_floor_mode: entry
+
 train:
   mode: self_play     # the only mode a sequential game supports
-  steps: 40
-  epochs: 400
-  checkpoint_dir: data/kuhn
+  steps: 200
+  epochs: 1000
+  checkpoint_dir: data/kuhn_test2
   seed: 0

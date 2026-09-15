@@ -60,10 +60,11 @@ ppo:
   ppo_epochs: 1
   target_tau: 0.001
   magnet_interval: 400
-  # Off-policy bet-size exploration (self_play only): with this probability a
-  # drawn bet size is replaced by a uniform draw on [min_bet, max_bet], so the
+  # Off-policy exploration (self_play only): with this probability the action
+  # is a uniform draw -- check/bet (fold/call) uniformly, a bet's size uniform
+  # on [min_bet, max_bet] -- so no branch of the tree goes unvisited and the
   # opponent learns to answer sizes the policy never bets. Each player's own
-  # exploratory bets are importance-weighted back to its policy (weights are
+  # exploratory actions are importance-weighted back to its policy (weights are
   # bounded by 1 / (1 - explore_eps)); evaluation scores the policy alone.
   # 0 (the default) disables it.
   explore_eps: 0.05

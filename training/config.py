@@ -150,6 +150,15 @@ class MixturePPOHyperparams(PPOHyperparams):
     category_update: str = "ppo"
     neurd_beta: float = 2.0
     neurd_clip: float = 10.0
+    # Standardize the policy-gradient advantage per player over the batch; False
+    # uses the raw advantage against the critic.
+    normalize_advantage: bool = True
+    # Hinge log-barrier keeping each legal kind's ("kind") or categorical entry's
+    # ("entry") probability at `category_floor` or above (see
+    # `training.mixture.category_floor_penalty`), under either update. 0 disables.
+    category_floor: float = 0.0
+    category_floor_coef: float = 0.01
+    category_floor_mode: str = "kind"
 
     @classmethod
     def from_dict(cls, data: dict) -> "MixturePPOHyperparams":
