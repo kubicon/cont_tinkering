@@ -93,8 +93,9 @@ def build_episode_sampler(
     axis on every `Episode` field and a scalar `payoff` to player 0.
 
     `explore_eps[p]` makes player `p` act from its exploring behavior policy:
-    each continuous action it draws is, with that probability, replaced by a
-    uniform draw on its network's box -- or, under `bucket_means`, on the drawn
+    with that probability each of its actions is a uniform draw instead -- a
+    legal kind (e.g. check vs bet) uniformly, then a component uniformly, and a
+    value uniformly on its network's box or, under `bucket_means`, on that
     component's bucket (see `sample_mixture_component`). Any
     nonzero entry records `Episode.behavior_eps`, which switches the loss to its
     importance-weighted form for that player's own decisions. The default

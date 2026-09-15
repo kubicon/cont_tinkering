@@ -85,6 +85,9 @@ def build_loss_fn(player: int, hyperparams: MixturePPOHyperparams, shared_obs: b
         vtrace_c_bar=hyperparams.vtrace_c_bar,
         vtrace_opponent_correction=hyperparams.vtrace_opponent_correction,
         vtrace_opponent_past_floor=hyperparams.vtrace_opponent_past_floor,
+        category_update=hyperparams.category_update,
+        neurd_beta=hyperparams.neurd_beta,
+        neurd_clip=hyperparams.neurd_clip,
     )
 
 

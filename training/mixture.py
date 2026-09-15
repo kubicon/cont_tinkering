@@ -387,16 +387,16 @@ class Episode:
     action_value: chex.Array  # `raw_action` clipped to the action space; read by the game only on the continuous kind
     value: chex.Array
     reward: chex.Array
-    # `()` float per decision: the `explore_eps` its continuous action was drawn
-    # under (see `sample_mixture_component`). `None` -- the default, and what
-    # every non-exploring sampler leaves -- marks an on-policy rollout, which the
-    # loss then scores exactly as before; set, it switches the loss to its
-    # importance-weighted form (see `behavior_gaussian_log_prob`).
+    # `()` float per decision: the `explore_eps` its action -- categorical entry
+    # and continuous value alike -- was drawn under (see `sample_mixture_component`).
+    # `None` -- the default, and what every non-exploring sampler leaves -- marks
+    # an on-policy rollout, which the loss then scores exactly as before; set, it
+    # switches the loss to its importance-weighted form (see `behavior_log_probs`).
     behavior_eps: chex.Array | None = None
     # `()` float per decision, set together with `behavior_eps`: the acting
     # player's `log pi_old(a) - log mu(a)` of the action it played, the policy
     # and behavior densities both at sampling time (see `behavior_log_ratio`).
-    # Zero on atoms and padding. What the *opponent's* correction reads, since
+    # Zero on padding. What the *opponent's* correction reads, since
     # the loss has only its own player's network (and boxes) to hand.
     behavior_log_ratio: chex.Array | None = None
     # `()` float per decision, sequential rollouts only: player 0's reward for
@@ -458,26 +458,32 @@ def sample_mixture_component(
 ) -> tuple[chex.Array, chex.Array]:
     """Draw one `(component, raw_action)` from a masked hybrid mixture policy.
 
-    With `explore_eps`, the *behavior* policy is sampled instead: the component
-    is drawn exactly as the policy says, and then, with probability
-    `explore_eps`, the drawn Gaussian's sample is replaced by a uniform draw on
-    the box `[low, high]`. So for a Gaussian component `k` the continuous
-    action has density `(1 - eps) N_k(x) + eps U(x)` while every categorical
-    probability -- check vs bet, which component -- is untouched. The loss
-    corrects for it from `Episode.behavior_eps`; see `behavior_gaussian_log_prob`.
+    With `explore_eps`, the *behavior* policy is sampled instead: with
+    probability `explore_eps` the whole action is a uniform draw -- the
+    categorical entry from `uniform_component_log_probs` (a legal kind
+    uniformly, e.g. check vs bet, then a legal Gaussian component uniformly),
+    and a Gaussian entry's value uniformly on the box `[low, high]` -- and
+    otherwise the policy's own draw. So entry `k` with value `x` has density
+    `(1 - eps) pi(k) N_k(x) + eps u(k) U(x)`, and an atom `(1 - eps) pi(k) + eps u(k)`.
+    The loss corrects for it from `Episode.behavior_eps`; see `behavior_log_probs`.
     `None` (the default) is the plain policy, with the same rng stream as before.
 
     `low`/`high` may also be `(num_components, d)` -- one box per component, as
     `component_boxes` gives -- and the uniform is then drawn on the drawn
-    component's own box. Under `bucket_means` that keeps exploration local to
-    the bucket: an explored size arrives with the hand composition the policy
-    bets into *that* region, rather than the policy's overall betting mix.
+    component's own box, which under `bucket_means` keeps a value explored in
+    a bucket inside that bucket.
     """
     if explore_eps is None:
         component_key, noise_key = jax.random.split(key)
     else:
-        component_key, noise_key, coin_key, uniform_key = jax.random.split(key, 4)
+        component_key, noise_key, coin_key, uniform_key, explore_key = jax.random.split(key, 5)
     component = jax.random.categorical(component_key, jnp.where(mask, logits, MASKED_LOGIT))
+    if explore_eps is not None:
+        explore = jax.random.uniform(coin_key) < explore_eps
+        explored_component = jax.random.categorical(
+            explore_key, uniform_component_log_probs(mask, num_atoms, logits.dtype)
+        )
+        component = jnp.where(explore, explored_component, component)
     index = gaussian_component_index(component, num_atoms)
     mean = means[index]
     # `dtype=mean.dtype` rather than the default: under `jax_enable_x64` (which
@@ -494,7 +500,6 @@ def sample_mixture_component(
             uniform_key, mean.shape, dtype=mean.dtype,
             minval=low.astype(mean.dtype), maxval=high.astype(mean.dtype),
         )
-        explore = jax.random.uniform(coin_key) < explore_eps
         raw_action = jnp.where(explore, uniform, raw_action)
     return component, raw_action
 
@@ -509,26 +514,53 @@ def component_box(
     return low, high
 
 
-def behavior_gaussian_log_prob(
+def uniform_component_log_probs(
+    mask: chex.Array, num_atoms: int, dtype=jnp.float32
+) -> chex.Array:
+    """`log u` over the categorical head's entries: what exploration draws its entry from.
+
+    Uniform over the legal *kinds* first -- each legal atom, and the continuous
+    kind as one -- then uniform over the legal Gaussian components within the
+    continuous kind, so exploring a check-or-bet node checks half the time
+    however many components the bet is split into. Illegal entries sit at
+    `masked_log_softmax`'s finite floor.
+    """
+    num_components = jnp.maximum(jnp.sum(mask[num_atoms:]), 1).astype(dtype)
+    per_entry = jnp.concatenate([
+        jnp.zeros((num_atoms,), dtype=dtype),
+        jnp.broadcast_to(-jnp.log(num_components), (mask.shape[-1] - num_atoms,)),
+    ])
+    return masked_log_softmax(per_entry, mask)
+
+
+def behavior_log_probs(
+    category_log_prob: chex.Array,
     gaussian_log_prob: chex.Array,
+    uniform_log_prob: chex.Array,
     raw_action: chex.Array,
     explore_eps: chex.Array,
     low: chex.Array,
     high: chex.Array,
-) -> chex.Array:
-    """`log((1 - eps) N_k(x) + eps U(x))`: the exploring sampler's density of `raw_action`.
+) -> tuple[chex.Array, chex.Array]:
+    """`(log mu(k), log mu(k, x))`: the exploring sampler's density of one drawn entry `k`.
 
-    `gaussian_log_prob` is `log N_k(x)` under the sampling-time policy, for the
-    component that was drawn. `U` is the uniform density on the box, zero
-    outside it (a Gaussian draw can land there; a uniform one cannot). Since the
-    categorical draw is unchanged, `N_k(x) / this` is the full importance
-    ratio of the sample, and it is bounded by `1 / (1 - eps)`.
+    `category_log_prob`/`gaussian_log_prob` are `log pi(k)` and `log N_k(x)`
+    under the sampling-time policy, `uniform_log_prob` is `log u(k)` (see
+    `uniform_component_log_probs`) and `low`/`high` the box the uniform value
+    was drawn on. `U` is the uniform density on it, zero outside (a Gaussian
+    draw can land there; a uniform one cannot). The first is the entry's
+    marginal -- all an atom has -- and the second its joint with the value,
+    meaningful for a Gaussian entry only. Both importance ratios,
+    `pi(k) / mu(k)` and `pi(k) N_k(x) / mu(k, x)`, are bounded by `1 / (1 - eps)`.
     """
     inside = jnp.all((raw_action >= low) & (raw_action <= high))
     log_uniform = jnp.where(inside, -jnp.sum(jnp.log(high - low)), -jnp.inf)
-    return jnp.logaddexp(
-        jnp.log1p(-explore_eps) + gaussian_log_prob, jnp.log(explore_eps) + log_uniform
+    keep, explore = jnp.log1p(-explore_eps), jnp.log(explore_eps)
+    category = jnp.logaddexp(keep + category_log_prob, explore + uniform_log_prob)
+    joint = jnp.logaddexp(
+        keep + category_log_prob + gaussian_log_prob, explore + uniform_log_prob + log_uniform
     )
+    return category, joint
 
 
 def hybrid_action_log_prob(
@@ -552,27 +584,30 @@ def hybrid_action_log_prob(
     two such densities is the lower-variance importance weight of the two
     (`mixture_log_probs` keeps the component-level factors the PPO heads use).
 
-    With `explore_eps` this is the *exploring* behavior's density instead: the
-    component is drawn as the policy says, then its sample is replaced by a
-    uniform draw on `[low, high]` with probability `eps` (see
-    `sample_mixture_component`), so the continuous density becomes
-    `(1 - eps) sum_k P(k) N_k(x) + eps sum_k P(k) U_k(x)`, where `U_k` is the
+    With `explore_eps` this is the *exploring* behavior's density instead: with
+    probability `eps` the entry is drawn from `u` (`uniform_component_log_probs`)
+    and a Gaussian entry's value uniformly on its box (see
+    `sample_mixture_component`), so an atom has probability
+    `(1 - eps) P(k) + eps u(k)` and the continuous density becomes
+    `(1 - eps) sum_k P(k) N_k(x) + eps sum_k u(k) U_k(x)`, where `U_k` is the
     uniform on component `k`'s box -- one shared box (`(d,)`) or its own
     bucket (`(num_components, d)`, as `component_boxes` gives). With a shared
-    box the second sum is `eps P(continuous) U(x)`. Atoms are never touched by
-    exploration.
+    box the second sum is `eps u(continuous) U(x)`.
     """
     log_probs = masked_log_softmax(logits, mask)
     per_component = jax.vmap(gaussian_log_prob, in_axes=(None, 0, 0))(raw_action, means, scale_trils)
     continuous = jax.nn.logsumexp(log_probs[num_atoms:] + per_component)
     if explore_eps is not None:
+        uniform_log_probs = uniform_component_log_probs(mask, num_atoms, logits.dtype)
         lows, highs = jnp.broadcast_to(low, means.shape), jnp.broadcast_to(high, means.shape)
         inside = jnp.all((raw_action >= lows) & (raw_action <= highs), axis=-1)
         log_uniform = jnp.where(inside, -jnp.sum(jnp.log(highs - lows), axis=-1), -jnp.inf)
+        keep, explore = jnp.log1p(-explore_eps), jnp.log(explore_eps)
         continuous = jnp.logaddexp(
-            jnp.log1p(-explore_eps) + continuous,
-            jnp.log(explore_eps) + jax.nn.logsumexp(log_probs[num_atoms:] + log_uniform),
+            keep + continuous,
+            explore + jax.nn.logsumexp(uniform_log_probs[num_atoms:] + log_uniform),
         )
+        log_probs = jnp.logaddexp(keep + log_probs, explore + uniform_log_probs)
     return jnp.where(component >= num_atoms, continuous, log_probs[component])
 
 
@@ -760,6 +795,10 @@ def mixture_ppo_loss_from_outputs(
     mean_box_penalty: chex.Array = 0.0,
     low: chex.Array | None = None,
     high: chex.Array | None = None,
+    raw_advantage: chex.Array | None = None,
+    category_update: str = "ppo",
+    neurd_beta: float = 2.0,
+    neurd_clip: float = 10.0,
 ) -> tuple[chex.Array, dict[str, chex.Array]]:
     """Clipped-surrogate PPO loss plus KL penalties, for a single (unbatched) `Episode`,
     given the current policy's already-computed forward pass at `episode.obs`.
@@ -829,21 +868,44 @@ def mixture_ppo_loss_from_outputs(
     `magnet_*_kl_coef * KL(current || magnet)` pulls towards the
     periodically-snapshotted magnet policy.
 
-    **Off-policy samples.** When `episode.behavior_eps` is set, the continuous
-    action was drawn from the exploring behavior policy `mu` (see
-    `sample_mixture_component`) and `low`/`high` must give the box it explored
-    -- shared `(d,)`, or per component `(num_components, d)`.
-    The categorical factor was sampled on-policy and is untouched. The Gaussian
-    factor uses the decoupled PPO objective: the same clipped surrogate in
+    **Off-policy samples.** When `episode.behavior_eps` is set, the action --
+    categorical entry and continuous value both -- was drawn from the exploring
+    behavior policy `mu` (see `sample_mixture_component`) and `low`/`high` must
+    give the box it explored -- shared `(d,)`, or per component `(num_components, d)`.
+    Both factors use the decoupled PPO objective: the same clipped surrogate in
     `r = pi_new / pi_old`, weighted by `w = pi_old / mu` -- so the trust region
-    still acts around the sampling-time policy, and `w <= 1 / (1 - eps)` keeps
-    the weights bounded. The sampled-action entropy estimate `-log p(x)` gets
-    the same `w`, turning it back into an estimate under `pi_old`; without it a
-    uniform draw deep in a Gaussian's tail would dominate the bonus. The KLs are
-    closed forms over the components and need no correction. Only this
-    decision's own action is reweighted: the return still reflects the rest of
-    the behavior trajectory -- in particular the *opponent's* exploration,
-    which is exactly what the responder is meant to learn from.
+    still acts around the sampling-time policy. The categorical factor's sample
+    is the entry `k`, weighted by `pi_old(k) / mu(k)`; the Gaussian factor's is
+    the pair `(k, x)`, weighted by the joint `pi_old(k) N_k(x) / mu(k, x)` (see
+    `behavior_log_probs`). Both are at most `1 / (1 - eps)`. The sampled-action
+    entropy estimate `-log p(x)` gets the Gaussian factor's `w`, turning it back
+    into an estimate under `pi_old`; without it a uniform draw deep in a
+    Gaussian's tail would dominate the bonus. The KLs are closed forms over the
+    components and need no correction. Only this decision's own action is
+    reweighted: the return still reflects the rest of the behavior trajectory
+    -- in particular the *opponent's* exploration, which is exactly what the
+    responder is meant to learn from.
+
+    **NeuRD.** With `category_update="neurd"` the categorical factor is not a
+    PPO surrogate but Neural Replicator Dynamics (Hennes et al., 2020): each
+    logit moves by its entry's advantage itself, without the softmax Jacobian
+    whose `pi_k` factor freezes an entry the policy has all but stopped picking
+    (see `neurd_category_loss`). Every entry's advantage is estimated from this
+    one sample, zero on the entries not drawn and clipped to `neurd_clip`: an
+    atom's is `raw_advantage / mu(k)`, a Gaussian entry's
+    `raw_advantage * N_k(x) / mu(k, x)` -- the entry played with its *own* bet
+    size rather than with whichever size exploration drew (see
+    `neurd_log_weight`). `mu` is the density the sample was drawn from (the
+    policy's own on an on-policy batch, the exploring behavior's otherwise), so
+    exploration is what bounds the weights. `raw_advantage` is
+    the *unnormalized* advantage, so the update and its regularization are in
+    payoff units. The categorical entropy bonus and magnet KL move into those
+    advantages, exactly and for every entry, as
+    `-tau_ent log pi_k - tau_mag (log pi_k - log magnet_k)` (R-NaD's reward
+    transform), and drop out of the loss; the fixed point is then `pi`
+    proportional to `magnet^(tau_mag / tau) exp(Q / tau)`, `tau = tau_ent + tau_mag`.
+    The trust-region KL stays a loss term, and the Gaussian factor is the PPO
+    surrogate either way.
     """
     mask = episode.action_mask
 
@@ -865,10 +927,25 @@ def mixture_ppo_loss_from_outputs(
         clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantage
         return jnp.minimum(unclipped, clipped)
 
-    category_policy_loss = -clipped_surrogate(category_ratio)
+    def decoupled_surrogate(log_ratio: chex.Array, log_weight: chex.Array) -> chex.Array:
+        # `w * min(r A, clip(r) A)`, with `w * r = pi_new / mu` formed directly and
+        # the clip taken on the log-ratio: a uniform draw far into a narrow
+        # Gaussian's tail, or onto an entry the policy all but never picks, has
+        # `pi_old` underflowing, so `r` alone can overflow (and `w * r` would be
+        # `0 * inf`) where the product is perfectly finite.
+        unclipped = jnp.exp(log_ratio + log_weight) * advantage
+        clipped = jnp.exp(
+            log_weight + jnp.clip(log_ratio, jnp.log1p(-clip_eps), jnp.log1p(clip_eps))
+        ) * advantage
+        return jnp.minimum(unclipped, clipped)
+
     if episode.behavior_eps is None:
         # On-policy: the sample came from `pi_old` itself.
+        behavior_category_log_prob = old_category_log_prob
+        behavior_joint_log_prob = old_category_log_prob + old_gaussian_log_prob
+        category_is_weight = jnp.ones(())
         is_weight = jnp.ones(())
+        category_surrogate = clipped_surrogate(category_ratio)
         gaussian_surrogate = clipped_surrogate(gaussian_ratio)
     else:
         if low is None or high is None:
@@ -878,21 +955,49 @@ def mixture_ppo_loss_from_outputs(
         explored_low, explored_high = component_box(
             low, high, gaussian_component_index(episode.component, num_atoms)
         )
-        behavior_log_prob = behavior_gaussian_log_prob(
-            old_gaussian_log_prob, episode.raw_action, episode.behavior_eps,
-            explored_low, explored_high,
+        uniform_log_prob = uniform_component_log_probs(mask, num_atoms, episode.logits.dtype)
+        behavior_category_log_prob, behavior_joint_log_prob = behavior_log_probs(
+            old_category_log_prob, old_gaussian_log_prob, uniform_log_prob[episode.component],
+            episode.raw_action, episode.behavior_eps, explored_low, explored_high,
         )
-        is_weight = jnp.exp(old_gaussian_log_prob - behavior_log_prob)
-        # `w * min(r A, clip(r) A)`, with `w * r = pi_new / mu` formed directly and
-        # the clip taken on the log-ratio: a uniform draw far into a narrow
-        # Gaussian's tail has `pi_old(x)` underflowing, so `r` alone can overflow
-        # (and `w * r` would be `0 * inf`) where the product is perfectly finite.
-        log_ratio = new_gaussian_log_prob - old_gaussian_log_prob
-        unclipped = jnp.exp(new_gaussian_log_prob - behavior_log_prob) * advantage
-        clipped = is_weight * jnp.exp(
-            jnp.clip(log_ratio, jnp.log1p(-clip_eps), jnp.log1p(clip_eps))
-        ) * advantage
-        gaussian_surrogate = jnp.minimum(unclipped, clipped)
+        # The categorical factor's sample is the entry alone; the Gaussian
+        # factor's is the entry together with its value.
+        category_log_weight = old_category_log_prob - behavior_category_log_prob
+        gaussian_log_weight = old_category_log_prob + old_gaussian_log_prob - behavior_joint_log_prob
+        category_is_weight = jnp.exp(category_log_weight)
+        is_weight = jnp.exp(gaussian_log_weight)
+        category_surrogate = decoupled_surrogate(
+            new_category_log_prob - old_category_log_prob, category_log_weight
+        )
+        gaussian_surrogate = decoupled_surrogate(
+            new_gaussian_log_prob - old_gaussian_log_prob, gaussian_log_weight
+        )
+    if category_update == "neurd":
+        if raw_advantage is None:
+            raise ValueError("category_update='neurd' needs the unnormalized raw_advantage")
+        # This sample's estimate of every entry's advantage: the drawn entry's,
+        # importance-weighted (see `neurd_log_weight`), and zero for the rest.
+        log_weight = neurd_log_weight(
+            is_gaussian, old_gaussian_log_prob, behavior_category_log_prob, behavior_joint_log_prob
+        )
+        weight = jnp.exp(jnp.minimum(log_weight, 50.0))
+        sampled = jax.nn.one_hot(episode.component, logits.shape[-1], dtype=logits.dtype)
+        estimate = sampled * jnp.clip(raw_advantage * weight, -neurd_clip, neurd_clip)
+        # The entropy bonus and the magnet as a per-entry reward, exact for every entry.
+        log_policy = masked_log_softmax(logits, mask)
+        log_magnet = masked_log_softmax(episode.magnet_logits, mask)
+        regularization = (
+            -category_entropy_coef * log_policy
+            - magnet_category_kl_coef * (log_policy - log_magnet)
+        )
+        category_policy_loss, neurd_gated_frac = neurd_category_loss(
+            logits, mask, jax.lax.stop_gradient(estimate + regularization), neurd_beta
+        )
+    elif category_update == "ppo":
+        category_policy_loss = -category_surrogate
+        neurd_gated_frac = jnp.zeros(())
+    else:
+        raise ValueError(f"category_update must be one of {CATEGORY_UPDATES}, got {category_update!r}")
     gaussian_policy_loss = -is_gaussian * gaussian_surrogate
     policy_loss = category_policy_loss + gaussian_policy_loss
 
@@ -920,23 +1025,29 @@ def mixture_ppo_loss_from_outputs(
         * gaussian_kl(means, scale_trils, episode.magnet_means, episode.magnet_scale_trils)
     )
 
+    # Under NeuRD the categorical entropy and magnet already sit inside the
+    # per-entry advantages; as loss terms their gradients would carry the very
+    # `pi` factor NeuRD exists to remove.
+    category_regularized = 0.0 if category_update == "neurd" else 1.0
     loss = (
         policy_loss
         + value_coef * value_loss
-        - category_entropy_coef * category_entropy
+        - category_regularized * category_entropy_coef * category_entropy
         - gaussian_entropy_coef * action_entropy
         + trpo_category_kl_coef * trpo_category_kl
         + trpo_gaussian_kl_coef * trpo_gaussian_kl
-        + magnet_category_kl_coef * magnet_category_kl
+        + category_regularized * magnet_category_kl_coef * magnet_category_kl
         + magnet_gaussian_kl_coef * magnet_gaussian_kl
         + mean_box_penalty
     )
 
-    # Both Gaussian diagnostics are expectations under `pi_old`, so they carry
-    # the same importance weight (exactly 1 on an on-policy batch).
-    category_approx_kl = old_category_log_prob - new_category_log_prob
+    # Every diagnostic is an expectation under `pi_old`, so each carries its
+    # factor's importance weight (exactly 1 on an on-policy batch).
+    category_approx_kl = category_is_weight * (old_category_log_prob - new_category_log_prob)
     gaussian_approx_kl = is_gaussian * is_weight * (old_gaussian_log_prob - new_gaussian_log_prob)
-    category_clip_frac = (jnp.abs(category_ratio - 1.0) > clip_eps).astype(jnp.float32)
+    category_clip_frac = category_is_weight * (
+        jnp.abs(category_ratio - 1.0) > clip_eps
+    ).astype(jnp.float32)
     gaussian_clip_frac = is_gaussian * is_weight * (
         jnp.abs(gaussian_ratio - 1.0) > clip_eps
     ).astype(jnp.float32)
@@ -964,6 +1075,8 @@ def mixture_ppo_loss_from_outputs(
         "magnet_category_kl": magnet_category_kl,
         "magnet_gaussian_kl": magnet_gaussian_kl,
         "mean_box_penalty": jnp.asarray(mean_box_penalty, dtype=jnp.float32),
+        # Share of legal entries whose NeuRD update was dropped at the logit bound.
+        "neurd_gated_frac": neurd_gated_frac,
     }
     return loss, metrics
 
@@ -1002,6 +1115,10 @@ def mixture_ppo_loss(
     magnet_category_kl_coef: float,
     magnet_gaussian_kl_coef: float,
     mean_box_penalty_coef: float = 0.0,
+    raw_advantage: chex.Array | None = None,
+    category_update: str = "ppo",
+    neurd_beta: float = 2.0,
+    neurd_clip: float = 10.0,
 ) -> tuple[chex.Array, dict[str, chex.Array]]:
     """`mixture_ppo_loss_from_outputs`, forward-passing `params` at `episode.obs` first."""
     logits, raw_means, scale_trils, value_pred = network.apply(
@@ -1016,11 +1133,58 @@ def mixture_ppo_loss(
         clip_eps, value_coef, category_entropy_coef, gaussian_entropy_coef,
         trpo_category_kl_coef, trpo_gaussian_kl_coef,
         magnet_category_kl_coef, magnet_gaussian_kl_coef, mean_box_penalty,
-        low=lows, high=highs,
+        low=lows, high=highs, raw_advantage=raw_advantage, category_update=category_update,
+        neurd_beta=neurd_beta, neurd_clip=neurd_clip,
     )
 
 
 OPPONENT_CORRECTIONS = ("none", "future", "future_and_past")
+CATEGORY_UPDATES = ("ppo", "neurd")
+
+
+def neurd_category_loss(
+    logits: chex.Array, mask: chex.Array, advantages: chex.Array, beta: float
+) -> tuple[chex.Array, chex.Array]:
+    """NeuRD's categorical loss at one state, and the share of legal entries it gated.
+
+    `-sum_k y_k * A_k` over the legal entries, with `y` the logits centered over
+    them and `advantages` (one per entry) held constant. Its gradient on `y_k` is
+    the advantage itself -- no softmax Jacobian, so no `pi_k` factor, which is
+    what lets an entry the policy has all but stopped picking come back as fast
+    as it left (Hennes et al., 2020). An entry's update is dropped where it
+    would push `y_k` further past `beta` (up, with a positive advantage) or past
+    `-beta` (down, with a negative one): that keeps the centered logits within
+    `[-beta, beta]` without biasing anything inside the band, while a push back
+    inside always goes through in full.
+    """
+    legal = mask.astype(logits.dtype)
+    num_legal = jnp.maximum(jnp.sum(legal), 1.0)
+    centered = logits - jnp.sum(logits * legal) / num_legal
+    level = jax.lax.stop_gradient(centered)
+    advantages = jax.lax.stop_gradient(advantages)
+    pushed_out = ((advantages > 0.0) & (level >= beta)) | ((advantages < 0.0) & (level <= -beta))
+    force = legal * jnp.where(pushed_out, 0.0, advantages)
+    return -jnp.sum(centered * force), jnp.sum(legal * pushed_out) / num_legal
+
+
+def neurd_log_weight(
+    is_gaussian: chex.Array,
+    gaussian_log_prob: chex.Array,
+    behavior_category_log_prob: chex.Array,
+    behavior_joint_log_prob: chex.Array,
+) -> chex.Array:
+    """`log` of the importance weight NeuRD puts on the drawn entry's advantage.
+
+    An atom's is `1 / mu(k)`. A Gaussian entry's is `N_k(x) / mu(k, x)`, with
+    `N_k` the sampling-time policy's density of the value played: that makes
+    the estimate the entry's advantage when bet at its *own* sizes, so a size
+    exploration drew far from the component contributes next to nothing, where
+    `1 / mu(k)` alone would credit the component with it. Both are `1 / pi(k)`
+    on an on-policy batch, and at most `1 / ((1 - eps) pi(k))` otherwise.
+    """
+    return jnp.where(
+        is_gaussian > 0, gaussian_log_prob - behavior_joint_log_prob, -behavior_category_log_prob
+    )
 
 
 def build_mixture_ppo_loss_fn(
@@ -1040,6 +1204,9 @@ def build_mixture_ppo_loss_fn(
     vtrace_c_bar: float = 1.0,
     vtrace_opponent_correction: str = "none",
     vtrace_opponent_past_floor: float = 0.05,
+    category_update: str = "ppo",
+    neurd_beta: float = 2.0,
+    neurd_clip: float = 10.0,
 ):
     """`player`'s PPO loss over a whole `Episode` batch, one-shot or sequential alike.
 
@@ -1099,6 +1266,11 @@ def build_mixture_ppo_loss_fn(
         is the self-normalized weighted mean. Moves the state distribution
         (and, with hidden information, the beliefs) towards the opponent's
         policy while exploration-only states keep some weight.
+
+    `category_update` picks the categorical head's update: `"ppo"`, the clipped
+    surrogate, or `"neurd"` (see `mixture_ppo_loss_from_outputs` and
+    `neurd_category_loss`), which reads the unnormalized advantage. `neurd_beta`
+    bounds its centered logits and `neurd_clip` its importance-weighted advantage.
     """
     if player not in (0, 1):
         raise ValueError(f"player must be 0 or 1, got {player}")
@@ -1115,6 +1287,10 @@ def build_mixture_ppo_loss_fn(
         raise ValueError("vtrace_opponent_correction needs advantage_estimator='vtrace'")
     if not 0.0 < vtrace_opponent_past_floor <= 1.0:
         raise ValueError(f"vtrace_opponent_past_floor must lie in (0, 1], got {vtrace_opponent_past_floor}")
+    if category_update not in CATEGORY_UPDATES:
+        raise ValueError(f"category_update must be one of {CATEGORY_UPDATES}, got {category_update!r}")
+    if neurd_beta <= 0.0 or neurd_clip <= 0.0:
+        raise ValueError(f"neurd_beta and neurd_clip must be positive, got {neurd_beta} and {neurd_clip}")
     if advantage_estimator == "vtrace" and shared_obs:
         raise ValueError("advantage_estimator='vtrace' needs per-decision observations; shared_obs is one-shot only")
 
@@ -1122,6 +1298,9 @@ def build_mixture_ppo_loss_fn(
         category_entropy_coef, gaussian_entropy_coef,
         trpo_category_kl_coef, trpo_gaussian_kl_coef,
         magnet_category_kl_coef, magnet_gaussian_kl_coef,
+    )
+    category_update_kwargs = dict(
+        category_update=category_update, neurd_beta=neurd_beta, neurd_clip=neurd_clip
     )
 
     def loss_fn(
@@ -1140,10 +1319,12 @@ def build_mixture_ppo_loss_fn(
         weight = player_weight(batch, player)
         # Normalized over the player's own decisions, across the whole batch:
         # a batch statistic, so it has to be computed before the per-sample vmap.
-        advantage = normalized_advantage(batch.reward - batch.value, weight)
+        raw_advantage = batch.reward - batch.value
+        advantage = normalized_advantage(raw_advantage, weight)
 
         flat = flatten_batch_axes(batch)
         flat_weight, flat_advantage = weight.reshape(-1), advantage.reshape(-1)
+        flat_raw_advantage = raw_advantage.reshape(-1)
 
         if shared_obs:
             logits, raw_means, scale_trils, value_pred = network.apply(
@@ -1152,21 +1333,21 @@ def build_mixture_ppo_loss_fn(
             means, mean_box_penalty = projected_means_and_penalty(
                 network, raw_means, mean_box_penalty_coef
             )
-            per_sample_loss, metrics = jax.vmap(
-                mixture_ppo_loss_from_outputs,
-                in_axes=(None, None, None, None, None, 0, 0, None, None, None, None, None, None, None, None, None),
-            )(
-                logits, means, scale_trils, value_pred, network.num_atoms, flat, flat_advantage,
-                clip_eps, value_coef, *coefs, mean_box_penalty,
-            )
+
+            def per_sample(episode, adv, raw_adv):
+                return mixture_ppo_loss_from_outputs(
+                    logits, means, scale_trils, value_pred, network.num_atoms, episode, adv,
+                    clip_eps, value_coef, *coefs, mean_box_penalty,
+                    raw_advantage=raw_adv, **category_update_kwargs,
+                )
         else:
-            per_sample_loss, metrics = jax.vmap(
-                mixture_ppo_loss,
-                in_axes=(None, None, 0, 0, None, None, None, None, None, None, None, None, None),
-            )(
-                params, network, flat, flat_advantage, clip_eps, value_coef, *coefs,
-                mean_box_penalty_coef,
-            )
+            def per_sample(episode, adv, raw_adv):
+                return mixture_ppo_loss(
+                    params, network, episode, adv, clip_eps, value_coef, *coefs,
+                    mean_box_penalty_coef, raw_advantage=raw_adv, **category_update_kwargs,
+                )
+
+        per_sample_loss, metrics = jax.vmap(per_sample)(flat, flat_advantage, flat_raw_advantage)
 
         loss = masked_mean(per_sample_loss, flat_weight)
         metrics = jax.tree_util.tree_map(lambda m: masked_mean(m, flat_weight), metrics)
@@ -1239,14 +1420,16 @@ def build_mixture_ppo_loss_fn(
         # The value head regresses on `reward`; here that is the V-trace target.
         scored = flat.replace(reward=targets.vs.reshape(-1))
 
-        def per_sample(logits, means, scale_trils, value_pred, episode, adv, penalty):
+        def per_sample(logits, means, scale_trils, value_pred, episode, adv, raw_adv, penalty):
             return mixture_ppo_loss_from_outputs(
                 logits, means, scale_trils, value_pred, network.num_atoms, episode, adv,
                 clip_eps, value_coef, *coefs, penalty, low=low, high=high,
+                raw_advantage=raw_adv, **category_update_kwargs,
             )
 
         per_sample_loss, metrics = jax.vmap(per_sample)(
-            logits, means, scale_trils, value_pred, scored, flat_advantage, mean_box_penalty
+            logits, means, scale_trils, value_pred, scored, flat_advantage,
+            targets.pg_advantage.reshape(-1), mean_box_penalty,
         )
         if vtrace_opponent_correction == "future_and_past":
             past = opponent_past_weight(weight > 0, opponent_log_rhos, vtrace_opponent_past_floor)

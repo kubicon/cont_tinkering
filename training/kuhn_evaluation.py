@@ -262,6 +262,10 @@ def build_kuhn_strategy_log_fn(game: ContinuousKuhnPoker, num_grid_points: int =
     size conditional on betting, plus the probability of calling a bet of the
     middle size. A coarse grid is plenty -- this is a readout, not a measurement,
     and `build_kuhn_metric_fn` is what produces numbers to trust.
+
+    Below each player's line, the raw mixture at its opening node, per card:
+    every Gaussian component as `weight x (mean ± sigma)`, the weight joint with
+    betting at all and sigma the (clamped) standard deviation actually sampled.
     """
     grid = bet_grid(game) if game.max_bet <= game.min_bet else bet_grid(game, num_grid_points)
     middle = grid.shape[0] // 2
@@ -281,6 +285,21 @@ def build_kuhn_strategy_log_fn(game: ContinuousKuhnPoker, num_grid_points: int =
                 for c in range(game.num_cards)
             )
             lines.append(f"  p{player} | {cards}")
+
+            network, params = trainer.networks[player], trainer.params[player]
+            open_node, _ = game.decision_nodes(player)
+            open_mask = expand_kind_mask(game.infoset_action_mask(open_node), network.num_components)
+            for c in range(game.num_cards):
+                logits, means, scale_trils, _ = network.apply(
+                    params, game.infoset_observation(c, open_node, 0.0)
+                )
+                weights = jnp.exp(masked_log_softmax(logits, open_mask))[network.num_atoms:]
+                sigmas = marginal_std(scale_trils)[:, 0]
+                components = "  ".join(
+                    f"{float(w):.2f}x({float(m):.3f}±{float(s):.3f})"
+                    for w, m, s in zip(weights, means[:, 0], sigmas)
+                )
+                lines.append(f"       {labels[c]} | {components}")
         return "\n".join(lines)
 
     return strategy_log_fn

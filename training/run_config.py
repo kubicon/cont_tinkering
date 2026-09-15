@@ -120,12 +120,12 @@ class PPOConfig:
     target_tau: float = 0.001
     magnet_interval: int = 500
 
-    # Off-policy exploration of the continuous action, `train_sequential.py`'s
-    # `self_play` only (`discrete_mmd` never draws a Gaussian, so it is inert
-    # there). With probability `explore_eps` a drawn
-    # Gaussian sample (a bet size) is replaced by a uniform draw on the action
-    # box (on the drawn component's bucket under `network.bucket_means`); the
-    # check/bet choice itself is untouched. Each player's loss
+    # Off-policy exploration, `train_sequential.py`'s `self_play` only
+    # (`discrete_mmd` never samples through the mixture sampler, so it is inert
+    # there). With probability `explore_eps` the action is a uniform draw
+    # instead: the check/bet (fold/call) choice uniformly over the legal kinds,
+    # and a bet's component uniformly with its size uniform on the action box
+    # (on that component's bucket under `network.bucket_means`). Each player's loss
     # importance-weights its own exploratory actions back to its policy, while
     # the opponent's exploration is left in: that is what teaches a player how
     # to answer sizes the opponent's policy never plays. Evaluation and
@@ -163,6 +163,18 @@ class PPOConfig:
     trpo_gaussian_kl_coef: float = 0.05
     magnet_category_kl_coef: float = 0.2
     magnet_gaussian_kl_coef: float = 0.2
+
+    # Categorical head update, `policy: gaussian_mixture` only. "ppo" is the
+    # clipped surrogate. "neurd" is Neural Replicator Dynamics: each logit moves
+    # by its entry's advantage with no `pi` factor, so an action the policy has
+    # all but abandoned recovers as fast as any other; the centered logits stay
+    # within [-neurd_beta, neurd_beta], and each sampled entry's advantage over
+    # its behavior probability is clipped to `neurd_clip`. Under "neurd" the
+    # categorical entropy/magnet coefficients act inside the advantage, in payoff
+    # units, rather than as loss terms.
+    category_update: str = "ppo"
+    neurd_beta: float = 2.0
+    neurd_clip: float = 10.0
 
     # `policy: exp_family` only. A log-linear density has one head, so it has one
     # of each coefficient rather than the mixture's per-head pair. `null` (the
@@ -400,6 +412,27 @@ def _check_advantage(ppo: PPOConfig) -> PPOConfig:
     return dataclasses.replace(ppo, **values)
 
 
+CATEGORY_UPDATES = ("ppo", "neurd")
+
+
+def _check_category_update(ppo: PPOConfig, network: NetworkConfig) -> PPOConfig:
+    """Coerce the NeuRD constants to floats and reject impossible combinations."""
+    if ppo.category_update not in CATEGORY_UPDATES:
+        raise ValueError(
+            f"unknown ppo.category_update {ppo.category_update!r}, choices: {list(CATEGORY_UPDATES)}"
+        )
+    if ppo.category_update != "ppo" and network.policy != "gaussian_mixture":
+        raise ValueError(
+            f"ppo.category_update: {ppo.category_update} needs network.policy: gaussian_mixture, "
+            f"got {network.policy!r}"
+        )
+    values = {name: float(getattr(ppo, name)) for name in ("neurd_beta", "neurd_clip")}
+    for name, value in values.items():
+        if value <= 0.0:
+            raise ValueError(f"ppo.{name} must be positive, got {value}")
+    return dataclasses.replace(ppo, **values)
+
+
 def _check_sigma_bounds(network: NetworkConfig) -> NetworkConfig:
     """Coerce `sigma_min` / `sigma_max` to floats and reject impossible bounds.
 
@@ -454,6 +487,7 @@ def run_config_from_dict(raw: dict) -> RunConfig:
         raise ValueError(f"ppo.explore_eps must lie in [0, 1), got {ppo.explore_eps}")
     ppo = dataclasses.replace(ppo, explore_eps=float(ppo.explore_eps))
     ppo = _check_advantage(ppo)
+    ppo = _check_category_update(ppo, network)
 
     train = _build_dataclass(TrainConfig, raw.get("train", {}) or {})
     if train.solver not in SOLVERS:

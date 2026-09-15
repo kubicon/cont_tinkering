@@ -102,11 +102,11 @@ class MixturePPOHyperparams(PPOHyperparams):
     # One fixed bucket of `[low, high]` per component, its mean kept inside it
     # and started at its center; see `training.mixture.MixtureActorCritic`.
     bucket_means: bool = False
-    # Off-policy exploration of the continuous action (sequential self-play
-    # only): with this probability a drawn Gaussian sample is replaced by a
-    # uniform draw on `[low, high]` (the drawn component's bucket under
-    # `bucket_means`), and the loss importance-weights it back to
-    # the policy (see `training.mixture.sample_mixture_component`). 0 disables it.
+    # Off-policy exploration (sequential self-play only): with this probability
+    # the action is a uniform draw -- a legal kind uniformly, then a component,
+    # then a value on `[low, high]` (that component's bucket under
+    # `bucket_means`) -- and the loss importance-weights it back to the policy
+    # (see `training.mixture.sample_mixture_component`). 0 disables it.
     explore_eps: float = 0.0
     # Where the advantage comes from (see `training.mixture.build_mixture_ppo_loss_fn`):
     # "monte_carlo" (the recorded return, no bootstrapping) or "vtrace"
@@ -141,6 +141,15 @@ class MixturePPOHyperparams(PPOHyperparams):
     trpo_gaussian_kl_coef: float = 0.0  # KL(old || current), Gaussian head (old = params at update start).
     magnet_category_kl_coef: float = 0.0  # KL(current || magnet_params), categorical head.
     magnet_gaussian_kl_coef: float = 0.0  # KL(current || magnet_params), Gaussian head.
+    # How the categorical head is updated (see `training.mixture.
+    # mixture_ppo_loss_from_outputs`): "ppo", the clipped surrogate, or "neurd",
+    # Neural Replicator Dynamics -- centered logits bounded to
+    # `[-neurd_beta, neurd_beta]`, each sampled entry's importance-weighted
+    # advantage clipped to `neurd_clip`, and the categorical entropy/magnet
+    # coefficients applied inside the advantage rather than as loss terms.
+    category_update: str = "ppo"
+    neurd_beta: float = 2.0
+    neurd_clip: float = 10.0
 
     @classmethod
     def from_dict(cls, data: dict) -> "MixturePPOHyperparams":

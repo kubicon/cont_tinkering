@@ -83,6 +83,9 @@ def build_hyperparams(game: ZeroSumGame, player: int, config: RunConfig) -> Mixt
         trpo_gaussian_kl_coef=ppo.trpo_gaussian_kl_coef,
         magnet_category_kl_coef=ppo.magnet_category_kl_coef,
         magnet_gaussian_kl_coef=ppo.magnet_gaussian_kl_coef,
+        category_update=ppo.category_update,
+        neurd_beta=ppo.neurd_beta,
+        neurd_clip=ppo.neurd_clip,
     )
 
 
