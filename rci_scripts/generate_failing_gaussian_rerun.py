@@ -46,19 +46,20 @@ DEFAULT_GPU = False
 
 # Every job gets one CPU and runs its seeds one after another, so a job's wall-time is
 # (hours per seed) x (number of seeds). Hours per seed on one core, estimated from the
-# single-seed local run of this grid (4 cells sharing an 8-core machine, i.e. ~2 cores
-# each): rot3/rot2/mp idealized ~8.5/6.8/2.8 h, sampled ~2.4/2.0/0.1 h, ppo ~1.2/0.7/0.2 h
-# -- doubled for one core. The job requests TIME_SAFETY times that, capped by SLURM at 72.
+# single-seed local run of this grid at 100k iterations (4 cells sharing an 8-core
+# machine, i.e. ~2 cores each): rot3/rot2/mp idealized ~8.5/6.8/2.8 h, sampled
+# ~2.4/2.0/0.1 h, ppo ~1.2/0.7/0.2 h -- doubled for one core, then halved for the
+# current 50k (`train.steps: 100`). The job requests TIME_SAFETY times that, capped at 72.
 SEED_HOURS: dict[tuple[str, str], float] = {
-    ("rot3", "idealized"): 17.0, ("rot2", "idealized"): 14.0, ("mp", "idealized"): 6.0,
-    ("rot3", "sampled"): 5.0,    ("rot2", "sampled"): 4.0,    ("mp", "sampled"): 0.5,
-    ("rot3", "ppo"): 2.5,        ("rot2", "ppo"): 1.5,        ("mp", "ppo"): 0.5,
+    ("rot3", "idealized"): 8.5,  ("rot2", "idealized"): 7.0,  ("mp", "idealized"): 3.0,
+    ("rot3", "sampled"): 2.5,    ("rot2", "sampled"): 2.0,    ("mp", "sampled"): 0.25,
+    ("rot3", "ppo"): 1.25,       ("rot2", "ppo"): 0.75,       ("mp", "ppo"): 0.25,
 }
 TIME_SAFETY = 1.4
 MAX_TIME_H = 72
 # Scoring every checkpoint of every seed, also on one CPU; the spread measure's payoff
 # matrix makes the rotation games the slow ones.
-SCORE_TIME_H: dict[str, int] = {"rot3": 24, "rot2": 12, "mp": 4}
+SCORE_TIME_H: dict[str, int] = {"rot3": 12, "rot2": 8, "mp": 4}
 SCORE_MEMORY_G = 16
 
 # Slowest first, so the queue starts the long jobs early.

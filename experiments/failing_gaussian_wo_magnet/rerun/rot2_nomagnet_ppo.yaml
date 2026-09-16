@@ -4,7 +4,7 @@
 #
 # One cell of the 3 domains x {magnet, no magnet} x 3 losses grid. Within a domain the
 # magnet pair differs only in `ppo.magnet_gaussian_kl_coef`. Checkpoints land in
-# `data/failing_gaussian_rerun/rot2_nomagnet_ppo` ({step}.pkl, 0..200).
+# `data/failing_gaussian_rerun/rot2_nomagnet_ppo` ({step}.pkl, 0..100).
 
 game:
   name: coupled_rotation
@@ -50,7 +50,7 @@ train:
   mode: self_play
   perspective: 0
   opponent: random
-  steps: 200
+  steps: 100
   epochs: 500
   checkpoint_dir: data/failing_gaussian_rerun/rot2_nomagnet_ppo
   seed: 123

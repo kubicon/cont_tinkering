@@ -48,7 +48,7 @@ train:
   mode: self_play
   perspective: 0
   opponent: random
-  steps: 200
+  steps: 100
   epochs: 500
   checkpoint_dir: data/failing_gaussian_rerun/rot2_nomagnet_sampled
   seed: 123

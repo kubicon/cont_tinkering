@@ -8,9 +8,16 @@ baked into the run.
 bash experiments/failing_gaussian_wo_magnet/rerun/run_all.sh [max_parallel]   # default 4
 ```
 
+That is the original **single-seed** run, read by `analyze.py`. The **multi-seed** run
+(below, "Multiple seeds") is what to use for anything reported.
+
 18 cells, `<domain>_<magnet|nomagnet>_<engine>.yaml`. All of them run
 `train.steps: 200` x `train.epochs: 500` = **100 000 iterations**, logging and
 checkpointing once per step (201 records per cell, `t = 0, 500, ..., 100000`).
+
+> **Changed since that run:** the YAMLs now set `train.steps: 100`, i.e. **50 000
+> iterations** (101 checkpoints, `t = 0, 500, ..., 50000`). The single-seed data in
+> `data/failing_gaussian_rerun/` was produced at 200 steps; the counts below describe it.
 
 ## The three factors
 
@@ -76,3 +83,42 @@ trustworthy 3-D cell, and `rot3_*_idealized` for direction only.
 the exact solver's mirror step `eta` in the `idealized`/`sampled` cells (0.05 for `mp`,
 0.02 for the rotation games) and the network's Adam step in the `ppo` cells (0.001).
 The magnet comparison is within a cell pair; the loss comparison is qualitative.
+
+## Multiple seeds
+
+Three scripts, the same split as `one_shot_neural` / the sequential sweep:
+
+| script | what it does |
+|-|-|
+| `rci_scripts/generate_failing_gaussian_rerun.py` | one single-CPU SLURM job per cell (running its seeds one after another), one scoring job per cell, `run_all.sh`, `run_all_score.sh`, `plot.sh` under `scripts/failing_gaussian_rerun/` |
+| `run_cell.py` | trains one cell over `--seeds`, sequentially on one thread, into `<out>/<cell>/seed<k>/` |
+| `plot.py` | scores every seed's checkpoints (cached as `seed<k>/exploitability.pkl`), then plots mean and 95% CI over seeds |
+
+```bash
+python rci_scripts/generate_failing_gaussian_rerun.py            # --seeds 0 1 2 3 4 by default
+bash scripts/failing_gaussian_rerun/run_all.sh                   # train
+bash scripts/failing_gaussian_rerun/run_all_score.sh             # score, after training
+bash scripts/failing_gaussian_rerun/plot.sh                      # plot from the saved scores
+
+# or locally, one cell
+python experiments/failing_gaussian_wo_magnet/rerun/run_cell.py mp_magnet_ppo --seeds 0 1 2
+python experiments/failing_gaussian_wo_magnet/rerun/plot.py --cells mp_magnet_ppo mp_nomagnet_ppo
+```
+
+The tree is `data/failing_gaussian_rerun_seeds/` -- separate from the single-seed one,
+so the two never mix. Each seed directory holds `run_config.yaml`: the cell's YAML with
+only `train.seed` and `train.checkpoint_dir` changed, so the YAMLs here remain the one
+place hyperparameters are set. The seed drives the network init and PPO batches (`ppo`)
+and the Monte-Carlo draws (`sampled`, via `idealized.sample_seed: null`).
+
+**`idealized` cells run a single seed.** Quadrature payoffs and a config-given init leave
+nothing random, so extra seeds would be copies; their curves are drawn without a band
+(`n=1`).
+
+Plots (`<out>/plots/`): `expl_<domain>_<engine>.png` -- exploitability over iterations,
+magnet vs no magnet, mean line with a 95% t-interval band (`ppo` adds the Polyak target,
+dashed); `mp_means_<engine>.png` -- matching pennies in the plane of the two players'
+means, the mean trajectory with 95% CI ellipses at 12 checkpoints. Add `--show-seeds`
+to draw individual seeds faintly: runs orbiting the Nash out of phase average into a
+spiral that no single run follows, and the plane plot is misleading without them.
+`--no-std` works as in `analyze.py`.
