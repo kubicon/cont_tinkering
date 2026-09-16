@@ -35,6 +35,7 @@ from .mixture import (
     Episode,
     MixtureActorCritic,
     behavior_log_ratio,
+    behavior_uniform_log_ratio,
     component_boxes,
     component_to_kind,
     expand_kind_mask,
@@ -194,6 +195,13 @@ def build_episode_sampler(
                     eps, low, high,
                 )
                 record["behavior_log_ratio"] = jnp.where(actor == TERMINAL, 0.0, log_ratio)
+                uniform_log_ratio = behavior_uniform_log_ratio(
+                    logits, means, scale_trils, mask, component, raw_action, num_atoms,
+                    eps, low, high,
+                )
+                record["behavior_uniform_log_ratio"] = jnp.where(
+                    actor == TERMINAL, 0.0, uniform_log_ratio
+                )
             return next_state, record
 
         init_key, scan_key = jax.random.split(key)
@@ -281,6 +289,13 @@ def _build_mjx_episode_sampler(
             )
             record["behavior_log_ratio"] = jnp.where(
                 record["actor"] == TERMINAL, 0.0, log_ratio
+            )
+            uniform_log_ratio = behavior_uniform_log_ratio(
+                logits, means, scale_trils, mask, component, raw_action, num_atoms,
+                eps, low, high,
+            )
+            record["behavior_uniform_log_ratio"] = jnp.where(
+                record["actor"] == TERMINAL, 0.0, uniform_log_ratio
             )
         return action, record
 

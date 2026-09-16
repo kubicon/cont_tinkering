@@ -35,7 +35,7 @@ from .gaussian import (
     scale_param_size,
     scale_tril_from_log_diag,
 )
-from .vtrace import opponent_past_weight, vtrace
+from .vtrace import opponent_past_weight, range_smoothed_log_rhos, vtrace
 
 SCALE_PARAMETERIZATIONS = ("linear", "log")
 
@@ -400,6 +400,12 @@ class Episode:
     # Zero on padding. What the *opponent's* correction reads, since
     # the loss has only its own player's network (and boxes) to hand.
     behavior_log_ratio: chex.Array | None = None
+    # `()` float per decision, set together with `behavior_log_ratio`: the same
+    # ratio with the policy's continuous value swapped for the exploration
+    # uniform, `log pi_old(k) U(x) - log mu(k, x)` (see
+    # `behavior_uniform_log_ratio`). What `vtrace_opponent_past_floor_mode="range"`
+    # smooths the opponent's past ratios with. Zero on padding.
+    behavior_uniform_log_ratio: chex.Array | None = None
     # `()` float per decision, sequential rollouts only: player 0's reward for
     # this row's transition, the terminal payoff included on the episode's last
     # decision (see `training.sequential_rollout`). What `training.vtrace`
@@ -631,6 +637,40 @@ def behavior_log_ratio(
     target = hybrid_action_log_prob(
         logits, means, scale_trils, mask, component, raw_action, num_atoms
     )
+    behavior = hybrid_action_log_prob(
+        logits, means, scale_trils, mask, component, raw_action, num_atoms, explore_eps, low, high
+    )
+    return jnp.maximum(target - behavior, -50.0)
+
+
+def behavior_uniform_log_ratio(
+    logits: chex.Array,
+    means: chex.Array,
+    scale_trils: chex.Array,
+    mask: chex.Array,
+    component: chex.Array,
+    raw_action: chex.Array,
+    num_atoms: int,
+    explore_eps: chex.Array,
+    low: chex.Array,
+    high: chex.Array,
+) -> chex.Array:
+    """`log pi(k) U(x) - log mu(k, x)`: `behavior_log_ratio` with the policy's value
+    density swapped for the exploration uniform, the categorical head kept.
+
+    For a continuous action the numerator is `sum_k pi(k) U_k(x)` -- the policy's
+    probability of betting at all (or of each component, under per-component
+    boxes) times the uniform density -- so a value explored far outside every
+    Gaussian still carries how likely the policy was to take that *kind* of
+    action. An atom has no value to swap, and this is `behavior_log_ratio` itself.
+    Floored at `-50` alike; a Gaussian draw outside the box has `U = 0` and sits there.
+    """
+    log_probs = masked_log_softmax(logits, mask)
+    lows, highs = jnp.broadcast_to(low, means.shape), jnp.broadcast_to(high, means.shape)
+    inside = jnp.all((raw_action >= lows) & (raw_action <= highs), axis=-1)
+    log_uniform = jnp.where(inside, -jnp.sum(jnp.log(highs - lows), axis=-1), -jnp.inf)
+    continuous = jax.nn.logsumexp(log_probs[num_atoms:] + log_uniform)
+    target = jnp.where(component >= num_atoms, continuous, log_probs[component])
     behavior = hybrid_action_log_prob(
         logits, means, scale_trils, mask, component, raw_action, num_atoms, explore_eps, low, high
     )
@@ -1165,6 +1205,7 @@ def mixture_ppo_loss(
 
 
 OPPONENT_CORRECTIONS = ("none", "future", "future_and_past")
+OPPONENT_PAST_FLOOR_MODES = ("cumulative", "range")
 CATEGORY_UPDATES = ("ppo", "neurd")
 CATEGORY_FLOOR_MODES = ("kind", "entry")
 
@@ -1265,6 +1306,7 @@ def build_mixture_ppo_loss_fn(
     vtrace_c_bar: float = 1.0,
     vtrace_opponent_correction: str = "none",
     vtrace_opponent_past_floor: float = 0.05,
+    vtrace_opponent_past_floor_mode: str = "cumulative",
     category_update: str = "ppo",
     neurd_beta: float = 2.0,
     neurd_clip: float = 10.0,
@@ -1332,6 +1374,19 @@ def build_mixture_ppo_loss_fn(
         (and, with hidden information, the beliefs) towards the opponent's
         policy while exploration-only states keep some weight.
 
+    `vtrace_opponent_past_floor_mode` says how those states keep it:
+
+      * `"cumulative"` -- the product is floored at `vtrace_opponent_past_floor`.
+        Every exploration-only history gets the same weight, so the beliefs
+        there are the exploration's: an explored bet of a size the opponent
+        never plays is as likely to hold its weakest hand as its strongest.
+      * `"range"` -- no hard floor; each opponent row's ratio is smoothed first
+        by `range_smoothed_log_rhos`, so an explored continuous value the policy
+        never plays weighs `vtrace_opponent_past_floor * pi(k) / u(k)`, and the
+        beliefs keep the opponent's policy over *kinds* of action (its betting
+        range) while only the value is exploration's. Being per row, two such
+        rows in one history compound.
+
     `category_update` picks the categorical head's update: `"ppo"`, the clipped
     surrogate, or `"neurd"` (see `mixture_ppo_loss_from_outputs` and
     `neurd_category_loss`), which reads the unnormalized advantage. `neurd_beta`
@@ -1360,6 +1415,11 @@ def build_mixture_ppo_loss_fn(
         raise ValueError("vtrace_opponent_correction needs advantage_estimator='vtrace'")
     if not 0.0 < vtrace_opponent_past_floor <= 1.0:
         raise ValueError(f"vtrace_opponent_past_floor must lie in (0, 1], got {vtrace_opponent_past_floor}")
+    if vtrace_opponent_past_floor_mode not in OPPONENT_PAST_FLOOR_MODES:
+        raise ValueError(
+            f"vtrace_opponent_past_floor_mode must be one of {OPPONENT_PAST_FLOOR_MODES}, "
+            f"got {vtrace_opponent_past_floor_mode!r}"
+        )
     if category_update not in CATEGORY_UPDATES:
         raise ValueError(f"category_update must be one of {CATEGORY_UPDATES}, got {category_update!r}")
     if neurd_beta <= 0.0 or neurd_clip <= 0.0:
@@ -1519,7 +1579,18 @@ def build_mixture_ppo_loss_fn(
             targets.pg_advantage.reshape(-1), mean_box_penalty,
         )
         if vtrace_opponent_correction == "future_and_past":
-            past = opponent_past_weight(weight > 0, opponent_log_rhos, vtrace_opponent_past_floor)
+            floored = opponent_past_weight(weight > 0, opponent_log_rhos, vtrace_opponent_past_floor)
+            if vtrace_opponent_past_floor_mode == "range" and batch.behavior_log_ratio is not None:
+                smoothed = range_smoothed_log_rhos(
+                    opponent_log_rhos,
+                    jnp.where(batch.actor == 1 - player, batch.behavior_uniform_log_ratio, 0.0),
+                    batch.behavior_eps,
+                    vtrace_opponent_past_floor,
+                )
+                past = opponent_past_weight(weight > 0, smoothed, 0.0)
+            else:  # "cumulative", or nobody explored and every weight is one anyway
+                past = floored
+            floored = floored.reshape(-1)
             past = jax.lax.stop_gradient(past).reshape(-1)
             # Self-normalized: the weights are unbounded above and need not sum to the count.
             loss = jnp.sum(past * per_sample_loss) / jnp.maximum(jnp.sum(past), 1e-8)
@@ -1530,7 +1601,9 @@ def build_mixture_ppo_loss_fn(
         if vtrace_opponent_correction != "none":
             metrics["vtrace_opponent_rho"] = masked_mean(targets.opponent_rho.reshape(-1), flat_weight)
         if vtrace_opponent_correction == "future_and_past":
-            at_floor = past <= vtrace_opponent_past_floor * (1.0 + 1e-5)
+            # Under either mode: the share of decisions whose plain product is
+            # at or below the floor, i.e. reached (almost) only by exploration.
+            at_floor = floored <= vtrace_opponent_past_floor * (1.0 + 1e-5)
             metrics["opponent_past_floor_frac"] = masked_mean(at_floor.astype(jnp.float32), flat_weight)
             # Effective sample size of the past weights, as a fraction of the decisions.
             ess = jnp.square(jnp.sum(past)) / jnp.maximum(jnp.sum(jnp.square(past)), 1e-8)

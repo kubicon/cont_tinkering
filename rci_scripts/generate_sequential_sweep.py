@@ -163,6 +163,9 @@ COMMON: dict[str, object] = {
     "ppo.vtrace_c_bar": 1.0,
     "ppo.vtrace_opponent_correction": "future_and_past",
     "ppo.vtrace_opponent_past_floor": 0.1,
+    # "range" keeps the opponent's betting range at sizes only exploration plays
+    # (see `training.vtrace.range_smoothed_log_rhos`); "cumulative" flattens it.
+    "ppo.vtrace_opponent_past_floor_mode": "range",
     "ppo.category_entropy_coef": 0.05,
     "ppo.gaussian_entropy_coef": 0.05,
     "ppo.trpo_category_kl_coef": 0.05,
@@ -202,10 +205,13 @@ SOLVER_ALIASES: dict[str, str] = {
 # "this solver, on COMMON alone" -- worth keeping in, since a sweep of one
 # solver is only readable next to the others on their usual budgets.
 SOLVERS: dict[str, dict[str, object]] = {
-    # The method under test, on COMMON alone (= `configs/kuhn.yaml`).
-    # `steps * epochs` is the whole budget and the entropy bonus is what keeps
-    # the mixture from collapsing onto one bet size early.
-    "self_play": {},
+    # The method under test, on COMMON plus a weaker check/bet (fold/call)
+    # entropy bonus than the other solvers get. `steps * epochs` is the whole
+    # budget and the entropy bonus is what keeps the mixture from collapsing onto
+    # one bet size early.
+    "self_play": {
+        "ppo.category_entropy_coef": 0.02,
+    },
     # Soft-Actor-Critic ablation of self_play: one Gaussian, no KL / magnet
     # pull -- entropy remains. Same schedule and entropy sweep as self_play so
     # the comparison is the mixture + KL regularizers, nothing else.
@@ -228,7 +234,11 @@ SOLVERS: dict[str, dict[str, object]] = {
     # `br_steps * br_epochs` is the PPO budget behind each best response, and
     # everything fictitious play claims rests on that being an actual best
     # response; `eta` is how often a player plays it rather than the average.
+    # One Gaussian, like `sac`: the baselines are compared on a plain Gaussian
+    # policy, not the mixture under test. `num_components` sets the whole run's
+    # architecture here -- NFSP's average net included (see `sequential_oracle`).
     "nfsp": {
+        "network.num_components": 1,
         "nfsp.rounds": 20,
         "nfsp.br_steps": 10000,
         "nfsp.br_epochs": 1,
@@ -241,6 +251,7 @@ SOLVERS: dict[str, dict[str, object]] = {
     # Same oracle budget question, plus the meta-solver: `uniform` is the
     # self-play-ish ablation that says how much of PSRO is the LP.
     "psro": {
+        "network.num_components": 1,
         "psro.rounds": 50,
         "psro.br_steps": 10000,
         "psro.br_epochs": 1,
@@ -275,8 +286,8 @@ SOLVERS: dict[str, dict[str, object]] = {
 # and the active solver's own section are applied -- an `nfsp.*` override never
 # lands in a self_play run. Leduc's tree is larger, so budgets scale up here
 # rather than living as a second copy of every solver block. Do not pin
-# `network.num_components` here: `sac` sets it to 1 in SOLVERS, and GAME wins
-# last so a game-level 3 would silently undo the ablation.
+# `network.num_components` here: `sac`, `nfsp` and `psro` set it to 1 in SOLVERS,
+# and GAME wins last so a game-level 3 would silently undo that.
 GAME_OVERRIDES: dict[str, dict[str, object]] = {
     # Empty on purpose: every game runs the `configs/kuhn.yaml` setting in COMMON.
 }

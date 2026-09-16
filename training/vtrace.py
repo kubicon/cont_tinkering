@@ -166,6 +166,8 @@ def opponent_past_weight(
     only exploration reaches in training (at `floor` times their behavior
     weight), so the player still learns how to answer them. The floor is on the
     *cumulative* product -- a per-row floor would compound to `floor ** k`.
+    `floor=0` is no floor at all, for ratios already smoothed per row by
+    `range_smoothed_log_rhos`.
     """
     chex.assert_equal_shape([own, opponent_log_rhos])
     own = own.astype(opponent_log_rhos.dtype)
@@ -173,3 +175,30 @@ def opponent_past_weight(
     # Rows strictly before t; an own row's own entry is zero, so through t is the same.
     past = jnp.cumsum(opponent_log_rhos, axis=-1)
     return own * jnp.exp(jnp.clip(past, jnp.log(floor), 20.0))
+
+
+def range_smoothed_log_rhos(
+    log_rhos: chex.Array, uniform_log_rhos: chex.Array, explore_eps: chex.Array, floor: float
+) -> chex.Array:
+    """Per-row `log((1 - f) pi(k, x) / mu(k, x) + f pi(k) U(x) / mu(k, x))`, `f = floor * explore_eps`.
+
+    The importance ratio against the policy with its continuous value density
+    mixed towards the exploration uniform by `f` -- the categorical head, i.e.
+    *which kind of action* the policy takes, left as it is. `log_rhos` and
+    `uniform_log_rhos` are `Episode.behavior_log_ratio` and
+    `Episode.behavior_uniform_log_ratio`.
+
+    Where the policy's own density covers `x` this is the plain ratio to within
+    `f`. Where only exploration reaches `x`, the plain ratio is near zero and
+    this is `floor * pi(k) / u(k)` instead: still in proportion to how likely
+    the policy was to take that kind of action at all. That is the difference
+    from `opponent_past_weight`'s floor, which gives every exploration-only
+    history the *same* weight -- in poker, a Jack's and a King's explored bet
+    of an unplayed size alike -- so the states it keeps carry the exploration's
+    card mix rather than the policy's betting range. An atom's ratio is exact
+    either way (the two inputs coincide), and no hard floor is needed: the
+    categorical factor is bounded below by the policy's own probability.
+    """
+    chex.assert_equal_shape([log_rhos, uniform_log_rhos, explore_eps])
+    mix = jnp.clip(floor * explore_eps, 0.0, 1.0)
+    return jnp.logaddexp(jnp.log1p(-mix) + log_rhos, jnp.log(mix) + uniform_log_rhos)

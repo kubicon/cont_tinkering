@@ -21,6 +21,8 @@ from games.sequential_examples import ContinuousKuhnPoker
 from training.config import MixturePPOHyperparams
 from training.mixture import (
     behavior_log_probs,
+    behavior_log_ratio,
+    behavior_uniform_log_ratio,
     build_mixture_network,
     build_mixture_ppo_loss_fn,
     category_floor_penalty,
@@ -32,7 +34,12 @@ from training.mixture import (
 )
 from training.run_config import run_config_from_dict
 from training.sequential_rollout import build_episode_sampler, collect_sequential_batch
-from training.vtrace import opponent_past_weight, reverse_linear_recurrence, vtrace
+from training.vtrace import (
+    opponent_past_weight,
+    range_smoothed_log_rhos,
+    reverse_linear_recurrence,
+    vtrace,
+)
 
 NUM_ENVS = 64
 
@@ -149,6 +156,44 @@ def test_opponent_past_weight_is_the_floored_product_of_earlier_opponent_rows():
                 continue
             past = sum(opponent[e, k] for k in range(t) if not own[e, k])
             np.testing.assert_allclose(got[e, t], max(floor, np.exp(past)), rtol=1e-5)
+
+
+def _opening_ratios(bet_prob, size, component=1, eps=0.2, floor=0.1):
+    """One Kuhn-like opening row -- check, or a bet from two Gaussians at 0.9 +- 0.1
+    on `[0.25, 2]` -- as `(plain, uniform, range-smoothed)` log ratios."""
+    logits = jnp.log(jnp.array([1.0 - bet_prob, bet_prob / 2, bet_prob / 2]))
+    mask = jnp.ones(3, dtype=bool)
+    means, scale_trils = jnp.full((2, 1), 0.9), jnp.full((2, 1, 1), 0.1)
+    low, high = jnp.array([0.25]), jnp.array([2.0])
+    args = (logits, means, scale_trils, mask, jnp.array(component), jnp.array([size]), 1,
+            jnp.array(eps), low, high)
+    plain, uniform = behavior_log_ratio(*args), behavior_uniform_log_ratio(*args)
+    return plain, uniform, range_smoothed_log_rhos(plain, uniform, jnp.array(eps), floor)
+
+
+def test_range_smoothing_keeps_the_betting_range_of_a_size_only_exploration_plays():
+    eps, floor = 0.2, 0.1
+    # A bet of 1.95 sits ~10 sigma out: only exploration plays it, for either hand.
+    weak_plain, _, weak = _opening_ratios(0.25, 1.95, eps=eps, floor=floor)
+    strong_plain, _, strong = _opening_ratios(0.95, 1.95, eps=eps, floor=floor)
+    assert float(jnp.exp(weak_plain)) < 1e-6 and float(jnp.exp(strong_plain)) < 1e-6
+    # The cumulative floor cannot tell the two hands apart ...
+    floored = [float(opponent_past_weight(jnp.array([False, True]), jnp.array([r, 0.0]), floor)[1])
+               for r in (weak_plain, strong_plain)]
+    assert floored == pytest.approx([floor, floor])
+    # ... the smoothed ratio is `floor * pi(bet) / u(bet)`, `u(bet) = 1/2`.
+    assert float(jnp.exp(weak)) == pytest.approx(floor * 0.25 / 0.5, rel=1e-4)
+    assert float(jnp.exp(strong)) == pytest.approx(floor * 0.95 / 0.5, rel=1e-4)
+
+
+def test_range_smoothing_barely_moves_a_ratio_the_policy_covers():
+    eps, floor = 0.2, 0.1
+    plain, _, smoothed = _opening_ratios(0.6, 0.9, eps=eps, floor=floor)
+    assert float(jnp.exp(smoothed)) == pytest.approx(float(jnp.exp(plain)), rel=floor * eps)
+    # An atom has no value to smooth: both ratios coincide and so does the result.
+    plain, uniform, smoothed = _opening_ratios(0.6, 0.9, component=0, eps=eps, floor=floor)
+    assert float(uniform) == pytest.approx(float(plain), abs=1e-6)
+    assert float(smoothed) == pytest.approx(float(plain), abs=1e-6)
 
 
 def test_on_policy_lambda_one_is_the_monte_carlo_return():
@@ -353,6 +398,18 @@ def test_exploring_rollout_records_bounded_behavior_log_ratios():
     assert np.any(ratio[real] != 0.0)
 
 
+def test_exploring_rollout_records_uniform_log_ratios():
+    game = ContinuousKuhnPoker()
+    networks, _, batch, _ = _batch(game, explore_eps=(0.3, 0.3))
+    plain, uniform = np.asarray(batch.behavior_log_ratio), np.asarray(batch.behavior_uniform_log_ratio)
+    real = np.asarray(batch.actor) != TERMINAL
+    atom = real & (np.asarray(batch.component) < networks[0].num_atoms)
+    assert np.all(np.isfinite(uniform))
+    assert np.all(uniform[~real] == 0.0)
+    np.testing.assert_allclose(uniform[atom], plain[atom], atol=1e-5)
+    assert np.any(uniform[real & ~atom] != plain[real & ~atom])
+
+
 @pytest.mark.parametrize("correction", ["future", "future_and_past"])
 def test_opponent_correction_on_an_on_policy_batch_changes_nothing(correction):
     game = _sumo()
@@ -379,6 +436,43 @@ def test_opponent_correction_reweights_an_exploring_batch(make_game, correction)
     assert all(np.all(np.isfinite(np.asarray(g))) for g in jax.tree_util.tree_leaves(grads))
     if correction == "future_and_past":
         assert 0.0 < float(metrics["opponent_past_ess_frac"]) <= 1.0 + 1e-6
+
+
+def test_range_floor_mode_on_an_on_policy_batch_changes_nothing():
+    game = ContinuousKuhnPoker()
+    networks, params, batch, _ = _batch(game)
+    args = (params[1], networks[1], batch, 0.1, 0.5, 0.0)
+    base, _ = _loss_fn(1, "vtrace", vtrace_opponent_correction="future_and_past")(*args)
+    ranged, _ = _loss_fn(1, "vtrace", vtrace_opponent_correction="future_and_past",
+                         vtrace_opponent_past_floor_mode="range")(*args)
+    assert float(ranged) == pytest.approx(float(base), rel=1e-6)
+
+
+@pytest.mark.parametrize("make_game", [ContinuousKuhnPoker, _sumo])
+def test_range_floor_mode_reweights_an_exploring_batch(make_game):
+    game = make_game()
+    networks, params, batch, _ = _batch(game, explore_eps=(0.3, 0.3))
+    # Player 1: every one of its decisions follows a possibly explored move of player 0's.
+    args = (params[1], networks[1], batch, 0.1, 0.5, 0.0)
+    kwargs = dict(vtrace_opponent_correction="future_and_past", vtrace_opponent_past_floor=0.1)
+    cumulative, cumulative_metrics = _loss_fn(1, "vtrace", **kwargs)(*args)
+    fn = jax.value_and_grad(
+        _loss_fn(1, "vtrace", vtrace_opponent_past_floor_mode="range", **kwargs), has_aux=True
+    )
+    (loss, metrics), grads = fn(*args)
+    assert np.isfinite(float(loss)) and float(loss) != pytest.approx(float(cumulative), rel=1e-6)
+    assert all(np.all(np.isfinite(np.asarray(g))) for g in jax.tree_util.tree_leaves(grads))
+    assert 0.0 < float(metrics["opponent_past_ess_frac"]) <= 1.0 + 1e-6
+    # The floor share reads the plain product, so it is the same under either mode.
+    assert float(metrics["opponent_past_floor_frac"]) == pytest.approx(
+        float(cumulative_metrics["opponent_past_floor_frac"])
+    )
+
+
+def test_an_unknown_past_floor_mode_is_rejected():
+    with pytest.raises(ValueError, match="vtrace_opponent_past_floor_mode"):
+        _loss_fn(0, "vtrace", vtrace_opponent_correction="future_and_past",
+                 vtrace_opponent_past_floor_mode="per_row")
 
 
 def test_vtrace_ignores_whatever_sits_on_rows_that_are_not_the_players():
@@ -526,6 +620,7 @@ def test_vtrace_on_a_one_shot_batch_is_rejected():
     dict(advantage="vtrace", vtrace_opponent_correction="past"),
     dict(advantage="monte_carlo", vtrace_opponent_correction="future"),
     dict(advantage="vtrace", vtrace_opponent_correction="future_and_past", vtrace_opponent_past_floor=0.0),
+    dict(advantage="vtrace", vtrace_opponent_correction="future_and_past", vtrace_opponent_past_floor_mode="kind"),
 ])
 def test_bad_vtrace_settings_are_rejected(ppo):
     with pytest.raises(ValueError):
@@ -537,10 +632,13 @@ def test_vtrace_settings_reach_the_hyperparams():
     config = run_config_from_dict({
         "game": {"name": "disk_sumo"},
         "ppo": {"advantage": "vtrace", "gamma": 0.99, "vtrace_lambda": 0.8,
-                "vtrace_opponent_correction": "future_and_past", "vtrace_opponent_past_floor": 0.1},
+                "vtrace_opponent_correction": "future_and_past", "vtrace_opponent_past_floor": 0.1,
+                "vtrace_opponent_past_floor_mode": "range"},
     })
     hyperparams = train.build_hyperparams(config.game.build(), 0, config)
     assert (hyperparams.advantage, hyperparams.gamma, hyperparams.vtrace_lambda) == ("vtrace", 0.99, 0.8)
-    assert (hyperparams.vtrace_opponent_correction, hyperparams.vtrace_opponent_past_floor) == (
-        "future_and_past", 0.1
-    )
+    assert (
+        hyperparams.vtrace_opponent_correction,
+        hyperparams.vtrace_opponent_past_floor,
+        hyperparams.vtrace_opponent_past_floor_mode,
+    ) == ("future_and_past", 0.1, "range")

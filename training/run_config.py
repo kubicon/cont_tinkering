@@ -153,6 +153,11 @@ class PPOConfig:
     # exploration reaches keep being trained on. V-trace only.
     vtrace_opponent_correction: str = "none"
     vtrace_opponent_past_floor: float = 0.05
+    # "cumulative" floors the product itself; "range" smooths each opponent row's
+    # continuous value towards uniform instead, so exploration-only states keep
+    # the opponent's policy over kinds of action (see `training.vtrace.
+    # range_smoothed_log_rhos`).
+    vtrace_opponent_past_floor_mode: str = "cumulative"
 
     # Entropy bonus, split per head.
     category_entropy_coef: float = 0.1
@@ -394,6 +399,7 @@ def _build_dataclass(cls: type, data: dict) -> Any:
 
 ADVANTAGES = ("monte_carlo", "vtrace")
 OPPONENT_CORRECTIONS = ("none", "future", "future_and_past")
+OPPONENT_PAST_FLOOR_MODES = ("cumulative", "range")
 
 
 def _check_advantage(ppo: PPOConfig) -> PPOConfig:
@@ -420,6 +426,11 @@ def _check_advantage(ppo: PPOConfig) -> PPOConfig:
     if not 0.0 < values["vtrace_opponent_past_floor"] <= 1.0:
         raise ValueError(
             f"ppo.vtrace_opponent_past_floor must lie in (0, 1], got {values['vtrace_opponent_past_floor']}"
+        )
+    if ppo.vtrace_opponent_past_floor_mode not in OPPONENT_PAST_FLOOR_MODES:
+        raise ValueError(
+            f"unknown ppo.vtrace_opponent_past_floor_mode {ppo.vtrace_opponent_past_floor_mode!r}, "
+            f"choices: {list(OPPONENT_PAST_FLOOR_MODES)}"
         )
     return dataclasses.replace(ppo, **values)
 

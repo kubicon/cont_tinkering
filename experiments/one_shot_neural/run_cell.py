@@ -134,6 +134,10 @@ class Settings:
     # nfsp / psro
     br_steps: int = 50
     br_epochs: int = 20
+    # Best-response batch (PPO's `num_envs`). 0 uses the game config's `ppo.batch_size`,
+    # same as every other method in the cell; set this to tune nfsp/psro's BR batch on
+    # its own without touching the config every method reads from.
+    br_batch_size: int = 64
     eta: float = 0.1
     sl_steps: int = 400
     average_head: str = "mixture"
@@ -144,18 +148,23 @@ class Settings:
     # its own and not the pseudo-gradient block's above -- notably OGD rather than
     # AdaBelief, and a batch that is the *only* sampling in the update because the
     # gradient itself is exact.
-    rpn_lr: float = 1e-3
+    rpn_lr: float = 3e-4
     rpn_optimizer: str = "optimistic"
-    rpn_optimism: float = 1.0
+    rpn_optimism: float = 0.333
     rpn_max_grad_norm: float = 1.0
     rpn_batch_size: int = 128
-    rpn_noise_dim: int = 16
+    rpn_noise_dim: int = 8
     rpn_activation: str = "mish"
     rpn_normalization: str = "rms_norm"
+    rpn_squash: str = "sigmoid"
     # 0 keeps the exact gradient; > 0 switches this method to the zeroth-order estimator
     # with everything else held fixed, which is the controlled comparison against spg.
     rpn_smooth: int = 0
     rpn_smooth_scale: float = 0.1
+    # 'extragradient' doubles the payoff evaluations per iteration; plan_units accounts
+    # for that via payoff_evals_per_iteration below.
+    rpn_dynamics: str = "extragradient"
+    rpn_extragradient_step: float = 0.01
     # sisa
     atoms: int = 8
     lr_support: float = 1e-2
@@ -195,14 +204,14 @@ def plan_units(method: str, budget: int, settings: Settings, batch_size: int) ->
         return {"iterations": max(int(budget // per), 1), "evals_per_unit": per}
     if method == "rpn_pathwise":
         per = rpn_pathwise_module.payoff_evals_per_iteration(
-            settings.rpn_batch_size, settings.rpn_smooth)
+            settings.rpn_batch_size, settings.rpn_smooth, settings.rpn_dynamics)
         return {"iterations": max(int(budget // per), 1), "evals_per_unit": per}
     if method == "sisa":
         per = 4 * settings.atoms ** 2
         return {"iterations": max(int(budget // per), 1), "evals_per_unit": per}
 
     br_iterations = settings.br_steps * settings.br_epochs
-    per_round = 2 * br_iterations * batch_size
+    per_round = 2 * br_iterations * (settings.br_batch_size or batch_size)
     if method == "nfsp":
         return {"rounds": max(int(budget // per_round), 1), "evals_per_unit": per_round}
     if method == "psro":
@@ -382,6 +391,7 @@ def run_rpn_pathwise(game, oracle, config, plan, settings, seed, writer, score):
         noise_dim = settings.rpn_noise_dim
         activation = settings.rpn_activation
         normalization = settings.rpn_normalization
+        squash = settings.rpn_squash
         optimizer = settings.rpn_optimizer
         lr = settings.rpn_lr
         optimism = settings.rpn_optimism
@@ -389,6 +399,8 @@ def run_rpn_pathwise(game, oracle, config, plan, settings, seed, writer, score):
         batch_size = settings.rpn_batch_size
         smooth = settings.rpn_smooth
         smooth_scale = settings.rpn_smooth_scale
+        dynamics = settings.rpn_dynamics
+        extragradient_step = settings.rpn_extragradient_step
 
     hyperparams = rpn_pathwise_module.hyperparams_from_config(game, config, _Args())
     return rpn_pathwise_module.run_pathwise(
@@ -402,14 +414,16 @@ def run_nfsp(game, oracle, config, plan, settings, seed, writer, score):
         game, oracle, config, rounds=plan["rounds"], br_steps=settings.br_steps,
         br_epochs=settings.br_epochs, eta=settings.eta, sl_steps=settings.sl_steps,
         average_head=settings.average_head, average_components=settings.average_components,
-        samples=settings.samples, seed=seed, writer=writer, score=score)
+        samples=settings.samples, seed=seed, writer=writer, score=score,
+        batch_size=settings.br_batch_size or None)
 
 
 def run_psro(game, oracle, config, plan, settings, seed, writer, score):
     return psro_module.run_psro(
         game, oracle, config, rounds=plan["rounds"], br_steps=settings.br_steps,
         br_epochs=settings.br_epochs, payoff_samples=settings.payoff_samples,
-        meta_solver=settings.meta_solver, seed=seed, writer=writer, score=score)
+        meta_solver=settings.meta_solver, seed=seed, writer=writer, score=score,
+        batch_size=settings.br_batch_size or None)
 
 
 def run_sisa(game, oracle, config, plan, settings, seed, writer, score):

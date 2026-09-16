@@ -77,6 +77,7 @@ def build_hyperparams(game: ZeroSumGame, player: int, config: RunConfig) -> Mixt
         vtrace_c_bar=ppo.vtrace_c_bar,
         vtrace_opponent_correction=ppo.vtrace_opponent_correction,
         vtrace_opponent_past_floor=ppo.vtrace_opponent_past_floor,
+        vtrace_opponent_past_floor_mode=ppo.vtrace_opponent_past_floor_mode,
         category_entropy_coef=ppo.category_entropy_coef,
         gaussian_entropy_coef=ppo.gaussian_entropy_coef,
         trpo_category_kl_coef=ppo.trpo_category_kl_coef,

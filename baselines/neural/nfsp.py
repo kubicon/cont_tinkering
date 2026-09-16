@@ -187,12 +187,17 @@ def run_nfsp(
     seed: int = 0,
     writer: RunWriter | None = None,
     score: bool = True,
+    batch_size: int | None = None,
 ) -> dict:
     """`rounds` of NFSP. Returns the final average/best-response strategies and history.
 
     `score=False` skips the exploitability computation per round (scored offline from
     the checkpoints instead) and is what a wall-time comparison should use: measuring
     NFSP's average policy costs a best response of its own.
+
+    `batch_size`, if given, overrides the game config's `ppo.batch_size` (PPO's
+    `num_envs`) for the best responses -- the batch every other method in a comparison
+    still reads from config.
     """
     if rounds < 1:
         raise ValueError(f"rounds must be at least 1, got {rounds}")
@@ -200,8 +205,9 @@ def run_nfsp(
     dims = tuple(game.action_space(player).shape[0] for player in (0, 1))
     reservoirs = [Reservoir(reservoir_capacity, dims[player], seed + player) for player in (0, 1)]
 
-    br_hp = [bo.br_hyperparams(game, player, config) for player in (0, 1)]
-    sl_hp = [dataclasses.replace(bo.br_hyperparams(game, player, config),
+    envs_override = {"num_envs": batch_size} if batch_size is not None else {}
+    br_hp = [bo.br_hyperparams(game, player, config, **envs_override) for player in (0, 1)]
+    sl_hp = [dataclasses.replace(bo.br_hyperparams(game, player, config, **envs_override),
                                  num_components=average_components)
              for player in (0, 1)]
 

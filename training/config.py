@@ -125,6 +125,11 @@ class MixturePPOHyperparams(PPOHyperparams):
     # exploration reaches keep being trained on. V-trace only.
     vtrace_opponent_correction: str = "none"
     vtrace_opponent_past_floor: float = 0.05
+    # "cumulative" floors the product itself; "range" smooths each opponent row's
+    # continuous value towards uniform instead, so exploration-only states keep
+    # the opponent's policy over kinds of action (see `training.vtrace.
+    # range_smoothed_log_rhos`).
+    vtrace_opponent_past_floor_mode: str = "cumulative"
 
     # Target/magnet parameter tracking (see `training.mixture_trainer.MixtureTrainState`).
     target_tau: float = 0.005  # Polyak-averaging coefficient for `target_params`.

@@ -131,11 +131,16 @@ def run_psro(
     seed: int = 0,
     writer: RunWriter | None = None,
     score: bool = True,
+    batch_size: int | None = None,
 ) -> dict:
     """`rounds` of PSRO. Returns the final meta-strategies, populations, and history.
 
     `score=False` skips the true-exploitability computation per round (scored offline
     from the checkpoints instead); `rl_gap`, which PSRO computes anyway, is kept.
+
+    `batch_size`, if given, overrides the game config's `ppo.batch_size` (PPO's
+    `num_envs`) for the best responses -- the batch every other method in a comparison
+    still reads from config.
     """
     if rounds < 1:
         raise ValueError(f"rounds must be at least 1, got {rounds}")
@@ -151,7 +156,8 @@ def run_psro(
         raise ValueError(f"unknown meta_solver {meta_solver!r} (choices: nash, uniform)")
 
     key = jax.random.PRNGKey(seed)
-    hyperparams = [bo.br_hyperparams(game, player, config) for player in (0, 1)]
+    envs_override = {"num_envs": batch_size} if batch_size is not None else {}
+    hyperparams = [bo.br_hyperparams(game, player, config, **envs_override) for player in (0, 1)]
     networks = [build_mixture_network(hyperparams[player]) for player in (0, 1)]
     empirical = EmpiricalGame(game, _pairwise_payoff_fn(game), payoff_samples)
 
