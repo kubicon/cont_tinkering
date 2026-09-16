@@ -202,7 +202,7 @@ def x_label(x_axis: str, samples: str) -> str:
 def y_label(exact: bool, target: bool) -> str:
     if exact:
         return "exploitability (Polyak target)" if target else "exploitability"
-    return "exploitability lower bound"
+    return "exploitability lower bound (Polyak target where saved)"
 
 
 def draw_panel(ax, by_config: dict[str, list[dict]], x_axis: str, *, samples: str,

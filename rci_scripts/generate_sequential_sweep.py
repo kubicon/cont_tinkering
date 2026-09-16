@@ -211,6 +211,7 @@ SOLVERS: dict[str, dict[str, object]] = {
     # one bet size early.
     "self_play": {
         "ppo.category_entropy_coef": 0.02,
+        "ppo.gaussian_entropy_coef": 0.02,
     },
     # Soft-Actor-Critic ablation of self_play: one Gaussian, no KL / magnet
     # pull -- entropy remains. Same schedule and entropy sweep as self_play so

@@ -433,6 +433,9 @@ class MjxSumoConfig:
     # "auto" uses Warp's device default; staged modes trade copies for stable
     # pointers and fewer expensive CUDA graph recaptures.
     warp_graph_mode: str = "auto"
+    # Warp prints a line per world whenever the solver hits its iteration cap,
+    # which floods the log (GBs per run). Off by default; overflows still warn.
+    warp_warn_solver_iterations: bool = False
 
     def build(self) -> SequentialZeroSumGame:
         return MjxSumo(**dataclasses.asdict(self))
@@ -474,6 +477,7 @@ class MjxAntSumoConfig:
     warp_naconmax: int | None = None
     warp_njmax: int | None = None
     warp_graph_mode: str = "auto"
+    warp_warn_solver_iterations: bool = False
 
     def build(self) -> SequentialZeroSumGame:
         return MjxAntSumo(**dataclasses.asdict(self))

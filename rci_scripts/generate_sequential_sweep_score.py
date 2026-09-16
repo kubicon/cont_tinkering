@@ -115,6 +115,7 @@ def write_score_job_script(
     n_checkpoints: int | None,
     overwrite: bool,
     no_target: bool,
+    no_save_br: bool,
     time_h: int,
     memory_g: int,
     gpu: bool,
@@ -137,6 +138,8 @@ def write_score_job_script(
         flags.append("--overwrite")
     if no_target:
         flags.append("--no-target")
+    if no_save_br:
+        flags.append("--no-save-br")
     joined = " \\\n  ".join(flags)
     body = f"\npython {SCORE} \\\n  {joined}\n"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -180,6 +183,7 @@ def generate(
     n_checkpoints: int | None,
     overwrite: bool,
     no_target: bool,
+    no_save_br: bool,
     time_h: int,
     kuhn_time_h: int,
     memory_g: int,
@@ -206,6 +210,7 @@ def generate(
         "n_checkpoints": n_checkpoints,
         "overwrite": overwrite,
         "no_target": no_target,
+        "no_save_br": no_save_br,
         "time_h": time_h,
         "kuhn_time_h": kuhn_time_h,
         "memory_g": memory_g,
@@ -244,6 +249,7 @@ def generate(
             n_checkpoints=n_checkpoints,
             overwrite=overwrite,
             no_target=no_target,
+            no_save_br=no_save_br,
             time_h=kuhn_time_h if is_kuhn(run) else time_h,
             memory_g=memory_g,
             gpu=gpu,
@@ -313,7 +319,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--no-target", action="store_true",
-        help="skip Polyak-target scoring on Kuhn",
+        help="pass --no-target: skip target_expl on Kuhn, bound the live params on Leduc / Blotto",
+    )
+    ap.add_argument(
+        "--no-save-br", action="store_true",
+        help="pass --no-save-br: do not keep the Leduc / Blotto scoring best responses",
     )
     ap.add_argument(
         "--time", type=int, default=DEFAULT_TIME_H, dest="time_h",
@@ -351,6 +361,7 @@ def main() -> None:
         n_checkpoints=args.n_checkpoints,
         overwrite=args.overwrite,
         no_target=args.no_target,
+        no_save_br=args.no_save_br,
         time_h=args.time_h,
         kuhn_time_h=args.kuhn_time_h,
         memory_g=args.memory_g,

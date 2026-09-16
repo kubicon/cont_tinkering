@@ -20,6 +20,19 @@
 
 game:
   name: mjx_ant_sumo
+  # Warp on an NVIDIA-backed JAX installation, JAX for local CPU smoke tests.
+  # `warp_naconmax` is global across the vmapped batch: 256 contact slots per
+  # world times `ppo.batch_size` (512), the allowance the batch-scaling benchmark
+  # ran with. Raise it with the batch. `warp_njmax` is per world.
+  physics_backend: auto
+  warp_naconmax: 131072
+  warp_njmax: 512
+  # Start with Warp's device default. Benchmark `warp_staged` if profiling
+  # shows repeated CUDA graph captures inside the training scans.
+  warp_graph_mode: auto
+  # Warp prints a line per world whenever the (line search) solver hits its
+  # iteration cap -- GBs of log per run. Buffer overflows still warn when off.
+  warp_warn_solver_iterations: false
   horizon: 250            # control steps; 2 * horizon decisions, 12.5 s at dt 0.05
   ring_radius: 3.0
   start_distance: 2.4     # torso-to-torso at the start
@@ -41,7 +54,7 @@ game:
 
 network:
   policy: gaussian_mixture  # the only policy a sequential game supports
-  hidden_dims: [256, 256]
+  hidden_dims: [512, 512, 512]
   activation: gelu
   normalization: rms_norm
   num_components: 4
@@ -58,6 +71,13 @@ network:
   bucket_means: false
   clip_means: true        # keep the means in the [-1, 1]^8 torque box
   mean_box_penalty_coef: 1.0    # pulls drifted means back to the box edge
+  # `policy: exp_family` only (one-shot games; a sequential run rejects it), so
+  # inert here -- listed so the file shows every field.
+  grid_points: 256
+  num_basis: 8
+  poly_order: 2
+  basis_width_scale: 1.0
+  init_tilt: 0.0
 
 optimizer:
   learning_rate: 0.0003
@@ -68,7 +88,7 @@ optimizer:
 ppo:
   clip_eps: 0.1
   value_coef: 0.5
-  batch_size: 64          # MJX is the cost here; raise this on a GPU
+  batch_size: 512         # throughput plateaus here (A100, Warp); see logs/mjx_batch_scaling.log
   ppo_epochs: 1
   target_tau: 0.001
   magnet_interval: 4000
@@ -76,7 +96,7 @@ ppo:
   # With this probability a sampled force is replaced by a uniform draw on the
   # box (on the component's bucket under `network.bucket_means`); V-trace
   # importance-weights it back to the policy. 0 disables.
-  explore_eps: 0.05
+  explore_eps: 0.2
 
   # V-trace over each player's own decisions (`training/vtrace.py`). gamma 1
   # keeps the zero-sum objective; lambda < 1 is the variance reduction. The
@@ -87,9 +107,14 @@ ppo:
   vtrace_lambda: 0.95
   vtrace_rho_bar: 2.0
   vtrace_c_bar: 1.0
-  # Correct the opponent's exploration after each own decision; not before it
-  # (fully observed state: the past only reweights states, see training/vtrace.py).
-  vtrace_opponent_correction: future
+  # Correct the opponent's exploration both after each own decision and before
+  # it (see training/vtrace.py). The past weights are floored at
+  # `vtrace_opponent_past_floor`; "range" smooths each opponent row's continuous
+  # value towards uniform instead of flooring the product, so states only
+  # exploration reaches keep the opponent's policy over kinds of action.
+  vtrace_opponent_correction: future_and_past
+  vtrace_opponent_past_floor: 0.1
+  vtrace_opponent_past_floor_mode: range   # "cumulative" or "range"
 
   # No atoms: the categorical head only picks which torque component to use.
   category_entropy_coef: 0.04
@@ -100,8 +125,31 @@ ppo:
   magnet_category_kl_coef: 0.2
   magnet_gaussian_kl_coef: 0.2
 
+  # Categorical head update: "ppo" (clipped surrogate) or "neurd" (Neural
+  # Replicator Dynamics; centered logits kept in [-neurd_beta, neurd_beta],
+  # per-entry advantage clipped to neurd_clip).
+  category_update: ppo
+  neurd_beta: 2.0
+  neurd_clip: 10.0
+  # Standardize the advantage per player over the batch; false keeps payoff units.
+  normalize_advantage: true
+  # Probability floor on the categorical head; "kind" or "entry". 0 disables.
+  category_floor: 0.01
+  category_floor_coef: 0.01
+  category_floor_mode: entry
+
+  # `policy: exp_family` only; null reuses the matching `*_gaussian_*` value.
+  density_entropy_coef: null
+  trpo_density_kl_coef: null
+  magnet_density_kl_coef: null
+
 train:
   mode: self_play         # the only mode a sequential game supports
+  # `train_sequential.py` only; `train.py` always runs self-play.
+  solver: self_play
+  # `mode: fixed_opponent` only.
+  perspective: 0
+  opponent: random
   steps: 100               # outer steps: each logs and writes a checkpoint
   epochs: 4000            # raise on a GPU
   checkpoint_dir: data/mjx_ant_sumo

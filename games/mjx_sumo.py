@@ -175,6 +175,7 @@ class MjxSumoBase(SequentialZeroSumGame):
         warp_naconmax: int | None,
         warp_njmax: int | None,
         warp_graph_mode: str,
+        warp_warn_solver_iterations: bool = False,
     ) -> None:
         """Compile the subclass's model onto the selected MJX backend."""
         if physics_backend not in ("auto", "jax", "warp"):
@@ -227,10 +228,26 @@ class MjxSumoBase(SequentialZeroSumGame):
         self.warp_naconmax = warp_naconmax
         self.warp_njmax = warp_njmax
         self.warp_graph_mode = warp_graph_mode
+        self.warp_warn_solver_iterations = bool(warp_warn_solver_iterations)
         self._mj_model = self._build_model()
         self._model = mjx.put_model(
             self._mj_model, impl=backend, graph_mode=graph_mode
         )
+        if backend == "warp" and not warp_warn_solver_iterations:
+            # Warp prints a warning from inside the kernel for every world whose
+            # (line search) solver hits its iteration cap -- with a few thousand
+            # worlds that is millions of lines per run and a multi-GB log. The
+            # capped iterations are a deliberate speed trade-off here, so drop
+            # just those two bits; buffer overflows (dropped contacts) still warn.
+            from mujoco.mjx.third_party.mujoco_warp import OverflowType
+
+            opt = self._model.opt
+            warn = opt._impl.warn_overflow & ~(
+                OverflowType.ITERATIONS | OverflowType.LS_ITERATIONS
+            )
+            self._model = self._model.replace(
+                opt=opt.replace(_impl=opt._impl.replace(warn_overflow=int(warn)))
+            )
         if backend == "warp":
             # Warp allocates contact storage across every later-vmapped world;
             # unlike the JAX backend it requires these capacities up front and
@@ -513,6 +530,7 @@ class MjxSumo(MjxSumoBase):
         warp_naconmax: int | None = None,
         warp_njmax: int | None = None,
         warp_graph_mode: str = "auto",
+        warp_warn_solver_iterations: bool = False,
     ):
         self._init_rules(
             horizon=horizon, ring_radius=ring_radius, start_distance=start_distance,
@@ -547,7 +565,8 @@ class MjxSumo(MjxSumoBase):
         self._speed_scale = max_force / drag if drag > 0.0 else max_force * dt / mass
         self._space = hybrid(NUM_ATOMS, [-1.0, -1.0], [1.0, 1.0])
         self._init_model(
-            physics_backend, warp_naconmax, warp_njmax, warp_graph_mode
+            physics_backend, warp_naconmax, warp_njmax, warp_graph_mode,
+            warp_warn_solver_iterations,
         )
 
     def _build_model(self) -> mujoco.MjModel:
@@ -745,6 +764,7 @@ class MjxLeggedSumo(MjxSumoBase):
         warp_naconmax: int | None = None,
         warp_njmax: int | None = None,
         warp_graph_mode: str = "auto",
+        warp_warn_solver_iterations: bool = False,
     ):
         self._init_rules(
             horizon=horizon, ring_radius=ring_radius, start_distance=start_distance,
@@ -779,7 +799,8 @@ class MjxLeggedSumo(MjxSumoBase):
         self.joint_velocity_scale = float(joint_velocity_scale)
         self._space = hybrid(NUM_ATOMS, [-1.0] * len(self.HINGES), [1.0] * len(self.HINGES))
         self._init_model(
-            physics_backend, warp_naconmax, warp_njmax, warp_graph_mode
+            physics_backend, warp_naconmax, warp_njmax, warp_graph_mode,
+            warp_warn_solver_iterations,
         )
         self._index_model()
 

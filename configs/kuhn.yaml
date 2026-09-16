@@ -19,7 +19,7 @@ game:
 
 network:
   policy: gaussian_mixture   # the only policy a sequential game accepts
-  hidden_dims: [128, 128]
+  hidden_dims: [64, 64]
   activation: gelu
   normalization: rms_norm
   num_components: 4
@@ -58,11 +58,16 @@ ppo:
   vtrace_c_bar: 1.0
   vtrace_opponent_correction: future_and_past
   vtrace_opponent_past_floor: 0.1
+  # "cumulative": floor the opponent's past ratio product at the floor, so every
+  # explored bet of a size the opponent never plays weighs the same whatever its
+  # card. "range": smooth each explored size towards uniform instead, keeping the
+  # opponent's betting range -- its King bets far more often than its Jack.
+  vtrace_opponent_past_floor_mode: range
 
   # The categorical head now carries the fold/check/call decision, so its
   # entropy is what keeps the policy from collapsing to pure play.
-  category_entropy_coef: 0.04
-  gaussian_entropy_coef: 0.04
+  category_entropy_coef: 0.02
+  gaussian_entropy_coef: 0.02
 
   trpo_category_kl_coef: 0.05
   trpo_gaussian_kl_coef: 0.05
@@ -95,6 +100,6 @@ ppo:
 train:
   mode: self_play     # the only mode a sequential game supports
   steps: 200
-  epochs: 1000
-  checkpoint_dir: data/kuhn_test2
+  epochs: 5000
+  checkpoint_dir: data/kuhn_test3
   seed: 0

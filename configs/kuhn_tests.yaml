@@ -38,13 +38,13 @@ network:
   hidden_dims: [64, 64]
   activation: gelu
   normalization: rms_norm
-  num_components: 2
+  num_components: 4
   clip_means: true    # the action *is* the bet size, so keep the means in the betting range
   # Bounds on each Gaussian component's std, as plain sigma in bet units under
   # either scale_parameterization ("log" clips to their logs). null = built-in
   # bounds: 1e-3 below, the box width (max_bet - min_bet = 1.75) above. The
   # initial std is width / (2 * num_components), clipped into these bounds.
-  sigma_min: 0.07
+  sigma_min: 0.1
   sigma_max: null
 
 optimizer:

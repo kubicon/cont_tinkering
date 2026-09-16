@@ -71,11 +71,24 @@ SCORE = "experiments/one_shot_neural/score.py"
 # Shared network / optimizer / PPO block. Method-specific knobs live in
 # `run_cell.Settings` (--set), not here; these only configure the networks every
 # method shares. Matches the historical train.py-style configs the comparison used.
+# Every `training.run_config` field a one-shot run reads is spelled out, at its schema
+# default unless noted, so a generated YAML never silently picks up a changed default.
+# Left out: `network`'s `exp_family`-only basis fields and `ppo.density_*` (run_cell
+# builds the Gaussian mixture), and `train.solver` (train_sequential.py only).
 _SHARED = {
     "network": {
+        "policy": "gaussian_mixture",
         "hidden_dims": [64, 64],
         "activation": "gelu",
         "normalization": "rms_norm",
+        "full_covariance": False,
+        "scale_parameterization": "log",
+        "max_correlation": 0.0,
+        "sigma_min": None,
+        "sigma_max": None,
+        "bucket_means": False,
+        "clip_means": False,
+        "mean_box_penalty_coef": 1.0,
     },
     "optimizer": {
         "learning_rate": 0.0003,
@@ -90,12 +103,32 @@ _SHARED = {
         "ppo_epochs": 2,
         "target_tau": 0.001,
         "magnet_interval": 500,
-        "category_entropy_coef": 0.1,
-        "gaussian_entropy_coef": 0.1,
+        "category_entropy_coef": 0.05,
+        "gaussian_entropy_coef": 0.05,
         "trpo_category_kl_coef": 0.05,
         "trpo_gaussian_kl_coef": 0.05,
         "magnet_category_kl_coef": 0.2,
         "magnet_gaussian_kl_coef": 0.2,
+        # Categorical head update: "ppo" (clipped surrogate) or "neurd".
+        "category_update": "ppo",
+        "neurd_beta": 2.0,
+        "neurd_clip": 10.0,
+        "normalize_advantage": True,
+        # Probability floor on the categorical head; 0 disables.
+        "category_floor": 0.0,
+        "category_floor_coef": 0.01,
+        "category_floor_mode": "kind",
+        # Sequential-only: a one-shot trainer rejects explore_eps > 0, and "vtrace"
+        # needs a game tree. Pinned here so the YAML states what the run did.
+        "explore_eps": 0.0,
+        "advantage": "monte_carlo",
+        "gamma": 1.0,
+        "vtrace_lambda": 0.95,
+        "vtrace_rho_bar": 2.0,
+        "vtrace_c_bar": 1.0,
+        "vtrace_opponent_correction": "none",
+        "vtrace_opponent_past_floor": 0.05,
+        "vtrace_opponent_past_floor_mode": "cumulative",
     },
     "train": {
         "mode": "self_play",
@@ -202,7 +235,7 @@ DEFAULT_METHODS = (
     # "jpspg",
     # "sisa",
 )
-DEFAULT_SEEDS = (0, 1, 2)
+DEFAULT_SEEDS = (0, 1, 2, 3, 4)
 # Shared metric / logging knobs from `run_cell.Settings`, applied to every method's job.
 SHARED_SETTINGS: dict[str, object] = {
     "checkpoints": 40,
@@ -215,34 +248,40 @@ SHARED_SETTINGS: dict[str, object] = {
 # `network.num_components` in the generated YAML.
 METHOD_SETTINGS: dict[str, dict[str, object]] = {
     "mixture": {},
-    "mmd_discrete": {
-        "bins": 51,
-    },
+    # `bins` is not set here: `settings_flags` matches it to each game's
+    # `num_components`, so the discrete grid has the mixture's capacity.
+    "mmd_discrete": {},
     "nfsp": {
-        "br_steps": 50,
-        "br_epochs": 40,
+        "br_steps": 20,
+        "br_epochs": 50,
+        "br_batch_size": 64,
         "eta": 0.1,
         "sl_steps": 400,
         "average_head": "mixture",
         "average_components": 8,
     },
     "psro": {
-        "br_steps": 50,
-        "br_epochs": 40,
+        "br_steps": 20,
+        "br_epochs": 50,
+        "br_batch_size": 64,
         "payoff_samples": 256,
         "meta_solver": "nash",
     },
     "rpn_pathwise": {
-        "rpn_lr": 3e-3,
+        "rpn_lr": 1e-3,
         "rpn_optimizer": "optimistic",
-        "rpn_optimism": 1.0,
+        "rpn_optimism": 0.333,
         "rpn_max_grad_norm": 5.0,
         "rpn_batch_size": 256,
         "rpn_noise_dim": 16,
         "rpn_activation": "mish",
         "rpn_normalization": "rms_norm",
-        "rpn_smooth": 8,
+        "rpn_squash": "sigmoid",
+        "rpn_smooth": 0,
         "rpn_smooth_scale": 0.1,
+        # "extragradient" doubles payoff evals per iteration; plan_units accounts for it.
+        "rpn_dynamics": "extragradient",
+        "rpn_extragradient_step": 0.01,
     },
     # "spg": {
     #     "sigma": 2.0,
@@ -344,13 +383,16 @@ def job_name(game_tag: str, method: str) -> str:
     return f"{game_tag}__{method}"
 
 
-def settings_flags(method: str, extra: list[str] = ()) -> list[str]:
-    """`--set key=value` items for one method: shared + that method's block + CLI extras."""
+def settings_flags(method: str, game_tag: str, extra: list[str] = ()) -> list[str]:
+    """`--set key=value` items for one (game, method) job: shared + that method's block +
+    per-game overrides + CLI extras (last, so they still win)."""
     if method not in METHOD_SETTINGS:
         raise SystemExit(
             f"no METHOD_SETTINGS entry for {method!r}; add one or choose from "
             f"{sorted(METHOD_SETTINGS)}")
     merged = {**SHARED_SETTINGS, **METHOD_SETTINGS[method]}
+    if method == "mmd_discrete":
+        merged["bins"] = GAMES[game_tag]["num_components"]
     flags = [f"{key}={value}" for key, value in merged.items()]
     flags.extend(extra)
     return flags
@@ -527,7 +569,7 @@ def generate(
                     time_h=time_h,
                     memory_g=memory_g,
                     gpu=gpu,
-                    settings=settings_flags(method, settings_extra),
+                    settings=settings_flags(method, tag, settings_extra),
                 )
             job_scripts.append(path)
             written.append(path)

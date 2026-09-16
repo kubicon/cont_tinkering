@@ -112,8 +112,13 @@ def rl_exploitability_bound(
     episodes: int = 20_000,
     key: chex.PRNGKey | None = None,
     evaluator: MixtureEvaluator | None = None,
+    on_response: Callable[[int, so.SequentialBestResponse, float], None] | None = None,
 ) -> dict[str, float]:
     """Train a best response to each side and add up what they win: a lower bound on `expl`.
+
+    `on_response(player, response, value)`, if given, receives each trained
+    response and its measured value (to the responder) once it has been played --
+    the hook a caller saves the responses through; they are discarded otherwise.
 
     The two responses are measured by *playing* them (`MixtureEvaluator`) rather
     than by reading the last training chunk's mean payoff: the chunk average is
@@ -136,6 +141,8 @@ def rl_exploitability_bound(
         key, eval_key = jax.random.split(key)
         mean, _ = scorer.evaluate(pair[0], pair[1], eval_key, num_episodes=episodes)
         values.append(mean if player == 0 else -mean)
+        if on_response is not None:
+            on_response(player, response, float(values[-1]))
     return {"expl_lb": values[0] + values[1], "br_lb_0": values[0], "br_lb_1": values[1]}
 
 

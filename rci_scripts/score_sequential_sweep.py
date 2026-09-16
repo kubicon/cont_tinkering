@@ -23,7 +23,11 @@ The pickle is a dict with numpy arrays ready for later plots:
       "scored_at",
       "steps",          # (T,) checkpoint indices
       "expl",           # (T,) exact exploitability when ``exact`` else NaN
-      "expl_lb",        # (T,) RL lower bound when not exact else NaN
+      "expl_lb",        # (T,) RL lower bound when not exact else NaN -- of the
+                        #      Polyak target where the checkpoint has one (see
+                        #      "scored_params"), of the live params otherwise
+      "scored_params",  # (T,) "target" or "live": which pair expl / expl_lb /
+                        #      br_* / value were computed on ("live" on Kuhn)
       "br_0", "br_1",   # (T,) per-player BR values (exact or lb)
       "value",          # (T,) game value under the pair (exact only; else NaN)
       "target_expl",    # (T,) Polyak iterate on Kuhn when present; else absent
@@ -58,7 +62,11 @@ from baselines.neural.sequential_scoring import (  # noqa: E402
     has_exact_exploitability,
     rl_exploitability_bound,
 )
-from training.checkpoint import load_checkpoint_step_multi, target_entry  # noqa: E402
+from training.checkpoint import (  # noqa: E402
+    load_checkpoint_step_multi,
+    save_checkpoint_step_multi,
+    target_entry,
+)
 from training.config import MixturePPOHyperparams  # noqa: E402
 from training.mixture import build_mixture_network  # noqa: E402
 from training.run_config import load_run_config  # noqa: E402
@@ -72,6 +80,7 @@ DEFAULT_EPISODES = 20_000
 DEFAULT_SEED = 0
 RESULT_FILENAME = "exploitability.pkl"
 CHECKPOINT_DIRNAME = "checkpoints"
+BR_DIRNAME = "br"   # the scoring best responses, per scored checkpoint (non-Kuhn)
 # ``{game}__{solver}[__swept...]__seed{N}`` from generate_sequential_sweep.py
 RUN_NAME_RE = re.compile(
     r"^(?P<game>.+?)__(?P<solver>[^_].*?)(?:__.*)?__seed(?P<seed>\d+)$"
@@ -267,6 +276,18 @@ def load_mixtures(
     return mixtures[0], mixtures[1]
 
 
+def has_target_entries(checkpoint_dir: Path, step: int) -> bool:
+    """Whether a checkpoint carries both players' Polyak targets (``player_{p}_target``).
+
+    Self-play runs (``self_play``, ``sac``, ``discrete_mmd``) do; NFSP, PSRO and
+    RPN have no averaged iterate to store.
+    """
+    entries = load_checkpoint_step_multi(
+        checkpoint_dir, step, hyperparams_cls=MixturePPOHyperparams
+    )
+    return all(target_entry(f"player_{player}") in entries for player in (0, 1))
+
+
 def score_checkpoint(
     game,
     mixtures: tuple[so.PolicyMixture, so.PolicyMixture],
@@ -279,8 +300,12 @@ def score_checkpoint(
     exact_grid: int | None,
     seed: int,
     key: jax.Array,
+    on_response=None,
 ) -> tuple[dict[str, float], jax.Array]:
-    """One checkpoint -> metrics. Kuhn uses the exact tree BR; else trains two BRs."""
+    """One checkpoint -> metrics. Kuhn uses the exact tree BR; else trains two BRs.
+
+    `on_response` is passed to `rl_exploitability_bound` (non-Kuhn only).
+    """
     if exact:
         return exact_kuhn_exploitability(game, mixtures, exact_grid), key
 
@@ -294,8 +319,46 @@ def score_checkpoint(
         seed=seed,
         episodes=episodes,
         key=br_key,
+        on_response=on_response,
     )
     return metrics, key
+
+
+def save_best_responses(
+    br_dir: Path,
+    step: int,
+    responses: dict[int, tuple[so.SequentialBestResponse, float]],
+    info: dict,
+) -> None:
+    """Write one checkpoint's two scoring best responses beside the run.
+
+    ``{br_dir}/{step}.pkl`` holds ``player_0`` / ``player_1`` -- the response
+    *for* that player, against the scored pair's other side -- in the training
+    checkpoints' own format (``load_checkpoint_step_multi``). ``{step}.json``
+    holds, per player, the evaluated value, the last-chunk ``br_value`` and the
+    per-iteration training history, plus ``info`` (budget, seed, which params
+    were scored).
+    """
+    save_checkpoint_step_multi(
+        br_dir,
+        step,
+        {f"player_{player}": (response.hyperparams, response.params)
+         for player, (response, _) in responses.items()},
+    )
+    record = {
+        **info,
+        "step": step,
+        "players": {
+            str(player): {
+                "value": value,
+                "br_value_last_chunk": response.br_value,
+                "opponent_label": response.opponent_label,
+                "history": response.history,
+            }
+            for player, (response, value) in sorted(responses.items())
+        },
+    }
+    (br_dir / f"{step}.json").write_text(json.dumps(record, default=float) + "\n")
 
 
 def score_run(
@@ -310,6 +373,7 @@ def score_run(
     include_target: bool,
     overwrite: bool,
     n_checkpoints: int | None = None,
+    save_br: bool = True,
 ) -> dict:
     out_path = run_dir / RESULT_FILENAME
     if out_path.exists() and not overwrite:
@@ -362,10 +426,18 @@ def score_run(
     wall_time: list[float] = []
     episodes_train: list[float] = []
     env_steps: list[float] = []
+    scored_params: list[str] = []
     have_target = False
 
     for step in steps:
-        mixtures = load_mixtures(checkpoint_dir, step, target=False)
+        # Kuhn scores the live pair here and the target beside it, both exactly.
+        # An approximate BR is too expensive to train twice per checkpoint, so
+        # Leduc / Blotto score one pair: the Polyak target where the checkpoint
+        # has it -- the better-behaved iterate in self-play -- the live one otherwise.
+        use_target = include_target and not exact and has_target_entries(checkpoint_dir, step)
+        scored_params.append("target" if use_target else "live")
+        mixtures = load_mixtures(checkpoint_dir, step, target=use_target)
+        responses: dict[int, tuple[so.SequentialBestResponse, float]] = {}
         metrics, key = score_checkpoint(
             game,
             mixtures,
@@ -377,7 +449,18 @@ def score_run(
             exact_grid=grid,
             seed=seed + step,
             key=key,
+            on_response=(lambda player, response, value:
+                         responses.__setitem__(player, (response, value))) if save_br else None,
         )
+        if responses:
+            save_best_responses(run_dir / BR_DIRNAME, step, responses, {
+                "scored_params": scored_params[-1],
+                "br_steps": br_steps,
+                "br_epochs": br_epochs,
+                "episodes": episodes,
+                "seed": seed + step,
+                "expl_lb": float(metrics["expl_lb"]),
+            })
 
         if exact:
             expl.append(float(metrics["expl"]))
@@ -392,7 +475,7 @@ def score_run(
             br_0.append(float(metrics["br_lb_0"]))
             br_1.append(float(metrics["br_lb_1"]))
             values.append(float("nan"))
-            headline = f"expl_lb={metrics['expl_lb']:+.5f}"
+            headline = f"expl_lb={metrics['expl_lb']:+.5f} ({scored_params[-1]})"
 
         if include_target and exact:
             try:
@@ -440,10 +523,14 @@ def score_run(
         "exact_grid": grid,
         "seed": seed,
         "n_checkpoints": n_checkpoints if not exact else None,
+        # Where the scoring best responses went, `{step}.pkl` / `{step}.json` (see
+        # `save_best_responses`); None when none were trained or saved.
+        "br_dir": BR_DIRNAME if save_br and not exact else None,
         "scored_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "steps": np.asarray(steps, dtype=np.int32),
         "expl": np.asarray(expl, dtype=np.float64),
         "expl_lb": np.asarray(expl_lb, dtype=np.float64),
+        "scored_params": np.asarray(scored_params),
         "br_0": np.asarray(br_0, dtype=np.float64),
         "br_1": np.asarray(br_1, dtype=np.float64),
         "value": np.asarray(values, dtype=np.float64),
@@ -517,7 +604,15 @@ def main() -> None:
     ap.add_argument(
         "--no-target",
         action="store_true",
-        help="skip Polyak-target scoring on Kuhn even when checkpoints carry it",
+        help="never score the Polyak target: on Kuhn skip target_expl, and on "
+             "Leduc / Blotto bound the live params instead of the target",
+    )
+    ap.add_argument(
+        "--no-save-br",
+        action="store_true",
+        help=f"do not keep the approximate best responses (Leduc / Blotto); by default "
+             f"each scored checkpoint's pair goes to <run>/{BR_DIRNAME}/{{step}}.pkl "
+             "with values and training history in {step}.json",
     )
     ap.add_argument(
         "--overwrite",
@@ -563,6 +658,7 @@ def main() -> None:
             include_target=not args.no_target,
             overwrite=args.overwrite,
             n_checkpoints=args.n_checkpoints,
+            save_br=not args.no_save_br,
         )
         print(
             f"  wrote {len(result['steps'])} scores -> {run_dir / RESULT_FILENAME} "
