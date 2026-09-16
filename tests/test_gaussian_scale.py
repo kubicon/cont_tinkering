@@ -31,6 +31,7 @@ from training.gaussian import (
     scale_diagonal,
     scale_param_size,
     scale_tril_from_log_diag,
+    straight_through_clip,
 )
 
 DIM = 3
@@ -139,14 +140,17 @@ def test_clamp_floors_the_diagonal_and_passes_the_gradient_through():
     # Value is projected into the feasible set...
     assert np.allclose(np.array(scale_diagonal(scale)), SIGMA_MIN)
 
-    # ...while the head that produced it still gets a gradient, unlike a plain
-    # clip, which is what lets a collapsed scale recover.
+    # ...while the head that produced it still gets a gradient back into range,
+    # unlike a plain clip, which is what lets a collapsed scale recover.
     def emitted_diagonal(raw):
         packed = pack_scale_tril(raw, DIM, True)
         return jnp.sum(scale_diagonal(clamp_scale_tril(packed, SIGMA_MIN, jnp.inf)))
 
-    grad = jax.grad(emitted_diagonal)(flat)
-    assert np.allclose(np.array(grad[diagonal_slots(DIM, True)]), 1.0)
+    grow = jax.grad(lambda raw: -emitted_diagonal(raw))(flat)
+    assert np.allclose(np.array(grow[diagonal_slots(DIM, True)]), -1.0)
+    # A loss that wants it smaller still has nowhere to take it.
+    shrink = jax.grad(emitted_diagonal)(flat)
+    assert np.allclose(np.array(shrink[diagonal_slots(DIM, True)]), 0.0)
 
 
 def test_natural_gradient_is_the_inverse_fisher_step():
@@ -277,7 +281,7 @@ def test_log_diag_is_positive_far_below_the_floor():
     assert np.all(np.array(scale_diagonal(unclamped)) > 0.0)
 
 
-def test_log_diag_clip_passes_the_gradient_through():
+def test_log_diag_clip_passes_the_gradient_back_into_range():
     flat = _log_flat(jnp.array([-40.0, -40.0, -40.0]))
 
     def emitted(raw):
@@ -285,8 +289,41 @@ def test_log_diag_clip_passes_the_gradient_through():
             scale_tril_from_log_diag(raw, DIM, True, LOG_SIGMA_MIN, jnp.inf)
         )))
 
-    grad = jax.grad(emitted)(flat)
-    assert np.allclose(np.array(grad[diagonal_slots(DIM, True)]), 1.0)
+    grow = jax.grad(lambda raw: -emitted(raw))(flat)
+    assert np.allclose(np.array(grow[diagonal_slots(DIM, True)]), -1.0)
+    shrink = jax.grad(emitted)(flat)
+    assert np.allclose(np.array(shrink[diagonal_slots(DIM, True)]), 0.0)
+
+
+def test_log_diag_ceiling_blocks_the_entropy_push():
+    """Pinned at `sigma_max`, an entropy bonus must not keep growing the raw head.
+
+    With a fully straight-through clip it did: the bonus's constant push on
+    `log sigma` drifted the raw output without bound (Kuhn self-play sweep).
+    """
+    log_sigma_max = 0.5
+    flat = _log_flat(jnp.array([3.0, 3.0, 3.0]))
+
+    def entropy_loss(raw):
+        scale = scale_tril_from_log_diag(raw, DIM, True, LOG_SIGMA_MIN, log_sigma_max)
+        return -gaussian_entropy(scale)
+
+    scale = scale_tril_from_log_diag(flat, DIM, True, LOG_SIGMA_MIN, log_sigma_max)
+    assert np.allclose(np.array(jnp.log(scale_diagonal(scale))), log_sigma_max)
+    assert np.allclose(np.array(jax.grad(entropy_loss)(flat)[diagonal_slots(DIM, True)]), 0.0)
+    # The opposite pull is what brings it back down, and it still arrives.
+    shrink = jax.grad(lambda raw: -entropy_loss(raw))(flat)
+    assert np.allclose(np.array(shrink[diagonal_slots(DIM, True)]), 1.0)
+
+
+def test_straight_through_clip_gradient_is_one_sided_outside_the_range():
+    x = jnp.array([-2.0, 0.5, 3.0])
+    assert np.allclose(np.array(straight_through_clip(x, 0.0, 1.0)), [0.0, 0.5, 1.0])
+    up = jax.grad(lambda v: -jnp.sum(straight_through_clip(v, 0.0, 1.0)))(x)
+    down = jax.grad(lambda v: jnp.sum(straight_through_clip(v, 0.0, 1.0)))(x)
+    # Below: only the step that raises `x` passes. Inside: both. Above: only the one that lowers it.
+    assert np.allclose(np.array(up), [-1.0, -1.0, 0.0])
+    assert np.allclose(np.array(down), [0.0, 1.0, 1.0])
 
 
 def test_max_correlation_bounds_the_condition_number():

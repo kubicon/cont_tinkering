@@ -90,6 +90,10 @@ class RandomizedPolicyHyperparams:
     activation: str = "tanh"
     low: tuple[float, ...] = (0.0,)
     high: tuple[float, ...] = (1.0,)
+    # `tanh` squashes into the box; `wrap` takes the output modulo the box, for periodic
+    # games (`circle`), where a squash turns the box's faces into walls the cyclic dynamics
+    # pile every sample against.
+    squash: str = "tanh"
     # Optimization. The paper's settings: AdaBelief, alpha = 1e-4, sigma = 0.1.
     learning_rate: float = 1e-4
     optimizer: str = "adabelief"
@@ -106,6 +110,14 @@ class RandomizedPolicyHyperparams:
     perturbation_batch: int = 256
     antithetic: bool = True
     dynamics: str = "simultaneous"    # simultaneous | extragradient | optimistic
+    # Polyak-averaged copy of each player's params, updated every step as
+    # `target = target_tau * live + (1 - target_tau) * target`. No magnet: unlike
+    # `training.trainer_common`, the live params never regularize *towards* the target --
+    # there is no density to take a KL between, so nothing here plays that role. The
+    # target exists purely as the slower-moving read-out; `0` disables tracking (the
+    # target stays frozen at its init). Sourced from the shared `ppo.target_tau` field so
+    # the same config value both baselines are compared against also governs this one.
+    target_tau: float = 0.001
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -131,6 +143,7 @@ class RandomizedPolicy(nn.Module):
     low: chex.Array
     high: chex.Array
     activation: str = "tanh"
+    squash: str = "tanh"
 
     @nn.compact
     def __call__(self, obs: chex.Array, noise: chex.Array) -> chex.Array:
@@ -143,6 +156,8 @@ class RandomizedPolicy(nn.Module):
         for dim in self.hidden_dims:
             x = Activation(kind=self.activation)(dense(dim)(x))
         raw = dense(self.action_dim, name="action_head")(x)
+        if self.squash == "wrap":
+            return self.low + (self.high - self.low) * jnp.mod(raw, 1.0)
         # Squashed rather than clipped: a clip would give the whole outside of the box
         # zero gradient, and a zeroth-order estimator cannot route around that.
         return self.low + (self.high - self.low) * 0.5 * (jnp.tanh(raw) + 1.0)
@@ -155,6 +170,7 @@ def build_policy(hyperparams: RandomizedPolicyHyperparams) -> RandomizedPolicy:
         low=jnp.asarray(hyperparams.low),
         high=jnp.asarray(hyperparams.high),
         activation=hyperparams.activation,
+        squash=hyperparams.squash,
     )
 
 
@@ -360,7 +376,7 @@ def run_pseudo_gradient(
                          hyperparams.antithetic, hyperparams.perturbation_batch)
 
     def step(carry, step_key):
-        params, opt_states, previous = carry
+        params, opt_states, previous, target_params = carry
         if hyperparams.dynamics == "extragradient":
             look_key, apply_key = jax.random.split(step_key)
             gradients, evaluations = estimate(params, look_key)
@@ -375,32 +391,39 @@ def run_pseudo_gradient(
             direction, raw, evaluations = _apply_dynamics(
                 hyperparams.dynamics, estimate, params, step_key, previous)
 
-        new_params, new_states = [], []
+        new_params, new_states, new_targets = [], [], []
         for player in (0, 1):
             # optax minimizes; these players ascend their own utility.
             updates, state = optimizer.update(
                 tree_scale(direction[player], -1.0), opt_states[player], params[player])
-            new_params.append(optax.apply_updates(params[player], updates))
+            updated = optax.apply_updates(params[player], updates)
+            new_params.append(updated)
             new_states.append(state)
+            new_targets.append(optax.incremental_update(
+                updated, target_params[player], hyperparams.target_tau))
         metrics = {"evaluations": jnp.asarray(evaluations, dtype=jnp.float64),
                    "grad_norm_0": optax.tree.norm(direction[0])}
-        return (tuple(new_params), tuple(new_states), raw), metrics
+        return (tuple(new_params), tuple(new_states), raw, tuple(new_targets)), metrics
 
     runner = ChunkRunner(lambda n: lambda c, k: jax.lax.scan(step, c, k))
 
     zero_gradients = tuple(jax.tree_util.tree_map(jnp.zeros_like, params[i]) for i in (0, 1))
-    carry = (params, opt_states, zero_gradients)
+    carry = (params, opt_states, zero_gradients, params)
 
     local_history: list[dict] = []
     history = writer.history if writer is not None else local_history
 
     def record(t: int, metrics: dict | None) -> dict:
         nonlocal key
-        key, key_0, key_1 = jax.random.split(key, 3)
+        key, key_0, key_1, target_key_0, target_key_1 = jax.random.split(key, 5)
         strategies = [
             empirical_strategy(sample_actions(policy, carry[0][player], observations[player],
                                               sample_key, samples, hyperparams.noise_dim))
             for player, sample_key in ((0, key_0), (1, key_1))]
+        target_strategies = [
+            empirical_strategy(sample_actions(policy, carry[3][player], observations[player],
+                                              sample_key, samples, hyperparams.noise_dim))
+            for player, sample_key in ((0, target_key_0), (1, target_key_1))]
         entry = {"t": int(t), "wall_time": runner.run_seconds,
                  "compile_time": runner.compile_seconds,
                  # Each utility evaluation averages `utility_samples` action pairs.
@@ -408,6 +431,9 @@ def run_pseudo_gradient(
         if score:
             entry.update(strategy_row(oracle, strategies[0][0], strategies[0][1],
                                       strategies[1][0], strategies[1][1]))
+            entry["target_expl"] = float(oracle.exploitability(
+                target_strategies[0][0], target_strategies[0][1],
+                target_strategies[1][0], target_strategies[1][1]))
         if metrics:
             entry.update({k: float(v) for k, v in metrics.items()})
         if writer is not None:
@@ -416,10 +442,10 @@ def run_pseudo_gradient(
                 support_1=strategies[1][0], weights_1=strategies[1][1]))
         else:
             local_history.append(entry)
-        return entry, strategies
+        return entry, strategies, target_strategies
 
     done, total_evaluations = 0, 0
-    entry, strategies = record(0, None)
+    entry, strategies, target_strategies = record(0, None)
     print_row(entry, ("support_0", "support_1"))
 
     while done < iterations:
@@ -429,7 +455,7 @@ def run_pseudo_gradient(
         done += length
         metrics = jax.device_get(metrics_stack)
         total_evaluations += int(np.sum(np.asarray(metrics["evaluations"])))
-        entry, strategies = record(done, {
+        entry, strategies, target_strategies = record(done, {
             "grad_norm_0": float(np.mean(np.asarray(metrics["grad_norm_0"]))),
             "utility_evaluations": float(total_evaluations),
         })
@@ -438,9 +464,12 @@ def run_pseudo_gradient(
     if writer is not None:
         for player in (0, 1):
             writer.save_params(f"player_{player}", hyperparams, carry[0][player])
-    return {"history": history, "params": carry[0], "policy": policy,
+            writer.save_params(f"target_{player}", hyperparams, carry[3][player])
+    return {"history": history, "params": carry[0], "target_params": carry[3], "policy": policy,
             "support_0": strategies[0][0], "weights_0": strategies[0][1],
             "support_1": strategies[1][0], "weights_1": strategies[1][1],
+            "target_support_0": target_strategies[0][0], "target_weights_0": target_strategies[0][1],
+            "target_support_1": target_strategies[1][0], "target_weights_1": target_strategies[1][1],
             "utility_evaluations": total_evaluations, "estimator": estimator_name,
             "train_seconds": runner.run_seconds, "compile_seconds": runner.compile_seconds}
 
@@ -454,6 +483,7 @@ def hyperparams_from_config(game: ZeroSumGame, config, args) -> RandomizedPolicy
         activation=config.network.activation,
         low=tuple(float(x) for x in lo),
         high=tuple(float(x) for x in hi),
+        squash=getattr(args, "squash", "tanh"),
         learning_rate=args.lr,
         optimizer=args.optimizer,
         max_grad_norm=args.max_grad_norm,
@@ -462,6 +492,7 @@ def hyperparams_from_config(game: ZeroSumGame, config, args) -> RandomizedPolicy
         perturbation_batch=args.perturbation_batch,
         antithetic=not args.no_antithetic,
         dynamics=args.dynamics,
+        target_tau=config.ppo.target_tau,
     )
 
 
@@ -473,6 +504,9 @@ def add_arguments(ap) -> None:
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--optimizer", default="adabelief", help="see training.optimizers.OPTIMIZERS")
     ap.add_argument("--noise-dim", type=int, default=8, help="latent noise fed to the policy")
+    ap.add_argument("--squash", choices=("tanh", "wrap"), default="tanh",
+                    help="map into the action box; 'wrap' (modulo the box) for periodic "
+                         "games such as circle")
     ap.add_argument("--max-grad-norm", type=float, default=0.0,
                     help="clip the pseudo-gradient to this global norm; 0 disables clipping")
     ap.add_argument("--utility-samples", type=int, default=256,
@@ -491,9 +525,13 @@ def report(args, game, game_config, oracle, hyperparams, result, writer, meta) -
     """Shared tail of both CLIs."""
     last = result["history"][-1]
     print(f"\nfinal exploitability {last['expl']:+.5f}  |  "
+          f"target {last['target_expl']:+.5f}  |  "
           f"{result['utility_evaluations']} utility evaluations")
     report_final(oracle, result["support_0"], result["weights_0"],
                  result["support_1"], result["weights_1"])
+    print("  target:")
+    report_final(oracle, result["target_support_0"], result["target_weights_0"],
+                 result["target_support_1"], result["target_weights_1"])
     if writer is not None:
         writer.finish({"final": last, "utility_evaluations": result["utility_evaluations"]})
         print(f"run -> {writer.directory}")
@@ -514,7 +552,8 @@ def main() -> None:
 
     print(f"game    : {type(game).__name__}  {dataclasses.asdict(game_config)}")
     print(f"policy  : randomized network a=f(o,z), noise {hyperparams.noise_dim}, "
-          f"hidden {hyperparams.hidden_dims} (no density -- no magnet, no ratio)")
+          f"hidden {hyperparams.hidden_dims} (no density -- no magnet, no ratio)  "
+          f"target_tau={hyperparams.target_tau}")
     print(f"solver  : simultaneous pseudo-gradient  sigma={hyperparams.sigma}  "
           f"lr={hyperparams.learning_rate}  {hyperparams.optimizer}  "
           f"{'antithetic' if hyperparams.antithetic else 'single-point'}  "

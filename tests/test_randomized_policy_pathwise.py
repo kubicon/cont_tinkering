@@ -27,8 +27,9 @@ _X64_BEFORE = jax.config.jax_enable_x64
 
 from baselines.common import GridOracle, load_game  # noqa: E402
 from baselines.neural.randomized_policy_pathwise import PathwisePolicyHyperparams, \
-    build_pathwise_optimizer, build_policy, build_utility_fn, payoff_evals_per_iteration, \
-    player_gradients, run_pathwise, sample_actions, smoothed_utility_fn  # noqa: E402
+    build_pathwise_optimizer, build_policy, build_utility_fn, extragradient_gradients, \
+    payoff_evals_per_iteration, player_gradients, run_pathwise, sample_actions, \
+    smoothed_utility_fn  # noqa: E402
 
 jax.config.update("jax_enable_x64", _X64_BEFORE)
 
@@ -191,6 +192,38 @@ def test_payoff_eval_cost_matches_what_a_run_reports(game, oracle):
                           samples=256, score=False)
     assert result["payoff_evals"] == 20 * payoff_evals_per_iteration(8, 0)
     assert result["history"][-1]["payoff_evals"] == result["payoff_evals"]
+
+
+def test_extragradient_measures_the_gradient_at_the_lookahead_point(game):
+    """The look-ahead gradient is the plain gradient at `theta + step * g`, for both
+    players at once and with the same key -- not a second sample at the current point."""
+    _, _, utility, params = _setup(game)
+    key = jax.random.PRNGKey(7)
+    step = 0.05
+
+    first = player_gradients(utility, params, key)
+    lookahead = tuple(_shift(params[player], first[player], step) for player in (0, 1))
+    expected = player_gradients(utility, lookahead, key)
+    actual = extragradient_gradients(utility, params, key, step)
+
+    for player in (0, 1):
+        direction = _direction(params[player], 5 + player)
+        assert _dot(actual[player], direction) == pytest.approx(
+            _dot(expected[player], direction), rel=1e-6)
+    # And the look-ahead is a real move: the result is not the gradient at `theta`.
+    assert not np.isclose(_dot(actual[0], first[0]), _dot(first[0], first[0]), rtol=1e-6)
+
+
+def test_extragradient_doubles_the_payoff_eval_cost(game, oracle):
+    assert payoff_evals_per_iteration(64, 0, "extragradient") == 4 * 64
+    assert payoff_evals_per_iteration(64, 3, "extragradient") == 4 * 64 * 4
+
+    hyperparams = PathwisePolicyHyperparams(
+        action_dim=1, hidden_dims=(32,), noise_dim=4, low=(-2.0,), high=(2.0,), batch_size=8,
+        smooth=0, dynamics="extragradient")
+    result = run_pathwise(game, oracle, hyperparams, iterations=20, log_every=10,
+                          samples=256, score=False)
+    assert result["payoff_evals"] == 20 * payoff_evals_per_iteration(8, 0, "extragradient")
 
 
 def test_run_produces_a_history_and_checkpoints(game, oracle, tmp_path):

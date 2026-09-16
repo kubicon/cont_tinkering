@@ -85,23 +85,43 @@ class PathwisePolicyHyperparams:
     normalization: str = "rms_norm"
     low: tuple[float, ...] = (0.0,)
     high: tuple[float, ...] = (1.0,)
+    # How the head's output is mapped into the box. `sigmoid` squashes, which makes the
+    # box's faces walls; `wrap` takes the output modulo the box, which is the right map for
+    # a periodic game (`circle`): under `sigmoid` the cyclic dynamics push every sample
+    # into one face, where the saturated squash kills the gradient and the policy
+    # collapses to a pure strategy there.
+    squash: str = "sigmoid"
     # Optimization. `optimistic` is this variant's own optimizer and is built here rather
     # than by `training.optimizers`, which exposes no `alpha`/`beta`; every other name is
     # looked up there, so the repo's optimizers remain available for comparison.
     optimizer: str = "optimistic"
-    learning_rate: float = 1e-2
+    learning_rate: float = 3e-4
     optimism: float = 1.0             # OGD's `beta`; only read when optimizer == "optimistic"
+    # `simultaneous` hands the gradient at the current point to the optimizer.
+    # `extragradient` (Korpelevich) first steps to a look-ahead point along the clipped
+    # gradient, `theta + extragradient_step * g`, and hands the optimizer the gradient
+    # measured *there*, applied from the original point. Both gradients use the same
+    # action-noise key, so the look-ahead measures the parameter change rather than a new
+    # sample. It doubles the payoff evaluations; pair it with a plain optimizer (`sgd`)
+    # unless the stacking with OGD's own extrapolation is the point.
+    dynamics: str = "simultaneous"
+    extragradient_step: float = 0.0   # look-ahead step size; 0 -> learning_rate
     max_grad_norm: float = 0.0        # 0 disables clipping
     # Action pairs per gradient estimate. Unlike the pseudo-gradient's `utility_samples`
     # this is the *only* sampling in the update, because the gradient itself is exact:
     # there is no perturbation batch to average on top of it.
-    batch_size: int = 64
+    batch_size: int = 512
     # Zeroth-order fallback. `smooth = 0` keeps the exact pathwise gradient; nonzero
     # replaces it with the score-function estimator of the objective smoothed at radius
     # `smooth_scale`, averaged over `smooth` perturbation samples -- which is the papers'
     # access model, reachable from inside this module for a controlled comparison.
-    smooth: int = 0
+    smooth: int = 4
     smooth_scale: float = 0.1
+    # Polyak-averaged copy of each player's params, updated every step as
+    # `target = target_tau * live + (1 - target_tau) * target`. See
+    # `RandomizedPolicyHyperparams.target_tau`: no magnet, purely a trailing readout.
+    # `0` disables tracking (the target stays frozen at its init).
+    target_tau: float = 0.001
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -114,10 +134,11 @@ class PathwisePolicyHyperparams:
         return cls(**data)
 
     def payoff_evals_per_iteration(self) -> int:
-        return payoff_evals_per_iteration(self.batch_size, self.smooth)
+        return payoff_evals_per_iteration(self.batch_size, self.smooth, self.dynamics)
 
 
-def payoff_evals_per_iteration(batch_size: int, smooth: int) -> int:
+def payoff_evals_per_iteration(batch_size: int, smooth: int,
+                               dynamics: str = "simultaneous") -> int:
     """Payoff evaluations one iteration costs, in scored action pairs.
 
     `batch_size` pairs per player's gradient, both players every iteration. Under
@@ -128,8 +149,12 @@ def payoff_evals_per_iteration(batch_size: int, smooth: int) -> int:
     Module-level so `experiments/one_shot_neural/run_cell.py` can price an iteration
     before it has built the hyperparameters -- the budget is in payoff evaluations, and a
     cost formula that lives in two places is one that will disagree with itself.
+
+    `extragradient` measures the gradient twice per iteration -- at the current point and
+    at the look-ahead -- so it doubles all of the above.
     """
-    return 2 * batch_size * (smooth + 1 if smooth else 1)
+    per_gradient = 2 * batch_size * (smooth + 1 if smooth else 1)
+    return 2 * per_gradient if dynamics == "extragradient" else per_gradient
 
 
 class PathwisePolicy(nn.Module):
@@ -152,6 +177,7 @@ class PathwisePolicy(nn.Module):
     high: chex.Array
     activation: str = "mish"
     normalization: str = "rms_norm"
+    squash: str = "sigmoid"
 
     @nn.compact
     def __call__(self, obs: chex.Array, noise: chex.Array) -> chex.Array:
@@ -161,6 +187,10 @@ class PathwisePolicy(nn.Module):
             x = Normalization(kind=self.normalization)(x, use_running_average=True)
             x = Activation(kind=self.activation)(x)
         raw = nn.Dense(self.action_dim, name="action_head")(x)
+        if self.squash == "wrap":
+            # Slope 1 almost everywhere; the jump at the seam is invisible to a periodic
+            # payoff, so mass crosses it as if the box were a torus.
+            return self.low + (self.high - self.low) * jnp.mod(raw, 1.0)
         return self.low + (self.high - self.low) * nn.sigmoid(raw)
 
 
@@ -172,6 +202,7 @@ def build_policy(hyperparams: PathwisePolicyHyperparams) -> PathwisePolicy:
         high=jnp.asarray(hyperparams.high),
         activation=hyperparams.activation,
         normalization=hyperparams.normalization,
+        squash=hyperparams.squash,
     )
 
 
@@ -254,6 +285,32 @@ def player_gradients(utility, params, key: chex.PRNGKey) -> tuple:
     return tuple(gradients)
 
 
+def clip_player_gradients(gradients: tuple, max_grad_norm: float) -> tuple:
+    """Each player's gradient clipped to `max_grad_norm` on its own, as the optimizer
+    chain clips it; `0` leaves them unchanged."""
+    if max_grad_norm <= 0:
+        return gradients
+    clip = optax.clip_by_global_norm(max_grad_norm)
+    return tuple(clip.update(gradient, clip.init(gradient))[0] for gradient in gradients)
+
+
+def extragradient_gradients(utility, params, key: chex.PRNGKey, step_size: float,
+                            max_grad_norm: float = 0.0) -> tuple:
+    """Both players' gradients at the extragradient look-ahead point.
+
+    Both players step to `theta_i + step_size * clip(g_i)` together, and the gradients
+    are measured again there. The same `key` serves both measurements, so the two see one
+    action-noise draw (and, under `--smooth`, one set of perturbations): what differs
+    between them is the parameters alone. The caller applies the result from the
+    *original* point, which is what separates this from two plain steps.
+    """
+    first = clip_player_gradients(player_gradients(utility, params, key), max_grad_norm)
+    lookahead = tuple(
+        jax.tree_util.tree_map(lambda p, g: p + step_size * g, params[player], first[player])
+        for player in (0, 1))
+    return player_gradients(utility, lookahead, key)
+
+
 def build_pathwise_optimizer(hyperparams: PathwisePolicyHyperparams) -> optax.GradientTransformation:
     """This variant's optimizer, with `optimistic` built here and everything else deferred.
 
@@ -288,8 +345,9 @@ def run_pathwise(
 
     Deliberately the same shape as `randomized_policy.run_pseudo_gradient` -- same chunked
     scan, same history rows, same checkpoints -- so the two differ in the gradient and
-    nothing else. There is no `dynamics` switch here: the optimism lives in the optimizer
-    (`optimistic` is OGD), which is where this variant puts it.
+    nothing else. Optimism lives in the optimizer (`optimistic` is OGD); `dynamics`
+    selects only between simultaneous ascent and extragradient, which needs a second
+    gradient and so cannot be an optimizer.
 
     `score=False` records checkpoints, wall time and payoff-evaluation counts but skips
     the exploitability computation, which is scored offline instead (see
@@ -310,44 +368,63 @@ def run_pathwise(
         for player in (0, 1))
     key = init_keys[2]
 
+    if hyperparams.dynamics not in ("simultaneous", "extragradient"):
+        raise ValueError(f"unknown dynamics {hyperparams.dynamics!r} "
+                         "(choices: simultaneous, extragradient)")
+    extragradient_step = hyperparams.extragradient_step or hyperparams.learning_rate
+
     optimizer = build_pathwise_optimizer(hyperparams)
     opt_states = tuple(optimizer.init(params[player]) for player in (0, 1))
     per_iteration = hyperparams.payoff_evals_per_iteration()
 
     def step(carry, step_key):
-        params, opt_states = carry
-        gradients = player_gradients(utility, params, step_key)
+        params, opt_states, target_params = carry
+        if hyperparams.dynamics == "extragradient":
+            gradients = extragradient_gradients(utility, params, step_key, extragradient_step,
+                                                hyperparams.max_grad_norm)
+        else:
+            gradients = player_gradients(utility, params, step_key)
 
-        new_params, new_states = [], []
+        new_params, new_states, new_targets = [], [], []
         for player in (0, 1):
             # optax minimizes; these players ascend their own utility.
             updates, state = optimizer.update(
                 jax.tree_util.tree_map(jnp.negative, gradients[player]),
                 opt_states[player], params[player])
-            new_params.append(optax.apply_updates(params[player], updates))
+            updated = optax.apply_updates(params[player], updates)
+            new_params.append(updated)
             new_states.append(state)
+            new_targets.append(optax.incremental_update(
+                updated, target_params[player], hyperparams.target_tau))
         metrics = {"grad_norm_0": optax.tree.norm(gradients[0])}
-        return (tuple(new_params), tuple(new_states)), metrics
+        return (tuple(new_params), tuple(new_states), tuple(new_targets)), metrics
 
     runner = ChunkRunner(lambda n: lambda c, k: jax.lax.scan(step, c, k))
-    carry = (params, opt_states)
+    carry = (params, opt_states, params)
 
     local_history: list[dict] = []
     history = writer.history if writer is not None else local_history
 
-    def record(t: int, metrics: dict | None) -> tuple[dict, list]:
+    def record(t: int, metrics: dict | None) -> tuple[dict, list, list]:
         nonlocal key
-        key, key_0, key_1 = jax.random.split(key, 3)
+        key, key_0, key_1, target_key_0, target_key_1 = jax.random.split(key, 5)
         strategies = [
             empirical_strategy(sample_actions(policy, carry[0][player], observations[player],
                                               sample_key, samples, hyperparams.noise_dim))
             for player, sample_key in ((0, key_0), (1, key_1))]
+        target_strategies = [
+            empirical_strategy(sample_actions(policy, carry[2][player], observations[player],
+                                              sample_key, samples, hyperparams.noise_dim))
+            for player, sample_key in ((0, target_key_0), (1, target_key_1))]
         entry = {"t": int(t), "wall_time": runner.run_seconds,
                  "compile_time": runner.compile_seconds,
                  "payoff_evals": t * per_iteration}
         if score:
             entry.update(strategy_row(oracle, strategies[0][0], strategies[0][1],
                                       strategies[1][0], strategies[1][1]))
+            entry["target_expl"] = float(oracle.exploitability(
+                target_strategies[0][0], target_strategies[0][1],
+                target_strategies[1][0], target_strategies[1][1]))
         if metrics:
             entry.update({k: float(v) for k, v in metrics.items()})
         if writer is not None:
@@ -356,10 +433,10 @@ def run_pathwise(
                 support_1=strategies[1][0], weights_1=strategies[1][1]))
         else:
             local_history.append(entry)
-        return entry, strategies
+        return entry, strategies, target_strategies
 
     done = 0
-    entry, strategies = record(0, None)
+    entry, strategies, target_strategies = record(0, None)
     print_row(entry, ("support_0", "support_1"))
 
     while done < iterations:
@@ -368,7 +445,7 @@ def run_pathwise(
         carry, metrics_stack = runner(carry, jax.random.split(chunk_key, length), length)
         done += length
         metrics = jax.device_get(metrics_stack)
-        entry, strategies = record(done, {
+        entry, strategies, target_strategies = record(done, {
             "grad_norm_0": float(np.mean(np.asarray(metrics["grad_norm_0"]))),
         })
         print_row(entry, ("grad_norm_0", "support_0", "support_1"))
@@ -376,9 +453,12 @@ def run_pathwise(
     if writer is not None:
         for player in (0, 1):
             writer.save_params(f"player_{player}", hyperparams, carry[0][player])
-    return {"history": history, "params": carry[0], "policy": policy,
+            writer.save_params(f"target_{player}", hyperparams, carry[2][player])
+    return {"history": history, "params": carry[0], "target_params": carry[2], "policy": policy,
             "support_0": strategies[0][0], "weights_0": strategies[0][1],
             "support_1": strategies[1][0], "weights_1": strategies[1][1],
+            "target_support_0": target_strategies[0][0], "target_weights_0": target_strategies[0][1],
+            "target_support_1": target_strategies[1][0], "target_weights_1": target_strategies[1][1],
             "payoff_evals": done * per_iteration,
             "train_seconds": runner.run_seconds, "compile_seconds": runner.compile_seconds}
 
@@ -393,6 +473,7 @@ def hyperparams_from_config(game: ZeroSumGame, config, args) -> PathwisePolicyHy
         normalization=args.normalization,
         low=tuple(float(x) for x in lo),
         high=tuple(float(x) for x in hi),
+        squash=getattr(args, "squash", "sigmoid"),
         optimizer=args.optimizer,
         learning_rate=args.lr,
         optimism=args.optimism,
@@ -400,33 +481,45 @@ def hyperparams_from_config(game: ZeroSumGame, config, args) -> PathwisePolicyHy
         batch_size=args.batch_size,
         smooth=args.smooth,
         smooth_scale=args.smooth_scale,
+        dynamics=getattr(args, "dynamics", "simultaneous"),
+        extragradient_step=getattr(args, "extragradient_step", 0.0),
+        target_tau=config.ppo.target_tau,
     )
 
 
 def add_arguments(ap) -> None:
     """This module's flags. Defaults are the reference implementation's for this variant,
     which is why several differ from `randomized_policy.add_arguments`."""
-    ap.add_argument("--iters", type=int, default=20_000)
+    ap.add_argument("--iters", type=int, default=400_000)
     ap.add_argument("--log-every", type=int, default=None)
-    ap.add_argument("--lr", type=float, default=1e-2)
+    ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--optimizer", default="optimistic",
                     help="'optimistic' is this variant's OGD; any other name is looked up "
                          "in training.optimizers.OPTIMIZERS")
-    ap.add_argument("--optimism", type=float, default=1.0,
+    ap.add_argument("--optimism", type=float, default=0.333,
                     help="OGD's negative-momentum coefficient (only used by 'optimistic')")
-    ap.add_argument("--max-grad-norm", type=float, default=0.0,
+    ap.add_argument("--max-grad-norm", type=float, default=1.0,
                     help="clip the gradient to this global norm; 0 disables clipping")
-    ap.add_argument("--noise-dim", type=int, default=16, help="latent noise fed to the policy")
+    ap.add_argument("--noise-dim", type=int, default=8, help="latent noise fed to the policy")
     ap.add_argument("--activation", default="mish", help="see nets.activations.ACTIVATIONS")
     ap.add_argument("--normalization", default="rms_norm",
                     help="see nets.normalization.NORMALIZATIONS")
-    ap.add_argument("--batch-size", type=int, default=64,
+    ap.add_argument("--squash", choices=("sigmoid", "wrap"), default="sigmoid",
+                    help="map into the action box; 'wrap' (modulo the box) for periodic "
+                         "games such as circle")
+    ap.add_argument("--batch-size", type=int, default=128,
                     help="action pairs averaged per gradient estimate")
     ap.add_argument("--smooth", type=int, default=0,
                     help="0 keeps the exact pathwise gradient; N > 0 replaces it with the "
                          "zeroth-order score-function estimator over N perturbation samples")
     ap.add_argument("--smooth-scale", type=float, default=0.1,
                     help="smoothing radius used by --smooth (the papers' sigma)")
+    ap.add_argument("--dynamics", choices=("simultaneous", "extragradient"),
+                    default="extragradient",
+                    help="'extragradient' steps from the current point with the gradient "
+                         "measured at a look-ahead point (2x payoff evaluations)")
+    ap.add_argument("--extragradient-step", type=float, default=0.01,
+                    help="look-ahead step size for --dynamics extragradient; 0 uses --lr")
 
 
 def main() -> None:
@@ -447,7 +540,12 @@ def main() -> None:
     print(f"game    : {type(game).__name__}  {dataclasses.asdict(game_config)}")
     print(f"policy  : randomized network a=f(o,z), noise {hyperparams.noise_dim}, "
           f"hidden {hyperparams.hidden_dims}, {hyperparams.normalization}/"
-          f"{hyperparams.activation} (no density -- no magnet, no ratio)")
+          f"{hyperparams.activation}, {hyperparams.squash} squash "
+          f"(no density -- no magnet, no ratio)  "
+          f"target_tau={hyperparams.target_tau}")
+    if hyperparams.dynamics == "extragradient":
+        optimizer += (f"  |  extragradient step="
+                      f"{hyperparams.extragradient_step or hyperparams.learning_rate}")
     print(f"solver  : {gradient}  |  {optimizer}  |  batch={hyperparams.batch_size}  "
           f"({hyperparams.payoff_evals_per_iteration()} payoff evaluations/iteration)\n")
 
@@ -461,9 +559,13 @@ def main() -> None:
 
     last = result["history"][-1]
     print(f"\nfinal exploitability {last['expl']:+.5f}  |  "
+          f"target {last['target_expl']:+.5f}  |  "
           f"{result['payoff_evals']} payoff evaluations")
     report_final(oracle, result["support_0"], result["weights_0"],
                  result["support_1"], result["weights_1"])
+    print("  target:")
+    report_final(oracle, result["target_support_0"], result["target_weights_0"],
+                 result["target_support_1"], result["target_weights_1"])
     if writer is not None:
         writer.finish({"final": last, "payoff_evals": result["payoff_evals"]})
         print(f"run -> {writer.directory}")

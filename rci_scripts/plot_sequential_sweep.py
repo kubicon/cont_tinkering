@@ -207,18 +207,31 @@ def y_label(exact: bool, target: bool) -> str:
 
 def draw_panel(ax, by_config: dict[str, list[dict]], x_axis: str, *, samples: str,
                target: bool, linear_y: bool, show_seeds: bool) -> None:
+    panels = []
     for config in sorted(by_config, key=sort_key):
-        runs = by_config[config]
-        color, linestyle, marker = style_for(config)
-        curves = [run_curve(r, x_axis, samples, target) for r in runs]
+        curves = [run_curve(r, x_axis, samples, target) for r in by_config[config]]
         pooled = pool_seeds(curves)
-        if pooled is None:
-            continue
+        if pooled is not None:
+            panels.append((config, curves, pooled))
+
+    # A log axis cannot draw a CI bound <= 0: matplotlib drops those polygon
+    # vertices and bridges the survivors with long diagonal wedges. Clip the
+    # lower bound to the axis floor instead, so it runs off the bottom.
+    floor = None
+    if not linear_y:
+        positive = [p["mean"][p["mean"] > 0] for _, _, p in panels]
+        positive = np.concatenate(positive) if positive else np.array([])
+        if positive.size:
+            floor = 0.5 * positive.min()
+
+    for config, curves, pooled in panels:
+        color, linestyle, marker = style_for(config)
         if show_seeds:
             for _, x, y in curves:
                 ax.plot(x, y, color=color, linewidth=0.7, alpha=0.3, linestyle=linestyle)
         if pooled["n"] > 1:
-            ax.fill_between(pooled["x"], pooled["lo"], pooled["hi"],
+            lo = pooled["lo"] if floor is None else np.maximum(pooled["lo"], floor)
+            ax.fill_between(pooled["x"], lo, pooled["hi"],
                             color=color, alpha=0.15, linewidth=0)
         # Sparse markers keep the marker a secondary cue without cluttering.
         markevery = max(1, len(pooled["x"]) // 8)
@@ -228,6 +241,8 @@ def draw_panel(ax, by_config: dict[str, list[dict]], x_axis: str, *, samples: st
                 label=f"{pretty_label(config)}  (n={pooled['n']})")
     if not linear_y:
         ax.set_yscale("log", nonpositive="mask")
+        if floor is not None:
+            ax.set_ylim(bottom=floor)
     if x_axis == "samples":
         ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
         ax.xaxis.get_offset_text().set_color(MUTED)

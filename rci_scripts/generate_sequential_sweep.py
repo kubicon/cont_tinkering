@@ -88,8 +88,8 @@ TRAIN = "train_sequential.py"
 
 DEFAULT_GAMES = (
     "configs/kuhn_solvers.yaml",
-    # "configs/leduc_solvers.yaml",
-    # "configs/sequential_blotto_solvers.yaml",
+    "configs/leduc_solvers.yaml",
+    "configs/sequential_blotto_solvers.yaml",
 )
 DEFAULT_SEEDS = (0, 1, 2, 3, 4)
 DEFAULT_TIME_H = 4
@@ -128,10 +128,10 @@ COMMON: dict[str, object] = {
     # network -- shared policy architecture for every solver but rpn (which only
     # reads hidden_dims / activation)
     "network.policy": "gaussian_mixture",
-    "network.hidden_dims": (128, 128),
+    "network.hidden_dims": (64, 64),
     "network.activation": "gelu",
     "network.normalization": "rms_norm",
-    "network.num_components": 2,
+    "network.num_components": 4,
     "network.full_covariance": False,
     "network.scale_parameterization": "log",
     "network.max_correlation": 0.0,
@@ -163,8 +163,8 @@ COMMON: dict[str, object] = {
     "ppo.vtrace_c_bar": 1.0,
     "ppo.vtrace_opponent_correction": "future_and_past",
     "ppo.vtrace_opponent_past_floor": 0.1,
-    "ppo.category_entropy_coef": 0.04,
-    "ppo.gaussian_entropy_coef": 0.04,
+    "ppo.category_entropy_coef": 0.05,
+    "ppo.gaussian_entropy_coef": 0.05,
     "ppo.trpo_category_kl_coef": 0.05,
     "ppo.trpo_gaussian_kl_coef": 0.05,
     "ppo.magnet_category_kl_coef": 0.2,

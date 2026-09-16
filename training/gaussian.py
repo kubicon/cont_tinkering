@@ -77,25 +77,46 @@ def marginal_std(scale_tril: chex.Array) -> chex.Array:
     return jnp.sqrt(jnp.sum(jnp.square(scale_tril), axis=-1))
 
 
+@jax.custom_vjp
+def _inward_clip(x: chex.Array, lo: chex.Array, hi: chex.Array) -> chex.Array:
+    return jnp.clip(x, lo, hi)
+
+
+def _inward_clip_fwd(x, lo, hi):
+    return jnp.clip(x, lo, hi), (x, lo, hi)
+
+
+def _inward_clip_bwd(residuals, g):
+    x, lo, hi = residuals
+    # A descent step moves `x` by `-g`: above `hi` only `g > 0` points back into
+    # range, below `lo` only `g < 0`.
+    inward = ((x <= hi) | (g > 0)) & ((x >= lo) | (g < 0))
+    return jnp.where(inward, g, 0.0), jnp.zeros_like(lo), jnp.zeros_like(hi)
+
+
+_inward_clip.defvjp(_inward_clip_fwd, _inward_clip_bwd)
+
+
 def straight_through_clip(x: chex.Array, lo: chex.Array, hi: chex.Array) -> chex.Array:
-    """`clip(x, lo, hi)` by value, the identity by gradient.
+    """`clip(x, lo, hi)` by value; by gradient, the identity wherever it leads back into range.
 
-    Value is exactly `clip(x, lo, hi)` (the second term is a bit-exact zero) and
-    `d/dx` is exactly `1`, in range and out of it alike -- a plain `jnp.clip`
-    would zero the gradient at the boundary, so a parameter that once saturated
-    could never come back.
+    Value is exactly `clip(x, lo, hi)`. Inside `[lo, hi]` the gradient is passed
+    through unchanged. Outside, it is passed through only when a descent step
+    would move `x` back towards the range, and zeroed when it would push `x`
+    further out -- a plain `jnp.clip` would zero it in both directions, so a
+    parameter that once saturated could never come back.
 
-    The price is that the raw parameter is free to drift arbitrarily far outside
-    `[lo, hi]` while the value stays pinned, and recovery then costs as many
-    steps as the drift. That is a real hazard in `sigma` coordinates, where the
-    loss offers no restoring force once the value is pinned; it is a much
-    smaller one in `log sigma`, where the entropy bonus and both KL log-det
-    terms each contribute a *constant* upward force on the raw parameter (their
-    derivative w.r.t. `log sigma` does not vanish with `sigma`), so a saturated
-    floor is actively pushed back into range.
+    The one-sided rule is what stops the raw parameter drifting. A fully
+    straight-through clip lets any force that does not vanish at the boundary
+    move `x` arbitrarily far past it while the value stays pinned. In `log sigma`
+    the closed-form entropy bonus is exactly such a force -- a constant upward
+    push -- and when nothing in the loss opposes it, the raw scale head grows
+    by about a learning rate per step, its weights amplify every gradient into
+    the shared torso, and the global gradient norm grows without bound (see the
+    Kuhn self-play sweep, where it breaks the second player after ~50 chunks).
     """
-    clipped = jnp.clip(x, lo, hi)
-    return jax.lax.stop_gradient(clipped) + (x - jax.lax.stop_gradient(x))
+    x = jnp.asarray(x)
+    return _inward_clip(x, jnp.asarray(lo, dtype=x.dtype), jnp.asarray(hi, dtype=x.dtype))
 
 
 def clamp_scale_tril(

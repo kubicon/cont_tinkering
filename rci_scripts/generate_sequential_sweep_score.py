@@ -45,6 +45,7 @@ DEFAULT_BR_EPOCHS = 100
 DEFAULT_EPISODES = 20_000
 DEFAULT_SEED = 0
 DEFAULT_TIME_H = 24
+DEFAULT_KUHN_TIME_H = 1
 DEFAULT_MEMORY_G = 16
 DEFAULT_GPU = False
 
@@ -88,6 +89,11 @@ def filter_runs(
             continue
         out.append(run)
     return out
+
+
+def is_kuhn(run: dict) -> bool:
+    """Same rule as ``score_sequential_sweep.py``: the config stem names the game."""
+    return "kuhn" in Path(run["game"]).stem
 
 
 def score_script_name(run_name: str) -> str:
@@ -175,6 +181,7 @@ def generate(
     overwrite: bool,
     no_target: bool,
     time_h: int,
+    kuhn_time_h: int,
     memory_g: int,
     gpu: bool,
     dry_run: bool = False,
@@ -200,6 +207,7 @@ def generate(
         "overwrite": overwrite,
         "no_target": no_target,
         "time_h": time_h,
+        "kuhn_time_h": kuhn_time_h,
         "memory_g": memory_g,
         "gpu": gpu,
     }
@@ -209,9 +217,11 @@ def generate(
             f"  n_checkpoints={n_checkpoints}" if n_checkpoints is not None else ""
         )
         print(f"{len(runs)} score jobs  BR {br_steps}x{br_epochs}  "
-              f"eval {episodes} episodes  wall {time_h}h{n_ck}\n")
+              f"eval {episodes} episodes  wall {time_h}h (Kuhn {kuhn_time_h}h)"
+              f"{n_ck}\n")
         for run in runs:
-            print(f"  score__{run['name']}")
+            run_time_h = kuhn_time_h if is_kuhn(run) else time_h
+            print(f"  score__{run['name']}  {run_time_h}h")
         return []
 
     SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -234,7 +244,7 @@ def generate(
             n_checkpoints=n_checkpoints,
             overwrite=overwrite,
             no_target=no_target,
-            time_h=time_h,
+            time_h=kuhn_time_h if is_kuhn(run) else time_h,
             memory_g=memory_g,
             gpu=gpu,
         )
@@ -310,6 +320,10 @@ def main() -> None:
         help="wall-time hours for #SBATCH --time (BR scoring is the long part)",
     )
     ap.add_argument(
+        "--kuhn-time", type=int, default=DEFAULT_KUHN_TIME_H, dest="kuhn_time_h",
+        help="wall-time hours for Kuhn runs (exact BR is cheap; overrides --time)",
+    )
+    ap.add_argument(
         "--memory", type=int, default=DEFAULT_MEMORY_G, dest="memory_g",
         help="memory in GB for #SBATCH --mem",
     )
@@ -338,6 +352,7 @@ def main() -> None:
         overwrite=args.overwrite,
         no_target=args.no_target,
         time_h=args.time_h,
+        kuhn_time_h=args.kuhn_time_h,
         memory_g=args.memory_g,
         gpu=args.gpu,
         dry_run=args.dry_run,

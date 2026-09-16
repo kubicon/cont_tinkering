@@ -228,6 +228,8 @@ def print_row(entry: dict, columns: tuple[str, ...] = ("value", "support_0", "su
     parts = [f"t={entry['t']:7d}"]
     if "expl" in entry:
         parts.append(f"expl={entry['expl']:+9.5f}")
+    if "target_expl" in entry:
+        parts.append(f"target_expl={entry['target_expl']:+9.5f}")
     if "wall_time" in entry:
         parts.append(f"{entry['wall_time']:7.1f}s")
     if "payoff_evals" in entry:
