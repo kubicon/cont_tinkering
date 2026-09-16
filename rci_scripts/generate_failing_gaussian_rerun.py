@@ -1,0 +1,174 @@
+"""Generate SLURM scripts for the multi-seed magnet grid (experiments/failing_gaussian_wo_magnet/rerun).
+
+The grid is 3 domains x {magnet, no magnet} x 3 engines = 18 *cells*, each one YAML in
+that directory (`<domain>_<magnet|nomagnet>_<engine>.yaml`). This script writes **one
+training job per cell**, and that job runs every seed of the cell via `run_cell.py`:
+
+    scripts/failing_gaussian_rerun/
+        <cell>.sh              train all seeds of one cell (the `idealized` cells run one seed)
+        score_<cell>.sh        score every seed's checkpoints of that cell (plot.py --no-plots)
+        run_all.sh             sbatch every training job
+        run_all_score.sh       sbatch every scoring job -- after training has finished
+        plot.sh                pool the saved scores into the plots; run it in the login shell
+
+Hyperparameters are not set here: the cell YAMLs are the source of truth, and
+`run_cell.py` only replaces `train.seed` / `train.checkpoint_dir` per seed. What lives
+here is the cluster side -- which cells, which seeds, how many at once, and the time
+each job needs (`TIME_H`, measured from the single-seed local run of this grid, which
+had 4 cells sharing one machine).
+
+    python rci_scripts/generate_failing_gaussian_rerun.py
+    python rci_scripts/generate_failing_gaussian_rerun.py --cells mp_magnet_ppo mp_nomagnet_ppo --seeds 0 1 2
+    bash scripts/failing_gaussian_rerun/run_all.sh
+    bash scripts/failing_gaussian_rerun/run_all_score.sh    # once training is done
+    bash scripts/failing_gaussian_rerun/plot.sh
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from utils import prepare_default_script
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXPERIMENT_DIR = REPO_ROOT / "experiments" / "failing_gaussian_wo_magnet" / "rerun"
+SCRIPTS_DIR = REPO_ROOT / "scripts" / "failing_gaussian_rerun"
+LOG_DIR = "logs/failing_gaussian_rerun"
+RUN_CELL = "experiments/failing_gaussian_wo_magnet/rerun/run_cell.py"
+PLOT = "experiments/failing_gaussian_wo_magnet/rerun/plot.py"
+
+DEFAULT_OUT = "data/failing_gaussian_rerun_seeds"
+DEFAULT_SEEDS = (0, 1, 2, 3, 4)
+DEFAULT_CPUS = 8
+DEFAULT_MEMORY_G = 16
+DEFAULT_GPU = False
+
+# Wall-time hours per (domain, engine) for one training job with every seed running in
+# parallel on DEFAULT_CPUS cores. Local single-seed times with 4 cells contending:
+# rot3/rot2/mp idealized ~8.5/6.8/2.8 h, sampled ~2.4/2.0/0.1 h, ppo ~1.2/0.7/0.2 h.
+# Seeds share the job's cores, so these are padded well past that; SLURM caps at 72.
+TIME_H: dict[tuple[str, str], int] = {
+    ("rot3", "idealized"): 24, ("rot2", "idealized"): 24, ("mp", "idealized"): 8,
+    ("rot3", "sampled"): 24,   ("rot2", "sampled"): 24,   ("mp", "sampled"): 4,
+    ("rot3", "ppo"): 12,       ("rot2", "ppo"): 8,        ("mp", "ppo"): 4,
+}
+# Scoring every checkpoint of every seed; the spread measure's payoff matrix makes the
+# rotation games the slow ones.
+SCORE_TIME_H: dict[str, int] = {"rot3": 12, "rot2": 8, "mp": 4}
+SCORE_MEMORY_G = 16
+
+# Slowest first, so the queue starts the long jobs early.
+DOMAIN_ORDER = ("rot3", "rot2", "mp")
+ENGINE_ORDER = ("idealized", "sampled", "ppo")
+
+
+def all_cells() -> list[str]:
+    cells = [p.stem for p in EXPERIMENT_DIR.glob("*.yaml")]
+    return sorted(cells, key=lambda c: (DOMAIN_ORDER.index(c.split("_")[0]),
+                                        ENGINE_ORDER.index(c.split("_")[2]), c))
+
+
+def cell_seeds(cell: str, seeds: list[int]) -> list[int]:
+    """`idealized` has no sampling, so its seeds would all be one run."""
+    return seeds[:1] if cell.endswith("_idealized") else seeds
+
+
+def header(time_h: int, memory_g: int, cpus: int, gpu: bool) -> str:
+    base = prepare_default_script(time_h, memory_g, gpu)
+    first, rest = base.split("\n", 1)
+    return f"{first}\n#SBATCH --cpus-per-task={cpus}\n{rest}"
+
+
+def write_script(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(path.stat().st_mode | 0o111)
+
+
+def write_train_job(path: Path, cell: str, seeds: list[int], out: str, cpus: int,
+                    memory_g: int, gpu: bool) -> None:
+    domain, _, engine = cell.split("_")
+    seeds_str = " ".join(str(s) for s in seeds)
+    body = f"""
+export PYTHONUNBUFFERED=1
+python {RUN_CELL} {cell} \\
+  --seeds {seeds_str} \\
+  --out {out} \\
+  --max-parallel {len(seeds)}
+"""
+    write_script(path, header(TIME_H[(domain, engine)], memory_g, cpus, gpu) + body)
+
+
+def write_score_job(path: Path, cell: str, out: str, cpus: int, no_std: bool) -> None:
+    domain = cell.split("_")[0]
+    flags = " --no-std" if no_std else ""
+    body = f"""
+export PYTHONUNBUFFERED=1
+python {PLOT} --out {out} --cells {cell} --no-plots{flags}
+"""
+    write_script(path, header(SCORE_TIME_H[domain], SCORE_MEMORY_G, cpus, False) + body)
+
+
+def write_submit_all(path: Path, jobs: list[Path], note: str = "") -> None:
+    lines = ["#!/bin/sh", ""]
+    if note:
+        lines += [f"# {note}", ""]
+    lines += [f"mkdir -p {LOG_DIR}", ""]
+    for job in jobs:
+        lines.append(f"sbatch -o {LOG_DIR}/{job.stem}.log {job.relative_to(REPO_ROOT).as_posix()}")
+    lines += ["", f'echo "submitted {len(jobs)} jobs; logs in {LOG_DIR}"']
+    write_script(path, "\n".join(lines) + "\n")
+
+
+def write_plot(path: Path, out: str, no_std: bool) -> None:
+    flags = " --no-std" if no_std else ""
+    lines = [
+        "#!/bin/sh",
+        "",
+        "# Run after run_all_score.sh's jobs have finished; it only loads the saved scores.",
+        f"python {PLOT} --out {out}{flags}",
+        "",
+    ]
+    write_script(path, "\n".join(lines))
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--cells", nargs="+", default=None, choices=all_cells(), metavar="CELL",
+                    help="subset of the grid (default: all 18)")
+    ap.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
+    ap.add_argument("--out", default=DEFAULT_OUT, help="checkpoint tree, passed to run_cell.py")
+    ap.add_argument("--cpus", type=int, default=DEFAULT_CPUS, help="#SBATCH --cpus-per-task")
+    ap.add_argument("--memory", type=int, default=DEFAULT_MEMORY_G, dest="memory_g")
+    ap.add_argument("--gpu", action="store_true", default=DEFAULT_GPU)
+    ap.add_argument("--no-std", action="store_true",
+                    help="score jobs and plot.sh use the means-only measure")
+    args = ap.parse_args()
+
+    cells = args.cells or all_cells()
+    train_jobs, score_jobs = [], []
+    for cell in cells:
+        path = SCRIPTS_DIR / f"{cell}.sh"
+        write_train_job(path, cell, cell_seeds(cell, args.seeds), args.out, args.cpus,
+                        args.memory_g, args.gpu)
+        train_jobs.append(path)
+        path = SCRIPTS_DIR / f"score_{cell}.sh"
+        write_score_job(path, cell, args.out, args.cpus, args.no_std)
+        score_jobs.append(path)
+
+    write_submit_all(SCRIPTS_DIR / "run_all.sh", train_jobs)
+    write_submit_all(SCRIPTS_DIR / "run_all_score.sh", score_jobs,
+                     note="Submit only after every run_all.sh job has finished.")
+    write_plot(SCRIPTS_DIR / "plot.sh", args.out, args.no_std)
+
+    rel = SCRIPTS_DIR.relative_to(REPO_ROOT)
+    print(f"wrote {len(train_jobs)} training + {len(score_jobs)} scoring jobs under {rel}")
+    for cell in cells:
+        print(f"  {cell:26} seeds {cell_seeds(cell, args.seeds)}")
+    print(f"\n1. bash {rel}/run_all.sh\n2. bash {rel}/run_all_score.sh\n3. bash {rel}/plot.sh")
+
+
+if __name__ == "__main__":
+    main()
