@@ -2,7 +2,7 @@
 
     python experiments/failing_gaussian_wo_magnet/rerun/run_cell.py mp_magnet_ppo --seeds 0 1 2 3 4
     python experiments/failing_gaussian_wo_magnet/rerun/run_cell.py rot2_nomagnet_sampled \\
-        --seeds 0 1 2 --max-parallel 3 --out data/failing_gaussian_rerun_seeds
+        --seeds 0 1 2 --out data/failing_gaussian_rerun_seeds
 
 A *cell* is one `<domain>_<magnet|nomagnet>_<engine>.yaml` in this directory; that file
 stays the single source of every hyperparameter. For each seed this script writes a copy
@@ -22,8 +22,9 @@ config -- so every seed would be the same run; only the first seed is run for th
 
 A seed whose directory already holds a finished run is skipped unless `--overwrite`, so
 a job that ran out of wall-time can be resubmitted and picks up where it stopped. Seeds
-run as separate processes, `--max-parallel` at a time, with each one's thread pool
-capped so parallel seeds do not measure contention with each other.
+run **one after another**, each as its own process with its thread pool capped at
+`--threads` (default 1), so a SLURM job of this script needs exactly one CPU and the
+parallelism comes from submitting many cells at once, not from inside a job.
 """
 
 from __future__ import annotations
@@ -105,9 +106,7 @@ def main() -> None:
     ap.add_argument("cell", choices=all_cells(), help="config stem in this directory")
     ap.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
     ap.add_argument("--out", default=DEFAULT_OUT, help="root of the per-seed checkpoint tree")
-    ap.add_argument("--max-parallel", type=int, default=1, help="seeds run at once")
-    ap.add_argument("--threads-per-seed", type=int, default=0,
-                    help="thread cap per seed (default: cores / --max-parallel)")
+    ap.add_argument("--threads", type=int, default=1, help="thread cap for each seed's process")
     ap.add_argument("--overwrite", action="store_true", help="rerun seeds that already finished")
     args = ap.parse_args()
 
@@ -118,54 +117,31 @@ def main() -> None:
               f"(dropping {seeds[1:]})")
         seeds = seeds[:1]
 
-    cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 4)
-    threads = args.threads_per_seed or max(1, cores // max(args.max_parallel, 1))
-    env = child_environment(threads)
+    env = child_environment(args.threads)
     script = entry_point(args.cell)
+    print(f"{args.cell}: seeds {seeds} sequentially via {script}, {args.threads} thread(s) "
+          f"-> {os.path.relpath(out / args.cell, REPO_ROOT)}", flush=True)
 
-    queue = []
+    failed: list[int] = []
     for seed in seeds:
         run_dir = seed_dir(out, args.cell, seed)
         config_path, steps = write_seed_config(args.cell, seed, run_dir)
         if not args.overwrite and is_finished(run_dir, args.cell, steps):
-            print(f"  seed {seed}: already finished in {os.path.relpath(run_dir, REPO_ROOT)}, skipping")
+            print(f"  seed {seed}: already finished, skipping", flush=True)
             continue
-        queue.append((seed, run_dir, config_path))
-
-    print(f"{args.cell}: {len(queue)} seed(s) via {script}, {args.max_parallel} at a time, "
-          f"{threads} threads each -> {os.path.relpath(out / args.cell, REPO_ROOT)}")
-
-    running: list[tuple[int, subprocess.Popen, object, float]] = []
-    failed: list[int] = []
-
-    def reap() -> None:
-        """Drop every finished process from `running`, recording failures."""
-        for item in list(running):
-            seed, proc, handle, started = item
-            if proc.poll() is None:
-                continue
-            handle.close()
-            running.remove(item)
-            status = "ok" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
-            print(f"  seed {seed}: {status} after {time.time() - started:.0f} s", flush=True)
-            if proc.returncode != 0:
-                failed.append(seed)
-
-    for seed, run_dir, config_path in queue:
-        while len(running) >= max(args.max_parallel, 1):
-            time.sleep(2.0)
-            reap()
-        handle = open(run_dir / LOG_NAME, "w")
         command = [sys.executable, script, os.path.relpath(config_path, REPO_ROOT)]
-        print(f"  seed {seed}: launch {' '.join(command[1:])}", flush=True)
-        running.append((seed, subprocess.Popen(command, cwd=REPO_ROOT, env=env, stdout=handle,
-                                               stderr=subprocess.STDOUT), handle, time.time()))
-    while running:
-        time.sleep(2.0)
-        reap()
+        print(f"  seed {seed}: {' '.join(command[1:])}", flush=True)
+        started = time.time()
+        with open(run_dir / LOG_NAME, "w") as handle:
+            code = subprocess.run(command, cwd=REPO_ROOT, env=env, stdout=handle,
+                                  stderr=subprocess.STDOUT).returncode
+        status = "ok" if code == 0 else f"FAILED (exit {code})"
+        print(f"  seed {seed}: {status} after {time.time() - started:.0f} s", flush=True)
+        if code != 0:
+            failed.append(seed)   # keep going: one bad seed should not cost the others
 
     if failed:
-        raise SystemExit(f"{args.cell}: seeds {sorted(failed)} failed; see their {LOG_NAME}")
+        raise SystemExit(f"{args.cell}: seeds {failed} failed; see their {LOG_NAME}")
     print(f"{args.cell}: done")
 
 

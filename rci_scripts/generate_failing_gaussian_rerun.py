@@ -14,8 +14,8 @@ training job per cell**, and that job runs every seed of the cell via `run_cell.
 Hyperparameters are not set here: the cell YAMLs are the source of truth, and
 `run_cell.py` only replaces `train.seed` / `train.checkpoint_dir` per seed. What lives
 here is the cluster side -- which cells, which seeds, how many at once, and the time
-each job needs (`TIME_H`, measured from the single-seed local run of this grid, which
-had 4 cells sharing one machine).
+each job needs (`SEED_HOURS` x seeds). **Every job uses one CPU** and runs its seeds
+sequentially; parallelism comes only from SLURM running many jobs at once.
 
     python rci_scripts/generate_failing_gaussian_rerun.py
     python rci_scripts/generate_failing_gaussian_rerun.py --cells mp_magnet_ppo mp_nomagnet_ppo --seeds 0 1 2
@@ -27,6 +27,7 @@ had 4 cells sharing one machine).
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 from utils import prepare_default_script
@@ -40,22 +41,24 @@ PLOT = "experiments/failing_gaussian_wo_magnet/rerun/plot.py"
 
 DEFAULT_OUT = "data/failing_gaussian_rerun_seeds"
 DEFAULT_SEEDS = (0, 1, 2, 3, 4)
-DEFAULT_CPUS = 8
 DEFAULT_MEMORY_G = 16
 DEFAULT_GPU = False
 
-# Wall-time hours per (domain, engine) for one training job with every seed running in
-# parallel on DEFAULT_CPUS cores. Local single-seed times with 4 cells contending:
-# rot3/rot2/mp idealized ~8.5/6.8/2.8 h, sampled ~2.4/2.0/0.1 h, ppo ~1.2/0.7/0.2 h.
-# Seeds share the job's cores, so these are padded well past that; SLURM caps at 72.
-TIME_H: dict[tuple[str, str], int] = {
-    ("rot3", "idealized"): 24, ("rot2", "idealized"): 24, ("mp", "idealized"): 8,
-    ("rot3", "sampled"): 24,   ("rot2", "sampled"): 24,   ("mp", "sampled"): 4,
-    ("rot3", "ppo"): 12,       ("rot2", "ppo"): 8,        ("mp", "ppo"): 4,
+# Every job gets one CPU and runs its seeds one after another, so a job's wall-time is
+# (hours per seed) x (number of seeds). Hours per seed on one core, estimated from the
+# single-seed local run of this grid (4 cells sharing an 8-core machine, i.e. ~2 cores
+# each): rot3/rot2/mp idealized ~8.5/6.8/2.8 h, sampled ~2.4/2.0/0.1 h, ppo ~1.2/0.7/0.2 h
+# -- doubled for one core. The job requests TIME_SAFETY times that, capped by SLURM at 72.
+SEED_HOURS: dict[tuple[str, str], float] = {
+    ("rot3", "idealized"): 17.0, ("rot2", "idealized"): 14.0, ("mp", "idealized"): 6.0,
+    ("rot3", "sampled"): 5.0,    ("rot2", "sampled"): 4.0,    ("mp", "sampled"): 0.5,
+    ("rot3", "ppo"): 2.5,        ("rot2", "ppo"): 1.5,        ("mp", "ppo"): 0.5,
 }
-# Scoring every checkpoint of every seed; the spread measure's payoff matrix makes the
-# rotation games the slow ones.
-SCORE_TIME_H: dict[str, int] = {"rot3": 12, "rot2": 8, "mp": 4}
+TIME_SAFETY = 1.4
+MAX_TIME_H = 72
+# Scoring every checkpoint of every seed, also on one CPU; the spread measure's payoff
+# matrix makes the rotation games the slow ones.
+SCORE_TIME_H: dict[str, int] = {"rot3": 24, "rot2": 12, "mp": 4}
 SCORE_MEMORY_G = 16
 
 # Slowest first, so the queue starts the long jobs early.
@@ -74,10 +77,19 @@ def cell_seeds(cell: str, seeds: list[int]) -> list[int]:
     return seeds[:1] if cell.endswith("_idealized") else seeds
 
 
-def header(time_h: int, memory_g: int, cpus: int, gpu: bool) -> str:
+def train_hours(cell: str, n_seeds: int) -> int:
+    domain, _, engine = cell.split("_")
+    hours = math.ceil(SEED_HOURS[(domain, engine)] * n_seeds * TIME_SAFETY)
+    if hours > MAX_TIME_H:
+        raise SystemExit(f"{cell}: {n_seeds} sequential seeds need ~{hours} h, over SLURM's "
+                         f"{MAX_TIME_H} h; pass fewer --seeds or lower SEED_HOURS")
+    return hours
+
+
+def header(time_h: int, memory_g: int, gpu: bool) -> str:
     base = prepare_default_script(time_h, memory_g, gpu)
     first, rest = base.split("\n", 1)
-    return f"{first}\n#SBATCH --cpus-per-task={cpus}\n{rest}"
+    return f"{first}\n#SBATCH --cpus-per-task=1\n{rest}"
 
 
 def write_script(path: Path, text: str) -> None:
@@ -86,28 +98,27 @@ def write_script(path: Path, text: str) -> None:
     path.chmod(path.stat().st_mode | 0o111)
 
 
-def write_train_job(path: Path, cell: str, seeds: list[int], out: str, cpus: int,
-                    memory_g: int, gpu: bool) -> None:
-    domain, _, engine = cell.split("_")
+def write_train_job(path: Path, cell: str, seeds: list[int], out: str, memory_g: int,
+                    gpu: bool) -> None:
     seeds_str = " ".join(str(s) for s in seeds)
     body = f"""
 export PYTHONUNBUFFERED=1
 python {RUN_CELL} {cell} \\
   --seeds {seeds_str} \\
-  --out {out} \\
-  --max-parallel {len(seeds)}
+  --out {out}
 """
-    write_script(path, header(TIME_H[(domain, engine)], memory_g, cpus, gpu) + body)
+    write_script(path, header(train_hours(cell, len(seeds)), memory_g, gpu) + body)
 
 
-def write_score_job(path: Path, cell: str, out: str, cpus: int, no_std: bool) -> None:
+def write_score_job(path: Path, cell: str, out: str, no_std: bool) -> None:
     domain = cell.split("_")[0]
     flags = " --no-std" if no_std else ""
     body = f"""
-export PYTHONUNBUFFERED=1
+export PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+export XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
 python {PLOT} --out {out} --cells {cell} --no-plots{flags}
 """
-    write_script(path, header(SCORE_TIME_H[domain], SCORE_MEMORY_G, cpus, False) + body)
+    write_script(path, header(SCORE_TIME_H[domain], SCORE_MEMORY_G, False) + body)
 
 
 def write_submit_all(path: Path, jobs: list[Path], note: str = "") -> None:
@@ -140,7 +151,6 @@ def main() -> None:
                     help="subset of the grid (default: all 18)")
     ap.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
     ap.add_argument("--out", default=DEFAULT_OUT, help="checkpoint tree, passed to run_cell.py")
-    ap.add_argument("--cpus", type=int, default=DEFAULT_CPUS, help="#SBATCH --cpus-per-task")
     ap.add_argument("--memory", type=int, default=DEFAULT_MEMORY_G, dest="memory_g")
     ap.add_argument("--gpu", action="store_true", default=DEFAULT_GPU)
     ap.add_argument("--no-std", action="store_true",
@@ -151,11 +161,11 @@ def main() -> None:
     train_jobs, score_jobs = [], []
     for cell in cells:
         path = SCRIPTS_DIR / f"{cell}.sh"
-        write_train_job(path, cell, cell_seeds(cell, args.seeds), args.out, args.cpus,
+        write_train_job(path, cell, cell_seeds(cell, args.seeds), args.out,
                         args.memory_g, args.gpu)
         train_jobs.append(path)
         path = SCRIPTS_DIR / f"score_{cell}.sh"
-        write_score_job(path, cell, args.out, args.cpus, args.no_std)
+        write_score_job(path, cell, args.out, args.no_std)
         score_jobs.append(path)
 
     write_submit_all(SCRIPTS_DIR / "run_all.sh", train_jobs)
@@ -166,7 +176,8 @@ def main() -> None:
     rel = SCRIPTS_DIR.relative_to(REPO_ROOT)
     print(f"wrote {len(train_jobs)} training + {len(score_jobs)} scoring jobs under {rel}")
     for cell in cells:
-        print(f"  {cell:26} seeds {cell_seeds(cell, args.seeds)}")
+        seeds = cell_seeds(cell, args.seeds)
+        print(f"  {cell:26} seeds {seeds}  ({train_hours(cell, len(seeds))} h)")
     print(f"\n1. bash {rel}/run_all.sh\n2. bash {rel}/run_all_score.sh\n3. bash {rel}/plot.sh")
 
 
