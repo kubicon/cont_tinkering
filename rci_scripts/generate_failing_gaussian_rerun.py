@@ -43,6 +43,8 @@ DEFAULT_OUT = "data/failing_gaussian_rerun_seeds"
 DEFAULT_SEEDS = (0, 1, 2, 3, 4)
 DEFAULT_MEMORY_G = 16
 DEFAULT_GPU = False
+# Score the means alone (plot.py --no-std): every component's sigma set to 0.
+DEFAULT_NO_STD = True
 
 # Every job gets one CPU and runs its seeds one after another, so a job's wall-time is
 # (hours per seed) x (number of seeds). Hours per seed on one core, estimated from the
@@ -154,8 +156,9 @@ def main() -> None:
     ap.add_argument("--out", default=DEFAULT_OUT, help="checkpoint tree, passed to run_cell.py")
     ap.add_argument("--memory", type=int, default=DEFAULT_MEMORY_G, dest="memory_g")
     ap.add_argument("--gpu", action="store_true", default=DEFAULT_GPU)
-    ap.add_argument("--no-std", action="store_true",
-                    help="score jobs and plot.sh use the means-only measure")
+    ap.add_argument("--with-std", dest="no_std", action="store_false", default=DEFAULT_NO_STD,
+                    help="score the full mixtures, spread included; by default the score jobs "
+                         "and plot.sh pass --no-std (every sigma set to 0)")
     args = ap.parse_args()
 
     cells = args.cells or all_cells()
