@@ -137,7 +137,10 @@ def build_progress_metric_fn(config: RunConfig, key: jax.Array, resp_iterates: t
         for iterate in resp_iterates:
             key, eval_key = jax.random.split(key)
             out[metric_keys[iterate]] = trainer.evaluate(
-                eval_key, num_episodes=episodes, target=(iterate == "target")
+                eval_key,
+                num_episodes=episodes,
+                target=(iterate == "target"),
+                batch_size=config.best_response.eval_batch_size,
             ).value
         return out
 

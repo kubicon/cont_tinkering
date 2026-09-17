@@ -79,7 +79,7 @@ MUTED = "#73726c"
 GRID = "#e4e3dd"
 
 X_AXES = ("checkpoint", "wall_time", "samples")
-SAMPLE_LABELS = {"episodes": "hands played", "env_steps": "decision nodes visited"}
+SAMPLE_LABELS = {"episodes": "Environment interactions", "env_steps": "Environment interactions"}
 
 
 def config_label(run_name: str, game: str) -> str:
@@ -89,11 +89,15 @@ def config_label(run_name: str, game: str) -> str:
     return name[len(prefix):] if name.startswith(prefix) else name
 
 
+# Legend names; the keys stay the run-directory names they are matched against.
+DISPLAY_NAMES = {"self_play": "Mixture", "sac": "PPO", "nfsp": "NFSP", "psro": "PSRO"}
+
+
 def pretty_label(config: str) -> str:
     match = BINS_RE.match(config)
     if match:
-        return f"discrete MMD ({match.group('bins')} bins)"
-    return config.replace("_", " ")
+        return f"Discrete MMD ({match.group('bins')} bins)"
+    return DISPLAY_NAMES.get(config, config.replace("_", " "))
 
 
 def style_for(config: str) -> tuple[str, str, str]:
@@ -193,16 +197,16 @@ def style_axes(ax) -> None:
 
 def x_label(x_axis: str, samples: str) -> str:
     if x_axis == "checkpoint":
-        return "checkpoint (chunk / round)"
+        return "Checkpoint"
     if x_axis == "wall_time":
-        return "training wall-time [h]"
+        return "Training wall-time [h]"
     return SAMPLE_LABELS[samples]
 
 
 def y_label(exact: bool, target: bool) -> str:
     if exact:
-        return "exploitability (Polyak target)" if target else "exploitability"
-    return "exploitability lower bound (Polyak target where saved)"
+        return "Exploitability" if target else "Exploitability"
+    return "Approximate Exploitability"
 
 
 def draw_panel(ax, by_config: dict[str, list[dict]], x_axis: str, *, samples: str,
@@ -238,7 +242,7 @@ def draw_panel(ax, by_config: dict[str, list[dict]], x_axis: str, *, samples: st
         ax.plot(pooled["x"], pooled["mean"], color=color, linewidth=1.6,
                 linestyle=linestyle, marker=marker, markersize=5,
                 markevery=markevery, markeredgecolor="white", markeredgewidth=0.8,
-                label=f"{pretty_label(config)}  (n={pooled['n']})")
+                label=f"{pretty_label(config)}")
     if not linear_y:
         ax.set_yscale("log", nonpositive="mask")
         if floor is not None:
@@ -310,8 +314,8 @@ def main() -> None:
             draw_panel(ax, by_config, x_axis, **panel_kwargs)
             ax.set_xlabel(x_label(x_axis, args.samples), color=TEXT)
             ax.set_ylabel(y_label(exact, args.target), color=TEXT)
-            ax.set_title(f"{title}: mean over seeds, band = 95% CI",
-                         color=TEXT, fontsize=11, loc="left")
+            # ax.set_title(f"{title}: mean over seeds, band = 95% CI",
+            #              color=TEXT, fontsize=11, loc="left")
             ax.legend(fontsize=8, frameon=False, loc="upper left",
                       bbox_to_anchor=(1.01, 1.0), labelcolor=TEXT)
             fig.tight_layout()

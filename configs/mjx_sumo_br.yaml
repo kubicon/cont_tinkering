@@ -22,19 +22,23 @@ best_response:
   # written before target params were saved only hold the live one.
   opponent_iterate: live
   eval_episodes: 200000
+  # The checkpoint's `warp_naconmax` is 20,000 and the puck has one contact per
+  # world, so this is the largest batch the saved game can step.
   eval_batch_size: 20000
   eval_seed: 12345
   progress_episodes: 20000
 
 network:
-  hidden_dims: [64, 64]
+  # The same capacity as the strategy under test: a smaller responder
+  # understates how exploitable it is.
+  hidden_dims: [512, 512, 512]
   activation: gelu
   normalization: rms_norm
-  num_components: 3   # must match the checkpoint's
+  num_components: 4   # must match the checkpoint's
   clip_means: true
 
 optimizer:
-  learning_rate: 0.003
+  learning_rate: 0.0003
   max_grad_norm: 0.5
   optimizer: adam
   weight_decay: 0.0
@@ -42,7 +46,7 @@ optimizer:
 ppo:
   clip_eps: 0.1
   value_coef: 0.5
-  batch_size: 512
+  batch_size: 2048        # the training run's batch; `warp_naconmax` covers it
   ppo_epochs: 1
 
   # A best response faces a *fixed* opponent, so it is a plain maximization
@@ -69,8 +73,12 @@ ppo:
   vtrace_lambda: 0.95
 
 train:
-  steps: 40
-  epochs: 300
+  # 32,000 iterations per responder, both in one 24 h slot. Self-play ran at
+  # ~1.1 s/iter on an A100 and a best response updates one network instead of
+  # two, so this is <= ~20 h total, leaving
+  # the rest of a 24 h slot for compilation, progress evals and the final eval.
+  steps: 16
+  epochs: 2000
   seed: 0
   # `mode` and `checkpoint_dir` are ignored here: a best response is a
   # measurement of somebody else's strategy, not a strategy to keep.

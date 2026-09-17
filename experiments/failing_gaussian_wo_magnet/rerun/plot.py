@@ -22,7 +22,9 @@ the expensive half; on the cluster run it per cell with `--cells <cell> --no-plo
 Seeds are pooled per checkpoint with no smoothing: the line is the mean over seeds and
 the band the 95% confidence interval of that mean, `mean +- t_{0.975, n-1} * sd / sqrt(n)`,
 with its lower edge clipped at 0.
-`ppo` cells draw the Polyak-averaged target as a dashed line with its own band. In the
+`ppo` cells draw the Polyak-averaged target as a dashed line with its own band (`--no-target`
+leaves it out), and are drawn on a plain log axis with every value clamped at
+`PPO_FLOOR` (1e-3), so a checkpoint or CI edge at 0 does not stretch the axis. In the
 plane, the mean trajectory is drawn bold with 95% CI ellipses (per-axis half-widths) at
 evenly spaced checkpoints, and `--show-seeds` adds each seed's own trajectory faintly --
 worth looking at, since seeds that circle the Nash out of phase average to a curve that
@@ -69,6 +71,9 @@ from analyze import (                                          # noqa: E402
 DEFAULT_OUT = "data/failing_gaussian_rerun_seeds"
 CI_LEVEL = 0.95
 CI_ELLIPSES = 12
+PPO_FLOOR = 1e-3   # ppo plots clamp exploitability here, so 0 does not stretch the log axis
+FONT_SIZE = 14         # axis labels and tick labels
+LEGEND_FONT_SIZE = 12
 
 
 # ------------------------------------------------------------------------- scoring
@@ -169,26 +174,43 @@ def pool(cell: str, runs: list[dict]) -> dict:
 # -------------------------------------------------------------------------- plots
 
 
-def _band(ax, t, values, color, ls, label, show_seeds):
+def _band(ax, t, values, color, ls, label, show_seeds, floor=0.0):
+    """Mean line and CI band; everything drawn is clamped from below at `floor`."""
     mean, half = mean_ci(values)
-    ax.plot(t, mean, color=color, lw=1.6 if ls == "-" else 1.2, ls=ls, label=label)
-    drawn = list(mean)
+    ax.plot(t, np.maximum(mean, floor), color=color, lw=1.6 if ls == "-" else 1.2, ls=ls,
+            label=label)
+    drawn = list(np.maximum(mean, floor))
     if half is not None:
         # Exploitability is >= 0, so an interval reaching below it only says the band is
         # wide; clipping keeps the symlog axis from spending half its height on negatives.
-        lower = np.maximum(mean - half, 0.0)
-        ax.fill_between(t, lower, mean + half, color=color, alpha=0.18 if ls == "-" else 0.1, lw=0)
-        drawn += list(mean + half)
+        lower = np.maximum(mean - half, floor)
+        upper = np.maximum(mean + half, floor)
+        ax.fill_between(t, lower, upper, color=color, alpha=0.18 if ls == "-" else 0.1, lw=0)
+        drawn += list(upper)
     if show_seeds and values.shape[0] > 1:
         for row in values:
-            ax.plot(t, row, color=color, lw=0.5, ls=ls, alpha=0.25)
+            ax.plot(t, np.maximum(row, floor), color=color, lw=0.5, ls=ls, alpha=0.25)
+        drawn += list(np.maximum(values, floor).ravel())
     return drawn
 
 
-def plot_exploitability(pooled: dict, domain: str, engine: str, no_std: bool, show_seeds: bool,
-                        out_dir: Path):
-    import matplotlib.pyplot as plt
+def _log_axis(ax, values):
+    """Plain log y-axis fitted to the drawn curves, which are clamped at `PPO_FLOOR`."""
+    positive = [v for v in values if np.isfinite(v) and v > 0]
+    ax.set_yscale("log")
+    if positive:
+        ax.set_ylim(min(positive) / 1.5, max(positive) * 1.5)
 
+
+def plot_exploitability(pooled: dict, domain: str, engine: str, no_std: bool, show_seeds: bool,
+                        out_dir: Path, show_target: bool = True):
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"font.size": FONT_SIZE})
+
+    # PPO curves (checkpoint 0 and CI lower edges) can touch 0, which on a symlog axis
+    # squashes everything else; clamp them at PPO_FLOOR and use a plain log axis. The
+    # exact engines keep the symlog axis, since they genuinely converge to 0.
+    floor = PPO_FLOOR if engine == "ppo" else 0.0
     fig, ax = plt.subplots(figsize=(7.5, 4.6))
     everything = []
     for magnet in MAGNETS:
@@ -196,26 +218,32 @@ def plot_exploitability(pooled: dict, domain: str, engine: str, no_std: bool, sh
         if p is None:
             continue
         color = MAGNET_COLOR[magnet]
-        label = f"{MAGNET_LABEL[magnet]} (n={p['n']})"
-        everything += _band(ax, p["t"], p["live"], color, "-", f"{label}, live", show_seeds)
-        if p["target"] is not None:
-            everything += _band(ax, p["t"], p["target"], color, "--", f"{label}, target", show_seeds)
+        label = f"{MAGNET_LABEL[magnet]}"
+        everything += _band(ax, p["t"], p["live"], color, "-", f"{label}", show_seeds,
+                            floor)
+        if show_target and p["target"] is not None:
+            everything += _band(ax, p["t"], p["target"], color, "--", f"{label}, target",
+                                show_seeds, floor)
 
     if not everything:
         plt.close(fig)
         return None
 
-    _symlog_axis(ax, [v for v in everything if np.isfinite(v)])
-    ax.set_xlabel("iteration")
-    ax.set_ylabel("exploitability" + (" (spread set to 0)" if no_std else ""))
+    if engine == "ppo":
+        _log_axis(ax, everything)
+    else:
+        _symlog_axis(ax, [v for v in everything if np.isfinite(v)])
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Exploitability")# + (" (spread set to 0)" if no_std else ""))
     band = f"mean, {CI_LEVEL:.0%} CI over seeds"
-    ax.set_title(f"{DOMAIN_LABEL[domain]}\n{ENGINE_LABEL[engine]}  --  {band}"
-                 + ("\nmeans only, spread zeroed" if no_std else ""), fontsize=10)
+    # ax.set_title(f"{DOMAIN_LABEL[domain]}\n{ENGINE_LABEL[engine]}  --  {band}"
+    #              + ("\nmeans only, spread zeroed" if no_std else ""), fontsize=10)
     ax.grid(alpha=0.25, which="both")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=LEGEND_FONT_SIZE)
     fig.tight_layout()
 
-    path = out_dir / f"expl_{domain}_{engine}{'_no_std' if no_std else ''}.png"
+    suffix = ("_no_std" if no_std else "") + ("_live" if not show_target and engine == "ppo" else "")
+    path = out_dir / f"expl_{domain}_{engine}{suffix}.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -225,6 +253,7 @@ def plot_mp_means(pooled: dict, engine: str, no_std: bool, show_seeds: bool, out
     """The matching-pennies trajectory in the plane of the two players' mean actions."""
     import matplotlib.pyplot as plt
     from matplotlib.patches import Ellipse
+    plt.rcParams.update({"font.size": FONT_SIZE})
 
     fig, ax = plt.subplots(figsize=(5.8, 5.6))
     drawn = False
@@ -238,7 +267,7 @@ def plot_mp_means(pooled: dict, engine: str, no_std: bool, show_seeds: bool, out
                 ax.plot(xs, ys, color=color, lw=0.5, alpha=0.25)
         x, x_half = mean_ci(p["x"])
         y, y_half = mean_ci(p["y"])
-        ax.plot(x, y, color=color, lw=1.4, alpha=0.9, label=f"{MAGNET_LABEL[magnet]} (n={p['n']})")
+        ax.plot(x, y, color=color, lw=1.4, alpha=0.9, label=f"{MAGNET_LABEL[magnet]}")
         if x_half is not None:
             for i in np.linspace(0, len(x) - 1, CI_ELLIPSES).round().astype(int):
                 ax.add_patch(Ellipse((x[i], y[i]), 2 * x_half[i], 2 * y_half[i], facecolor=color,
@@ -261,11 +290,11 @@ def plot_mp_means(pooled: dict, engine: str, no_std: bool, show_seeds: bool, out
     ax.set_aspect("equal")
     ax.set_xlabel("player 0 mean action")
     ax.set_ylabel("player 1 mean action")
-    ax.set_title(f"ContinuousMatchingPennies mean trajectory\n{ENGINE_LABEL[engine]}\n"
-                 f"mean over seeds, ellipses = {CI_LEVEL:.0%} CI; circle = start, X = end",
-                 fontsize=9)
+    # ax.set_title(f"ContinuousMatchingPennies mean trajectory\n{ENGINE_LABEL[engine]}\n"
+    #              f"mean over seeds, ellipses = {CI_LEVEL:.0%} CI; circle = start, X = end",
+    #              fontsize=9)
     ax.grid(alpha=0.25)
-    ax.legend(fontsize=8, loc="upper right")
+    ax.legend(fontsize=LEGEND_FONT_SIZE, loc="upper right")
     fig.tight_layout()
 
     path = out_dir / f"mp_means_{engine}{'_no_std' if no_std else ''}.png"
@@ -291,6 +320,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="rescore even if a result file exists")
     parser.add_argument("--no-plots", action="store_true", help="score and save only")
     parser.add_argument("--show-seeds", action="store_true", help="also draw each seed faintly")
+    parser.add_argument("--no-target", dest="show_target", action="store_false",
+                        help="ppo plots: draw only the live parameters, not the Polyak target "
+                             "(written as expl_<domain>_ppo[_no_std]_live.png)")
     parser.add_argument("--plots", type=Path, default=None, help="default: <out>/plots")
     return parser.parse_args()
 
@@ -327,7 +359,7 @@ def main() -> None:
     for domain in DOMAINS:
         for engine in ENGINES:
             written.append(plot_exploitability(pooled, domain, engine, args.no_std,
-                                               args.show_seeds, plots))
+                                               args.show_seeds, plots, args.show_target))
     for engine in ENGINES:
         written.append(plot_mp_means(pooled, engine, args.no_std, args.show_seeds, plots))
     written = [p for p in written if p is not None]

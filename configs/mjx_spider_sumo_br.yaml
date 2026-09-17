@@ -1,0 +1,59 @@
+# python best_response.py configs/mjx_spider_sumo_br.yaml
+#
+# `configs/mjx_sumo_br.yaml` for a legged game. The one difference: the game's `warp_naconmax` is
+# sized for exactly 512 worlds (contact slots per world * 512), and it is read
+# from the checkpoint's `config.yaml`, so it cannot be raised here. Every
+# rollout -- training, progress and final evaluation -- therefore has to stay
+# at 512 episodes per batch or it overflows the contact buffer.
+
+best_response:
+  checkpoint_dir: data/mjx_spider_sumo
+  checkpoint_step: null   # null = the last checkpoint written
+  responder: both         # 0, 1, or both (both also reports exploitability)
+  opponent_iterate: live  # live, target or both; see configs/mjx_sumo_br.yaml
+  # ~100 batches of 512 per readout. Episodes here are +-1 wins and losses,
+  # so the 95% interval is ~0.01.
+  eval_episodes: 51200
+  eval_batch_size: 512    # = the checkpoint's warp_naconmax / slots per world
+  eval_seed: 12345
+  progress_episodes: 4096
+
+network:
+  hidden_dims: [512, 512, 512]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 4   # must match the checkpoint's
+  clip_means: true
+
+optimizer:
+  learning_rate: 0.0003
+  max_grad_norm: 0.5
+  optimizer: adam
+  weight_decay: 0.0
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512         # the training batch; the contact buffer caps it
+  ppo_epochs: 1
+
+  # Off, and they should stay off: see configs/mjx_sumo_br.yaml.
+  target_tau: 0.001
+  magnet_interval: 500
+  trpo_category_kl_coef: 0.0
+  trpo_gaussian_kl_coef: 0.0
+  magnet_category_kl_coef: 0.0
+  magnet_gaussian_kl_coef: 0.0
+
+  category_entropy_coef: 0.005
+  gaussian_entropy_coef: 0.005
+
+  advantage: vtrace
+  gamma: 1.0
+  vtrace_lambda: 0.95
+
+train:
+  # 30000 iterations per responder, both responders in one 24 h amdgpu slot.
+  steps: 15
+  epochs: 2000
+  seed: 0

@@ -46,6 +46,18 @@ import numpy as np  # noqa: E402
 
 from baselines.common import GridOracle, StrategyPair, effective_support, load_game  # noqa: E402
 
+# Display names for the plot legend; methods not listed here show their raw name.
+METHOD_LABELS: dict[str, str] = {
+    "mixture": "Mixture",
+    "mmd_discrete": "Discrete MMD",
+    "nfsp": "NFSP",
+    "psro": "PSRO",
+    "rpn_pathwise": "Randomized policy networks",
+    "sisa": "SISA",
+    "spg": "Randomized policy (black-box)",
+    "jpspg": "JPSPG",
+}
+
 
 def find_runs(out_root: Path) -> list[Path]:
     return sorted(p.parent for p in out_root.glob("*/*/*/meta.json"))
@@ -212,8 +224,8 @@ def plot_game(curves: dict, game: str, out_path: Path,
 
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4), sharey=True)
     panels = (
-        (axes[0], "payoff_evals", "payoff evaluations (budget)"),
-        (axes[1], "wall_time", "wall-time (s)"),
+        (axes[0], "payoff_evals", "Environment interactions"),
+        (axes[1], "wall_time", "Wall-time (s)"),
     )
 
     for ax, x_key, xlabel in panels:
@@ -229,11 +241,11 @@ def plot_game(curves: dict, game: str, out_path: Path,
             x, mean, lo, hi = band
             color = colors[method]
             ax.fill_between(x, lo, hi, color=color, alpha=0.18, linewidth=0)
-            ax.plot(x, mean, color=color, label=method, linewidth=1.8)
+            ax.plot(x, mean, color=color, label=METHOD_LABELS.get(method, method), linewidth=1.8)
 
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("exploitability")
-        ax.set_title(f"{game}: expl vs {x_key if x_key != 'payoff_evals' else 'budget'}")
+        ax.set_ylabel("Exploitability")
+        # ax.set_title(f"{game}: expl vs {x_key if x_key != 'payoff_evals' else 'budget'}")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8, frameon=False)
 
@@ -280,10 +292,15 @@ def main() -> None:
     out_root = Path(args.out)
 
     if args.plot_only:
-        curves_path = out_root / "curves.json"
-        if not curves_path.exists():
-            raise SystemExit(f"no {curves_path}; run scoring first or drop --plot-only")
-        curves = json.loads(curves_path.read_text())
+        # curves.json (a full scoring pass) first, then the per-game `curves__<games>.json`
+        # files, which override it run by run since they are keyed by run directory.
+        paths = [p for p in [out_root / "curves.json"] if p.exists()]
+        paths += sorted(out_root.glob("curves__*.json"))
+        if not paths:
+            raise SystemExit(f"no curves*.json under {out_root}; run scoring first or drop --plot-only")
+        curves = {}
+        for path in paths:
+            curves.update(json.loads(path.read_text()))
         for path in plot_games(curves, out_root, args.game, methods=args.methods):
             print(f"plot -> {path}")
         return
@@ -321,13 +338,17 @@ def main() -> None:
               f"expl {last.get('expl', float('nan')):+.5f}  "
               f"{len(scores)} checkpoints")
 
-    (out_root / "curves.json").write_text(json.dumps(curves, indent=2))
+    # A `--games` subset writes its own files, so per-game jobs running at once do not
+    # overwrite each other's curves; `--plot-only` merges them back.
+    suffix = f"__{'-'.join(sorted(args.games))}" if args.games else ""
+    curves_path, summary_path = out_root / f"curves{suffix}.json", out_root / f"summary{suffix}.md"
+    curves_path.write_text(json.dumps(curves, indent=2))
     table = summary_table(rows)
-    (out_root / "summary.md").write_text(table + "\n")
+    summary_path.write_text(table + "\n")
     print(f"\n{table}")
     print(f"\nscored {len(rows)} runs in {time.monotonic() - started:.1f}s on a "
           f"{args.grid}-point grid")
-    print(f"curves -> {out_root / 'curves.json'}   summary -> {out_root / 'summary.md'}")
+    print(f"curves -> {curves_path}   summary -> {summary_path}")
 
     if args.plot:
         for path in plot_games(curves, out_root, args.game, methods=args.methods):
