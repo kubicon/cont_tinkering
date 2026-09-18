@@ -1,6 +1,6 @@
 """Generate configs + SLURM shell scripts for experiments/one_shot_neural.
 
-Two experiments, selected with ``--experiment``:
+Three experiments, selected with ``--experiment``:
 
 ``main`` (default)
     The eval-matched grid: one job per (game, method) across the chosen seeds, via
@@ -15,14 +15,25 @@ Two experiments, selected with ``--experiment``:
     throughput so that the run lands at the ``--match`` method's wall-time times
     ``--headroom``. Jobs land in a separate output tree and never write the reference.
 
+``capacity``
+    The same eval-matched training, run once per *representation size*: one job per
+    (game, method, K) over the chosen seeds, where K is the mixture's component count
+    (``mixture``) or the discretization's bin count (``mmd_discrete``) -- ``CAPACITIES``,
+    overridable with ``--capacities``. The budget is held fixed across K on purpose, so a
+    curve reads as what the representation buys rather than what a longer run buys. Each
+    cell writes to ``<out>/<game>/<method>__k<K>/seed<N>`` (``run_all.py --label``), which
+    is what keeps the K's from overwriting one another, and ``score.py --plot-capacity``
+    turns the tree into exploitability-against-K.
+
 Game specs live in ``GAMES`` below -- this script writes a YAML for each under
 ``configs/one_shot_neural/`` and points every job at those files. Do not hand it
 paths into ``configs/*.yaml``; edit ``GAMES`` instead (comment a game out to
 drop it from the batch).
 
 Each experiment also writes its own ``scripts/<name>/`` directory with a companion
-``run_all.sh`` that sbatches every generated job, and a ``score.sh`` that runs
-``score.py`` on the same output tree once those jobs finish.
+``run_all.sh`` that sbatches every generated job, one ``score__<game>.sh`` SLURM job
+per game running ``score.py --games <game>`` on the same output tree, and a
+``score_all.sh`` that sbatches those once the training jobs finish.
 
 Edit the defaults in ``main()``, or override them on the CLI:
 
@@ -43,7 +54,14 @@ Hyperparameters come from ``SHARED_SETTINGS`` / ``METHOD_SETTINGS`` (every
     # the wall-time-matched follow-up (spg / jpspg only)
     python rci_scripts/generate_one_shot_neural.py --experiment walltime
     bash scripts/one_shot_neural_walltime/run_all.sh
-    bash scripts/one_shot_neural_walltime/score.sh
+    bash scripts/one_shot_neural_walltime/score_all.sh
+
+    # how exploitability moves with the number of Gaussians / bins
+    python rci_scripts/generate_one_shot_neural.py --experiment capacity
+    python rci_scripts/generate_one_shot_neural.py --experiment capacity \\
+        --capacities 1 2 4 8 --games two_point all_pay_auction
+    bash scripts/one_shot_neural_capacity/run_all.sh
+    bash scripts/one_shot_neural_capacity/score_all.sh  # writes <game>_capacity.png
 
 The ``walltime`` scripts read ``--reference`` at *run* time to calibrate, so that tree
 must already hold finished ``--match`` and pseudo-gradient runs on the cluster. Check
@@ -55,6 +73,7 @@ what the budgets will be before submitting:
 from __future__ import annotations
 
 import argparse
+import ast
 from pathlib import Path
 from typing import Any
 
@@ -64,8 +83,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIGS_DIR = REPO_ROOT / "configs" / "one_shot_neural"
 SCRIPTS_DIR = REPO_ROOT / "scripts" / "one_shot_neural"
 SCRIPTS_DIR_WALLTIME = REPO_ROOT / "scripts" / "one_shot_neural_walltime"
+SCRIPTS_DIR_CAPACITY = REPO_ROOT / "scripts" / "one_shot_neural_capacity"
 RUN_ALL = "experiments/one_shot_neural/run_all.py"
 RUN_WALLTIME = "experiments/one_shot_neural/run_walltime_matched.py"
+RUN_CELL = REPO_ROOT / "experiments" / "one_shot_neural" / "run_cell.py"
 SCORE = "experiments/one_shot_neural/score.py"
 
 # Shared network / optimizer / PPO block. Method-specific knobs live in
@@ -317,6 +338,9 @@ DEFAULT_TIME_H = 4
 DEFAULT_MEMORY_G = 16
 DEFAULT_GPU = False
 DEFAULT_SCORE_GRID = 801
+# One score job scores every run of one game (capacity: ~19 cells x 5 seeds), at
+# minutes per run, so it needs the day-long partition rather than the 4 h one.
+DEFAULT_SCORE_TIME_H = 24
 
 # --- walltime experiment -----------------------------------------------------------
 # Only the methods cheap enough per evaluation to be worth re-running for longer; the
@@ -329,6 +353,59 @@ WALLTIME_HEADROOM = 1.1
 # One cell now costs about what the matched method costs (~950 s on these games), so a
 # job of `len(seeds)` cells at --max-parallel 1 is roughly 3 x that plus compile.
 WALLTIME_TIME_H = 4
+
+# --- capacity experiment -----------------------------------------------------------
+# How exploitability moves with the *representation*, holding the budget fixed: K
+# Gaussians against K grid bins, the same question in two policy classes. Only the two
+# methods whose capacity is a count of atoms are in it -- `psro`'s support grows with its
+# rounds (i.e. with the budget, which is what this experiment holds still), and the
+# randomized policy networks have no such count at all. `nfsp` and `sisa` do have one
+# (`average_components`, `atoms`); name them on --methods to add them.
+CAPACITY_METHODS = ("mixture", "mmd_discrete")
+# Shared across methods on purpose: the comparison is only readable if "K" means the same
+# number on both axes. Powers of two, so the plot's log2 x-axis is evenly spaced.
+CAPACITIES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
+# A one-bin grid is one action -- not a strategy, so there is nothing to be exploitable
+# about; a one-component mixture is still a (Gaussian) strategy, so `mixture` keeps K=1.
+CAPACITY_MIN = {"mmd_discrete": 2}
+CAPACITY_OUT = "data/one_shot_neural_capacity"
+# One job = one (game, method, K) over every seed, the same shape as the main grid's, so
+# the main experiment's wall-time per job carries over.
+CAPACITY_TIME_H = 4
+
+
+def capacity_settings() -> dict[str, str]:
+    """`run_cell.CAPACITY_SETTING`: the `Settings` field that is each method's capacity.
+
+    Read out of that file rather than copied here, so the two cannot drift; parsed rather
+    than imported, because importing `run_cell` pulls in JAX and every baseline just to
+    read a dict of four strings.
+    """
+    tree = ast.parse(RUN_CELL.read_text())
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", None) == "CAPACITY_SETTING"):
+            return ast.literal_eval(node.value)
+    raise SystemExit(f"no CAPACITY_SETTING dict in {RUN_CELL}")
+
+
+def capacity_label(method: str, capacity: int) -> str:
+    """The cell's directory name under `<out>/<game>/` -- `score.py` parses the `__k<N>`
+    suffix back only for the legend; the capacity itself it reads from `meta.json`."""
+    return f"{method}__k{capacity}"
+
+
+def capacity_cells(games: list[str], methods: list[str],
+                   capacities: list[int]) -> list[tuple[str, str, int]]:
+    """The (game, method, K) cells of the capacity experiment, minus the degenerate ones."""
+    known = capacity_settings()
+    unknown = [m for m in methods if m not in known]
+    if unknown:
+        raise SystemExit(
+            f"{unknown} have no capacity knob in run_cell.CAPACITY_SETTING "
+            f"(choices: {sorted(known)})")
+    return [(tag, method, k) for tag in games for method in methods for k in capacities
+            if k >= CAPACITY_MIN.get(method, 1)]
 
 
 def _yaml_scalar(value: Any) -> str:
@@ -383,9 +460,10 @@ def job_name(game_tag: str, method: str) -> str:
     return f"{game_tag}__{method}"
 
 
-def settings_flags(method: str, game_tag: str, extra: list[str] = ()) -> list[str]:
+def settings_flags(method: str, game_tag: str, extra: list[str] = (),
+                   capacity: int | None = None) -> list[str]:
     """`--set key=value` items for one (game, method) job: shared + that method's block +
-    per-game overrides + CLI extras (last, so they still win)."""
+    per-game overrides + this cell's capacity + CLI extras (last, so they still win)."""
     if method not in METHOD_SETTINGS:
         raise SystemExit(
             f"no METHOD_SETTINGS entry for {method!r}; add one or choose from "
@@ -393,6 +471,10 @@ def settings_flags(method: str, game_tag: str, extra: list[str] = ()) -> list[st
     merged = {**SHARED_SETTINGS, **METHOD_SETTINGS[method]}
     if method == "mmd_discrete":
         merged["bins"] = GAMES[game_tag]["num_components"]
+    if capacity is not None:
+        # The capacity experiment's whole axis: it replaces the per-game default above
+        # (and, for `mixture`, the generated config's `network.num_components`).
+        merged[capacity_settings()[method]] = capacity
     flags = [f"{key}={value}" for key, value in merged.items()]
     flags.extend(extra)
     return flags
@@ -411,12 +493,16 @@ def write_job_script(
     memory_g: int,
     gpu: bool,
     settings: list[str] = (),
+    label: str | None = None,
 ) -> None:
     header = prepare_default_script(time_h, memory_g, gpu)
     seeds_str = " ".join(str(s) for s in seeds)
     # One `--set key=value` per override; `run_all.py` forwards each to `run_cell.py` as
     # `--key value`, so these are `run_cell.Settings` field names.
     settings_str = "".join(f"  --set {item} \\\n" for item in settings)
+    # Without a label every K of one method would be the same cell directory, so the
+    # capacity sweep would keep skipping all but the first as "already done".
+    label_str = f"  --label {label} \\\n" if label else ""
     body = f"""
 python {RUN_ALL} \\
   --games {game_config} \\
@@ -424,7 +510,7 @@ python {RUN_ALL} \\
   --seeds {seeds_str} \\
   --budget {budget} \\
   --out {out} \\
-{settings_str}  --max-parallel {max_parallel}
+{label_str}{settings_str}  --max-parallel {max_parallel}
 """
     path.write_text(header + body)
     path.chmod(path.stat().st_mode | 0o111)
@@ -482,17 +568,24 @@ def write_submit_all(path: Path, job_scripts: list[Path], log_dir: str,
     path.chmod(path.stat().st_mode | 0o111)
 
 
-def write_score(path: Path, out: str, grid: int) -> None:
-    """Score the training output tree. Not submitted: scoring is cheap next to training,
-    and running it in the login shell is how you see it fail."""
-    lines = [
-        "#!/bin/sh",
-        "",
-        "# Run after run_all.sh's jobs have finished.",
-        f"python {SCORE} --out {out} --grid {grid} --plot",
-        "",
-    ]
-    path.write_text("\n".join(lines))
+def write_score_job(path: Path, *, tag: str, out: str, grid: int, time_h: int,
+                    memory_g: int, capacity: bool = False) -> None:
+    """Score (and plot) one game's runs as its own SLURM job.
+
+    One oracle evaluation takes minutes, so a whole tree is too long for one shell.
+    `score.py --games` writes `curves__<tag>.json` / `summary__<tag>.md`, so the per-game
+    jobs never overwrite one another, and runs that already have a `scores.json` are
+    skipped -- a job that hits its time limit picks up where it left off when resubmitted.
+    """
+    header = prepare_default_script(time_h, memory_g, False)
+    body = f"""
+python {SCORE} \\
+  --out {out} \\
+  --grid {grid} \\
+  --games {tag} \\
+  --plot{" --plot-capacity" if capacity else ""}
+"""
+    path.write_text(header + body)
     path.chmod(path.stat().st_mode | 0o111)
 
 
@@ -512,6 +605,8 @@ def generate(
     match: str = WALLTIME_MATCH,
     headroom: float = WALLTIME_HEADROOM,
     score_grid: int = DEFAULT_SCORE_GRID,
+    score_time_h: int = DEFAULT_SCORE_TIME_H,
+    capacities: list[int] = (),
 ) -> list[Path]:
     unknown = [g for g in games if g not in GAMES]
     if unknown:
@@ -524,7 +619,9 @@ def generate(
             f"from {sorted(METHOD_SETTINGS)}")
 
     walltime = experiment == "walltime"
-    scripts_dir = SCRIPTS_DIR_WALLTIME if walltime else SCRIPTS_DIR
+    capacity = experiment == "capacity"
+    scripts_dir = {"walltime": SCRIPTS_DIR_WALLTIME,
+                   "capacity": SCRIPTS_DIR_CAPACITY}.get(experiment, SCRIPTS_DIR)
     log_dir = f"logs/{scripts_dir.name}"
     CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -537,7 +634,44 @@ def generate(
         written.append(path)
         game_configs[tag] = config_rel(tag)
 
+    # Replaced by per-game score__<tag>.sh jobs + score_all.sh; drop a stale copy.
+    (scripts_dir / "score.sh").unlink(missing_ok=True)
+    score_jobs: list[Path] = []
+    for tag in games:
+        path = scripts_dir / f"score__{tag}.sh"
+        write_score_job(path, tag=tag, out=out, grid=score_grid, time_h=score_time_h,
+                        memory_g=memory_g, capacity=capacity)
+        score_jobs.append(path)
+        written.append(path)
+    score_all = scripts_dir / "score_all.sh"
+    write_submit_all(score_all, score_jobs, log_dir,
+                     ["# Run after run_all.sh's jobs have finished.", ""])
+
     job_scripts: list[Path] = []
+    if capacity:
+        for tag, method, k in capacity_cells(games, methods, list(capacities)):
+            label = capacity_label(method, k)
+            path = scripts_dir / f"{job_name(tag, label)}.sh"
+            write_job_script(
+                path,
+                game_config=game_configs[tag],
+                method=method,
+                seeds=seeds,
+                budget=budget,
+                out=out,
+                max_parallel=max_parallel,
+                time_h=time_h,
+                memory_g=memory_g,
+                gpu=gpu,
+                settings=settings_flags(method, tag, settings_extra, capacity=k),
+                label=label,
+            )
+            job_scripts.append(path)
+            written.append(path)
+        submit_all = scripts_dir / "run_all.sh"
+        write_submit_all(submit_all, job_scripts, log_dir)
+        return written + [submit_all, score_all]
+
     for tag in games:
         game_config = game_configs[tag]
         for method in methods:
@@ -589,19 +723,18 @@ def generate(
 
     submit_all = scripts_dir / "run_all.sh"
     write_submit_all(submit_all, job_scripts, log_dir, preamble)
-    score = scripts_dir / "score.sh"
-    write_score(score, out, score_grid)
-    written.extend([submit_all, score])
+    written.extend([submit_all, score_all])
     return written
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--experiment", choices=("main", "walltime"), default="main",
+    ap.add_argument("--experiment", choices=("main", "walltime", "capacity"), default="main",
                     help="'main': the eval-matched run_all.py grid. 'walltime': the "
                          "wall-time-matched spg/jpspg re-run (no --budget; it is derived "
-                         "per cell from --reference)")
+                         "per cell from --reference). 'capacity': the same eval-matched "
+                         "training once per mixture-component / bin count (--capacities)")
     ap.add_argument("--games", nargs="+", default=None, choices=sorted(GAMES),
                     metavar="TAG",
                     help="subset of GAMES to generate; default is every key in GAMES")
@@ -624,7 +757,15 @@ def main() -> None:
                          "SHARED_SETTINGS/METHOD_SETTINGS for every job "
                          "(e.g. --set samples=4096); repeatable. Main experiment only")
     ap.add_argument("--score-grid", type=int, default=None,
-                    help="deviation grid score.sh passes to score.py")
+                    help="deviation grid the score__<game>.sh jobs pass to score.py")
+    ap.add_argument("--score-time", type=int, default=None, dest="score_time_h",
+                    help="wall-time hours for each per-game scoring job")
+    capacity_group = ap.add_argument_group("capacity experiment")
+    capacity_group.add_argument("--capacities", nargs="+", type=int, default=None,
+                                metavar="K",
+                                help=f"mixture components / grid bins to sweep "
+                                     f"(default: {' '.join(map(str, CAPACITIES))}). One "
+                                     f"job per (game, method, K), each over every seed")
     walltime_group = ap.add_argument_group("walltime experiment")
     walltime_group.add_argument("--reference", default=None,
                                 help="tree to calibrate the budget from; read, never written")
@@ -638,20 +779,26 @@ def main() -> None:
     # overrides the ones the main grid's values would be wrong for: it re-runs only the
     # cheap methods, into its own tree, and derives its budget rather than taking one.
     walltime = args.experiment == "walltime"
+    capacity = args.experiment == "capacity"
     games = list(GAMES)
-    methods = list(WALLTIME_METHODS if walltime else DEFAULT_METHODS)
+    methods = list({"walltime": WALLTIME_METHODS, "capacity": CAPACITY_METHODS}
+                   .get(args.experiment, DEFAULT_METHODS))
     seeds = list(DEFAULT_SEEDS)
     budget = DEFAULT_BUDGET
-    out = WALLTIME_OUT if walltime else DEFAULT_OUT
+    out = {"walltime": WALLTIME_OUT, "capacity": CAPACITY_OUT}.get(args.experiment,
+                                                                   DEFAULT_OUT)
     max_parallel = DEFAULT_MAX_PARALLEL
-    time_h = WALLTIME_TIME_H if walltime else DEFAULT_TIME_H
+    time_h = {"walltime": WALLTIME_TIME_H, "capacity": CAPACITY_TIME_H}.get(
+        args.experiment, DEFAULT_TIME_H)
     memory_g = DEFAULT_MEMORY_G
     gpu = DEFAULT_GPU
     settings_extra: list[str] = []
+    capacities = list(CAPACITIES)
     reference = WALLTIME_REFERENCE
     match = WALLTIME_MATCH
     headroom = WALLTIME_HEADROOM
     score_grid = DEFAULT_SCORE_GRID
+    score_time_h = DEFAULT_SCORE_TIME_H
 
     if args.games is not None:
         games = args.games
@@ -675,6 +822,10 @@ def main() -> None:
         settings_extra = args.settings_extra
     if args.score_grid is not None:
         score_grid = args.score_grid
+    if args.score_time_h is not None:
+        score_time_h = args.score_time_h
+    if args.capacities is not None:
+        capacities = args.capacities
     if args.reference is not None:
         reference = args.reference
     if args.match is not None:
@@ -689,6 +840,12 @@ def main() -> None:
         print("note: --set is ignored for --experiment walltime; "
               "run_walltime_matched.py has no --set")
         settings_extra = []
+    if not capacity and args.capacities is not None:
+        print(f"note: --capacities is ignored for --experiment {args.experiment}")
+    if capacity:
+        bad = [k for k in capacities if k < 1]
+        if bad:
+            raise SystemExit(f"--capacities must be positive (got {bad})")
 
     written = generate(
         games=games,
@@ -706,16 +863,20 @@ def main() -> None:
         match=match,
         headroom=headroom,
         score_grid=score_grid,
+        score_time_h=score_time_h,
+        capacities=capacities,
     )
-    scripts_dir = SCRIPTS_DIR_WALLTIME if walltime else SCRIPTS_DIR
+    scripts_dir = {"walltime": SCRIPTS_DIR_WALLTIME,
+                   "capacity": SCRIPTS_DIR_CAPACITY}.get(args.experiment, SCRIPTS_DIR)
     n_configs = len(games)
-    n_jobs = len(games) * len(methods)
+    n_jobs = (len(capacity_cells(games, methods, capacities)) if capacity
+              else len(games) * len(methods))
     print(f"wrote {n_configs} configs under {CONFIGS_DIR.relative_to(REPO_ROOT)}")
-    print(f"wrote {n_jobs} job scripts + run_all.sh + score.sh under "
-          f"{scripts_dir.relative_to(REPO_ROOT)}")
+    print(f"wrote {n_jobs} job scripts + {n_configs} score jobs + run_all.sh + "
+          f"score_all.sh under {scripts_dir.relative_to(REPO_ROOT)}")
     for path in written:
         print(f"  {path.relative_to(REPO_ROOT)}")
-    print(f"score: bash {(scripts_dir / 'score.sh').relative_to(REPO_ROOT)}")
+    print(f"score: bash {(scripts_dir / 'score_all.sh').relative_to(REPO_ROOT)}")
 
 
 if __name__ == "__main__":

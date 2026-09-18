@@ -22,6 +22,15 @@ generator (baked into every score script), not of the training sweep::
 Filter the same axes the training generator uses (``--games``, ``--solvers``,
 ``--seeds``) so you can rescore only Leduc, or only one seed, without rewriting
 the training scripts. ``--dry-run`` prints the plan and writes nothing.
+
+``--experiment`` picks *which* sweep to score, by the same name the training
+generator writes it under -- ``capacity`` reads
+``scripts/sequential_capacity/manifest.json`` and scores
+``data/sequential_capacity``::
+
+    python rci_scripts/generate_sequential_sweep.py --experiment capacity
+    python rci_scripts/generate_sequential_sweep_score.py --experiment capacity
+    bash scripts/sequential_capacity/run_all_score.sh
 """
 
 from __future__ import annotations
@@ -30,15 +39,35 @@ import argparse
 import json
 from pathlib import Path
 
+from generate_sequential_sweep import EXPERIMENT_DIRS
 from utils import prepare_default_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS_DIR = REPO_ROOT / "scripts" / "sequential_sweep"
-CONFIGS_DIR = REPO_ROOT / "configs" / "sequential_sweep"
-CHECKPOINT_ROOT = "data/sequential_sweep"
-LOG_DIR = "logs/sequential_sweep/score"
-MANIFEST = SCRIPTS_DIR / "manifest.json"
 SCORE = "rci_scripts/score_sequential_sweep.py"
+
+
+class Paths:
+    """The tree one experiment lives in, named exactly as the training generator names
+    it (`generate_sequential_sweep.EXPERIMENT_DIRS`) -- scoring reads that sweep's
+    `manifest.json`, so the two must agree on where it is."""
+
+    def __init__(self, experiment: str) -> None:
+        if experiment not in EXPERIMENT_DIRS:
+            raise SystemExit(f"unknown experiment {experiment!r}; "
+                             f"choices: {sorted(EXPERIMENT_DIRS)}")
+        name = EXPERIMENT_DIRS[experiment]
+        self.scripts = REPO_ROOT / "scripts" / name
+        self.configs = REPO_ROOT / "configs" / name
+        self.checkpoints = f"data/{name}"
+        self.logs = f"logs/{name}/score"
+        self.manifest = self.scripts / "manifest.json"
+
+
+SCRIPTS_DIR = Paths("main").scripts
+CONFIGS_DIR = Paths("main").configs
+CHECKPOINT_ROOT = Paths("main").checkpoints
+LOG_DIR = Paths("main").logs
+MANIFEST = Paths("main").manifest
 
 DEFAULT_BR_STEPS = 200
 DEFAULT_BR_EPOCHS = 100
@@ -50,14 +79,14 @@ DEFAULT_MEMORY_G = 16
 DEFAULT_GPU = False
 
 
-def load_manifest() -> dict:
-    if not MANIFEST.exists():
+def load_manifest(paths: Paths) -> dict:
+    if not paths.manifest.exists():
         raise SystemExit(
-            f"no {MANIFEST.relative_to(REPO_ROOT)}; run "
+            f"no {paths.manifest.relative_to(REPO_ROOT)}; run "
             "rci_scripts/generate_sequential_sweep.py first so the scoring "
             "jobs know which runs exist"
         )
-    return json.loads(MANIFEST.read_text())
+    return json.loads(paths.manifest.read_text())
 
 
 def filter_runs(
@@ -147,13 +176,13 @@ def write_score_job_script(
     path.chmod(path.stat().st_mode | 0o111)
 
 
-def write_submit_all(path: Path, job_scripts: list[Path]) -> None:
-    lines = ["#!/bin/sh", "", f"mkdir -p {LOG_DIR}", ""]
+def write_submit_all(path: Path, job_scripts: list[Path], log_dir: str = LOG_DIR) -> None:
+    lines = ["#!/bin/sh", "", f"mkdir -p {log_dir}", ""]
     for script in job_scripts:
         rel = script.relative_to(REPO_ROOT).as_posix()
-        lines.append(f"sbatch -o {LOG_DIR}/{script.stem}.log {rel}")
+        lines.append(f"sbatch -o {log_dir}/{script.stem}.log {rel}")
     lines.append("")
-    lines.append(f'echo "submitted {len(job_scripts)} score jobs; logs in {LOG_DIR}"')
+    lines.append(f'echo "submitted {len(job_scripts)} score jobs; logs in {log_dir}"')
     path.write_text("\n".join(lines) + "\n")
     path.chmod(path.stat().st_mode | 0o111)
 
@@ -189,16 +218,18 @@ def generate(
     memory_g: int,
     gpu: bool,
     dry_run: bool = False,
+    experiment: str = "main",
 ) -> list[Path]:
-    manifest = load_manifest()
-    checkpoint_root = manifest.get("checkpoint_root", CHECKPOINT_ROOT)
+    paths = Paths(experiment)
+    manifest = load_manifest(paths)
+    checkpoint_root = manifest.get("checkpoint_root", paths.checkpoints)
     runs = filter_runs(
         manifest["runs"], games=games, solvers=solvers, seeds=seeds
     )
     if not runs:
         raise SystemExit(
             "no runs left after filtering; check --games / --solvers / --seeds "
-            f"against {MANIFEST.relative_to(REPO_ROOT)}"
+            f"against {paths.manifest.relative_to(REPO_ROOT)}"
         )
 
     settings = {
@@ -229,13 +260,13 @@ def generate(
             print(f"  score__{run['name']}  {run_time_h}h")
         return []
 
-    SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    configs_rel = CONFIGS_DIR.relative_to(REPO_ROOT).as_posix()
+    paths.scripts.mkdir(parents=True, exist_ok=True)
+    configs_rel = paths.configs.relative_to(REPO_ROOT).as_posix()
     written: list[Path] = []
     job_scripts: list[Path] = []
 
     for run in runs:
-        script_path = SCRIPTS_DIR / score_script_name(run["name"])
+        script_path = paths.scripts / score_script_name(run["name"])
         write_score_job_script(
             script_path,
             run_name=run["name"],
@@ -257,9 +288,9 @@ def generate(
         job_scripts.append(script_path)
         written.append(script_path)
 
-    submit_all = SCRIPTS_DIR / "run_all_score.sh"
-    write_submit_all(submit_all, job_scripts)
-    score_manifest = SCRIPTS_DIR / "score_manifest.json"
+    submit_all = paths.scripts / "run_all_score.sh"
+    write_submit_all(submit_all, job_scripts, paths.logs)
+    score_manifest = paths.scripts / "score_manifest.json"
     write_score_manifest(
         score_manifest,
         checkpoint_root=checkpoint_root,
@@ -345,6 +376,11 @@ def main() -> None:
         "--dry-run", action="store_true",
         help="print the score-job plan and write nothing",
     )
+    ap.add_argument(
+        "--experiment", choices=sorted(EXPERIMENT_DIRS), default="main",
+        help="which sweep to score: the manifest, configs and checkpoints of "
+             "generate_sequential_sweep.py --experiment <this>",
+    )
     args = ap.parse_args()
     if args.n_checkpoints is not None and args.n_checkpoints <= 2:
         raise SystemExit(f"--n-checkpoints must be > 2, got {args.n_checkpoints}")
@@ -367,19 +403,21 @@ def main() -> None:
         memory_g=args.memory_g,
         gpu=args.gpu,
         dry_run=args.dry_run,
+        experiment=args.experiment,
     )
     if not written:
         return
+    paths = Paths(args.experiment)
     n_jobs = len(written) - 2
     print(
         f"wrote {n_jobs} score job scripts + run_all_score.sh + score_manifest.json"
     )
-    print(f"  scripts : {SCRIPTS_DIR.relative_to(REPO_ROOT)}")
-    print(f"  scores  : {CHECKPOINT_ROOT}/{{run}}/exploitability.pkl")
+    print(f"  scripts : {paths.scripts.relative_to(REPO_ROOT)}")
+    print(f"  scores  : {paths.checkpoints}/{{run}}/exploitability.pkl")
     print(f"  BR      : {args.br_steps}x{args.br_epochs}, eval {args.episodes} episodes")
     if args.n_checkpoints is not None:
         print(f"  subsample: --n-checkpoints {args.n_checkpoints} (non-Kuhn only)")
-    print(f"\nsubmit: bash {(SCRIPTS_DIR / 'run_all_score.sh').relative_to(REPO_ROOT)}")
+    print(f"\nsubmit: bash {(paths.scripts / 'run_all_score.sh').relative_to(REPO_ROOT)}")
 
 
 if __name__ == "__main__":

@@ -23,6 +23,13 @@ same output tree.
 `jpspg`) are registered and runnable but not in it, so they have to be named:
 
     python experiments/one_shot_neural/run_all.py --methods spg jpspg
+
+A cell is identified by its directory, `<out>/<game>/<method>/seed<N>`, so running one
+method twice at different settings would be running the same cell twice. `--label`
+renames that middle level, which is how the capacity sweep keeps one K per cell:
+
+    python experiments/one_shot_neural/run_all.py --methods mixture \\
+        --set num_components=8 --label mixture__k8
 """
 
 from __future__ import annotations
@@ -64,12 +71,12 @@ DEFAULT_GAMES = (
 RUN_CELL = HERE / "run_cell.py"
 
 
-def cell_name(game: str, method: str, seed: int) -> str:
-    return f"{Path(game).stem}__{method}__seed{seed}"
+def cell_name(game: str, label: str, seed: int) -> str:
+    return f"{Path(game).stem}__{label}__seed{seed}"
 
 
-def is_done(out_root: Path, game: str, method: str, seed: int) -> bool:
-    return (out_root / Path(game).stem / method / f"seed{seed}" / "meta.json").exists()
+def is_done(out_root: Path, game: str, label: str, seed: int) -> bool:
+    return (out_root / Path(game).stem / label / f"seed{seed}" / "meta.json").exists()
 
 
 def child_environment(threads: int) -> dict:
@@ -99,6 +106,11 @@ def main() -> None:
     ap.add_argument("--budget", type=int, default=2_000_000,
                     help="payoff evaluations per cell -- the common currency; see run_cell.py")
     ap.add_argument("--out", default="data/one_shot_neural")
+    ap.add_argument("--label", default=None,
+                    help="directory name for these cells under <out>/<game>/, instead of "
+                         "the method's own. One method per invocation, since the label "
+                         "names the settings as well: --methods mixture --set "
+                         "num_components=8 --label mixture__k8")
     ap.add_argument("--max-parallel", type=int, default=4)
     ap.add_argument("--threads-per-cell", type=int, default=0,
                     help="0 divides the machine's cores evenly among the parallel cells")
@@ -111,6 +123,10 @@ def main() -> None:
     args = ap.parse_args()
 
     out_root = Path(args.out)
+    if args.label and len(args.methods) != 1:
+        raise SystemExit("--label names one method's settings; pass a single --methods "
+                         f"(got {args.methods})")
+    label = args.label
     extra: list[str] = []
     for item in args.set:
         key, _, value = item.partition("=")
@@ -118,14 +134,15 @@ def main() -> None:
 
     cells = [(game, method, seed)
              for game in args.games for method in args.methods for seed in args.seeds]
-    pending = [c for c in cells if args.overwrite or not is_done(out_root, *c)]
+    pending = [c for c in cells
+               if args.overwrite or not is_done(out_root, c[0], label or c[1], c[2])]
 
     threads = args.threads_per_cell or max(1, (os.cpu_count() or 4) // max(args.max_parallel, 1))
     print(f"{len(cells)} cells, {len(pending)} to run, {args.max_parallel} at a time "
           f"({threads} threads each), budget {args.budget:.3g} payoff evals -> {out_root}")
     if args.dry_run:
         for game, method, seed in pending:
-            print(f"  {cell_name(game, method, seed)}")
+            print(f"  {cell_name(game, label or method, seed)}")
         return
 
     logs = out_root / "logs"
@@ -139,9 +156,11 @@ def main() -> None:
     while queue or running:
         while queue and len(running) < args.max_parallel:
             game, method, seed = queue.pop(0)
-            name = cell_name(game, method, seed)
+            name = cell_name(game, label or method, seed)
             command = [sys.executable, str(RUN_CELL), "--game", game, "--method", method,
                        "--seed", str(seed), "--budget", str(args.budget), "--out", str(out_root)]
+            if label:
+                command += ["--label", label]
             if args.overwrite:
                 command.append("--overwrite")
             if args.score:

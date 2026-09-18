@@ -92,6 +92,31 @@ ACCESS_MODEL = {
     "sisa": "exact payoff gradients",
 }
 
+# The knob that *is* each method's representation capacity -- how many atoms, components
+# or bins the strategy it can end on is built from. This is the axis
+# `generate_one_shot_neural.py --experiment capacity` sweeps, and the reason it is a table
+# rather than one flag is that the methods do not share a parametrization: K Gaussians and
+# K grid bins are the same claim about capacity made in two different policy classes.
+# Methods absent from here have no such knob -- `psro`'s support grows with its rounds
+# (i.e. with the budget), and `rpn_pathwise`/`spg`/`jpspg` carry a continuous randomized
+# policy whose capacity is not a count at all.
+CAPACITY_SETTING = {
+    "mixture": "num_components",
+    "mmd_discrete": "bins",
+    "nfsp": "average_components",
+    "sisa": "atoms",
+}
+
+
+def capacity(method: str, settings: Settings) -> int | None:
+    """This cell's capacity, or `None` when the method has no such knob (or when
+    `mixture` was left on the config's `num_components` rather than given one here)."""
+    field = CAPACITY_SETTING.get(method)
+    if field is None:
+        return None
+    value = getattr(settings, field)
+    return int(value) if value else None
+
 
 @dataclasses.dataclass
 class Settings:
@@ -109,6 +134,11 @@ class Settings:
     # Shared by every method that carries a continuous policy, so raising it changes the
     # metric for all of them equally.
     samples: int = 16384
+    # mixture (and any other method whose policy is the config's). Components in the
+    # Gaussian mixture. 0 keeps the game config's `network.num_components`, which is what
+    # every run that is not sweeping capacity wants; a positive value overrides it, so the
+    # capacity experiment moves that one knob without a config per K. See CAPACITY_SETTING.
+    num_components: int = 0
     # mmd_discrete
     bins: int = 51
     # spg / jpspg. NOT the paper's defaults (those are sigma=0.1, lr=1e-4, noise_dim=8,
@@ -458,11 +488,21 @@ def _git_commit() -> str | None:
 
 
 def run_cell(game_config_path: str, method: str, seed: int, budget: int, settings: Settings,
-             out_root: Path, score: bool = False, overwrite: bool = False) -> dict:
-    """One cell. Returns its summary row; failures are recorded rather than raised."""
+             out_root: Path, score: bool = False, overwrite: bool = False,
+             label: str | None = None) -> dict:
+    """One cell. Returns its summary row; failures are recorded rather than raised.
+
+    `label` is the directory this cell writes under (`<out>/<game>/<label>/seed<N>`) and
+    the name `score.py` plots it as; it defaults to `method`. It exists so that two runs
+    of the *same* method at different settings -- the capacity sweep's `mixture__k8` and
+    `mixture__k16` -- are two cells rather than one cell run twice, while `method` stays
+    the registered runner both of them are.
+    """
     game_tag = Path(game_config_path).stem
-    directory = out_root / game_tag / method / f"seed{seed}"
-    row = {"game": game_tag, "method": method, "seed": seed, "budget": budget,
+    label = label or method
+    directory = out_root / game_tag / label / f"seed{seed}"
+    row = {"game": game_tag, "method": method, "label": label, "seed": seed,
+           "budget": budget, "capacity": capacity(method, settings),
            "config": game_config_path, "dir": str(directory),
            "access_model": ACCESS_MODEL[method]}
 
@@ -477,6 +517,11 @@ def run_cell(game_config_path: str, method: str, seed: int, budget: int, setting
     started = time.monotonic()
     try:
         game, game_cfg, config = load_run(game_config_path)
+        if settings.num_components:
+            # The mixture's capacity is a field of the config every method in the cell
+            # reads, not of `Settings`, so overriding it here is what lets a capacity
+            # sweep reuse one game config for every K.
+            config.network.num_components = settings.num_components
         oracle = GridOracle(game, points=settings.grid)
         batch = build_hyperparams(game, 0, config).num_envs
         plan = plan_units(method, budget, settings, batch)
@@ -538,6 +583,10 @@ def main() -> None:
     ap.add_argument("--budget", type=int, default=2_000_000,
                     help="payoff evaluations this cell may spend")
     ap.add_argument("--out", default="data/one_shot_neural")
+    ap.add_argument("--label", default=None,
+                    help="directory name for this cell under <out>/<game>/ (default: the "
+                         "method). Give two settings of one method different labels so "
+                         "they do not overwrite each other, e.g. --label mixture__k8")
     ap.add_argument("--score", action="store_true",
                     help="also compute exploitability during the run (slower; normally left "
                          "to score.py)")
@@ -546,10 +595,14 @@ def main() -> None:
     args = ap.parse_args()
 
     settings = settings_from_args(args)
-    print(f"{args.method} / {Path(args.game).stem} / seed{args.seed} / "
-          f"budget {args.budget:.3g} payoff evals  ({ACCESS_MODEL[args.method]})")
+    k = capacity(args.method, settings)
+    print(f"{args.label or args.method} / {Path(args.game).stem} / seed{args.seed} / "
+          f"budget {args.budget:.3g} payoff evals"
+          + (f" / capacity {k}" if k is not None else "")
+          + f"  ({ACCESS_MODEL[args.method]})")
     row = run_cell(args.game, args.method, args.seed, args.budget, settings,
-                   Path(args.out), score=args.score, overwrite=args.overwrite)
+                   Path(args.out), score=args.score, overwrite=args.overwrite,
+                   label=args.label)
     if row.get("status") == "failed":
         sys.exit(1)
 

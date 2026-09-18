@@ -63,6 +63,22 @@ and full set of overrides, which is what an analysis script should read rather
 than parsing the directory names back apart. Offline exploitability scoring is
 ``generate_sequential_sweep_score.py``: one SLURM job per run, reading this
 manifest and calling ``score_sequential_sweep.py``.
+
+**``--experiment capacity``** is the same machinery pointed at one question: how
+exploitability moves with the size of the representation. It sweeps
+``network.num_components`` for ``self_play`` and ``discrete.bins`` for
+``discrete_mmd`` over the same ``CAPACITIES``, every other hyperparameter left at
+its ``SOLVERS`` value, and writes to ``configs/``, ``scripts/``, ``logs/`` and
+``data/sequential_capacity`` so it never shares a ``manifest.json`` or a
+``run_all.sh`` with the main sweep::
+
+    python rci_scripts/generate_sequential_sweep.py --experiment capacity --dry-run
+    python rci_scripts/generate_sequential_sweep.py --experiment capacity \\
+        --capacities 1 2 4 8 16 --games configs/kuhn_solvers.yaml
+    bash scripts/sequential_capacity/run_all.sh
+    python rci_scripts/generate_sequential_sweep_score.py --experiment capacity
+    bash scripts/sequential_capacity/run_all_score.sh
+    python rci_scripts/plot_sequential_sweep.py --out data/sequential_capacity --capacity
 """
 
 from __future__ import annotations
@@ -79,17 +95,43 @@ import yaml
 from utils import prepare_default_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CONFIGS_DIR = REPO_ROOT / "configs" / "sequential_sweep"
-SCRIPTS_DIR = REPO_ROOT / "scripts" / "sequential_sweep"
-CHECKPOINT_ROOT = "data/sequential_sweep"
-LOG_DIR = "logs/sequential_sweep"
 RUN_CONFIG = REPO_ROOT / "training" / "run_config.py"
 TRAIN = "train_sequential.py"
+
+# Each experiment owns a directory name, and that one name fixes where its configs,
+# scripts, logs and checkpoints go. A sweep that shared a tree with another would also
+# share `manifest.json` and `run_all.sh`, and generating one would silently retarget the
+# other's scoring jobs -- so `capacity` is a tree of its own rather than a flag.
+EXPERIMENT_DIRS = {
+    "main": "sequential_sweep",
+    "capacity": "sequential_capacity",
+}
+CONFIGS_DIR = REPO_ROOT / "configs" / EXPERIMENT_DIRS["main"]
+SCRIPTS_DIR = REPO_ROOT / "scripts" / EXPERIMENT_DIRS["main"]
+CHECKPOINT_ROOT = f"data/{EXPERIMENT_DIRS['main']}"
+LOG_DIR = f"logs/{EXPERIMENT_DIRS['main']}"
+
+
+class Paths:
+    """Where one experiment writes. `main`'s are the module constants above."""
+
+    def __init__(self, experiment: str) -> None:
+        if experiment not in EXPERIMENT_DIRS:
+            raise SystemExit(f"unknown experiment {experiment!r}; "
+                             f"choices: {sorted(EXPERIMENT_DIRS)}")
+        name = EXPERIMENT_DIRS[experiment]
+        self.experiment = experiment
+        self.configs = REPO_ROOT / "configs" / name
+        self.scripts = REPO_ROOT / "scripts" / name
+        self.checkpoints = f"data/{name}"
+        self.logs = f"logs/{name}"
+
 
 DEFAULT_GAMES = (
     "configs/kuhn_solvers.yaml",
     "configs/leduc_solvers.yaml",
     "configs/sequential_blotto_solvers.yaml",
+    "configs/sequential_blotto5_solvers.yaml",
 )
 DEFAULT_SEEDS = (0, 1, 2, 3, 4)
 DEFAULT_TIME_H = 4
@@ -282,6 +324,38 @@ SOLVERS: dict[str, dict[str, object]] = {
     # },
 }
 
+# --------------------------------------------------------------------------- capacity
+#
+# `--experiment capacity`: the same training, run once per representation size. The
+# question is what a K-component mixture buys over a K-bin grid at a fixed budget, so the
+# two solvers sweep the *same* K's -- the axis below is the only thing that differs from
+# the `main` sweep, every other hyperparameter staying at its SOLVERS value so a
+# difference in the plot is a difference in the representation.
+CAPACITIES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
+# The one key that *is* capacity, per solver. `sac`, `nfsp` and `psro` are absent because
+# they pin `num_components` to 1 by definition (a plain Gaussian is what they are being
+# compared as), and `rpn`'s randomized policy has no such count.
+CAPACITY_AXIS = {
+    "self_play": "network.num_components",
+    "discrete_mmd": "discrete.bins",
+}
+# A one-bin grid leaves the player no choice at all, so there is no strategy to be
+# exploitable about; a one-component mixture is still a Gaussian strategy.
+CAPACITY_MIN = {"discrete_mmd": 2}
+
+
+def capacity_solvers(capacities: list[int]) -> dict[str, dict[str, object]]:
+    """SOLVERS with each capacity solver's own capacity key replaced by the sweep axis."""
+    grids = {}
+    for solver, axis in CAPACITY_AXIS.items():
+        values = [k for k in capacities if k >= CAPACITY_MIN.get(solver, 1)]
+        if not values:
+            raise SystemExit(f"no capacities left for {solver} "
+                             f"(minimum {CAPACITY_MIN.get(solver, 1)}): {capacities}")
+        grids[solver] = {**SOLVERS[solver], axis: values}
+    return grids
+
+
 # Per-game overrides of COMMON/SOLVERS (same bare-vs-list rule). Keys must match
 # an entry of `--games`. Only shared sections (network/optimizer/ppo/train/scoring)
 # and the active solver's own section are applied -- an `nfsp.*` override never
@@ -390,14 +464,20 @@ def validate(grid: dict[str, object], where: str, game_fields: set[str]) -> None
 # --------------------------------------------------------------------------- the plan
 
 
-def merge_grid(solver: str, game: str) -> dict[str, object]:
-    """COMMON < SOLVERS[solver] < relevant keys of GAME_OVERRIDES[game]."""
+def merge_grid(solver: str, game: str,
+               solvers: dict[str, dict[str, object]] | None = None) -> dict[str, object]:
+    """COMMON < solvers[solver] < relevant keys of GAME_OVERRIDES[game].
+
+    `solvers` is the experiment's grid -- SOLVERS for the main sweep, `capacity_solvers()`
+    for the capacity one.
+    """
+    solvers = SOLVERS if solvers is None else solvers
     allowed = _SHARED_SECTIONS | _SOLVER_SECTIONS[solver]
     game_over = {
         key: value for key, value in GAME_OVERRIDES.get(game, {}).items()
         if key.partition(".")[0] in allowed
     }
-    return {**COMMON, **SOLVERS[solver], **game_over}
+    return {**COMMON, **solvers[solver], **game_over}
 
 
 def variants(grid: dict[str, object]) -> list[dict[str, object]]:
@@ -492,21 +572,23 @@ def write_job_script(
     path.chmod(path.stat().st_mode | 0o111)
 
 
-def write_submit_all(path: Path, job_scripts: list[Path]) -> None:
-    lines = ["#!/bin/sh", "", f"mkdir -p {LOG_DIR}", ""]
+def write_submit_all(path: Path, job_scripts: list[Path], log_dir: str = LOG_DIR) -> None:
+    lines = ["#!/bin/sh", "", f"mkdir -p {log_dir}", ""]
     for script in job_scripts:
         rel = script.relative_to(REPO_ROOT).as_posix()
-        lines.append(f"sbatch -o {LOG_DIR}/{script.stem}.log {rel}")
+        lines.append(f"sbatch -o {log_dir}/{script.stem}.log {rel}")
     lines.append("")
-    lines.append(f'echo "submitted {len(job_scripts)} jobs; logs in {LOG_DIR}"')
+    lines.append(f'echo "submitted {len(job_scripts)} jobs; logs in {log_dir}"')
     path.write_text("\n".join(lines) + "\n")
     path.chmod(path.stat().st_mode | 0o111)
 
 
-def write_manifest(path: Path, runs: list[dict]) -> None:
+def write_manifest(path: Path, runs: list[dict], checkpoint_root: str = CHECKPOINT_ROOT,
+                   experiment: str = "main") -> None:
     """What each run is, for whatever reads the sweep back -- so an analysis
     script never has to parse a directory name apart."""
-    path.write_text(json.dumps({"checkpoint_root": CHECKPOINT_ROOT, "runs": runs}, indent=2) + "\n")
+    path.write_text(json.dumps({"checkpoint_root": checkpoint_root,
+                                "experiment": experiment, "runs": runs}, indent=2) + "\n")
 
 
 # --------------------------------------------------------------------------- generation
@@ -520,20 +602,24 @@ def generate(
     memory_g: int,
     gpu: bool,
     dry_run: bool = False,
+    experiment: str = "main",
+    solver_grids: dict[str, dict[str, object]] | None = None,
 ) -> list[Path]:
+    paths = Paths(experiment)
+    solver_grids = SOLVERS if solver_grids is None else solver_grids
     bases = {game: load_base_config(game) for game in games}
     for game in games:
         game_fields = set(bases[game]["game"]) - {"name"}
         validate(COMMON, "COMMON", game_fields)
         for solver in solvers:
-            validate(SOLVERS[solver], f"SOLVERS[{solver!r}]", game_fields)
+            validate(solver_grids[solver], f"SOLVERS[{solver!r}]", game_fields)
         if game in GAME_OVERRIDES:
             validate(GAME_OVERRIDES[game], f"GAME_OVERRIDES[{game!r}]", game_fields)
 
     plan: list[dict] = []
     for game in games:
         for solver in solvers:
-            grid = merge_grid(solver, game)
+            grid = merge_grid(solver, game, solver_grids)
             axes = swept_axes(grid)
             for variant in variants(grid):
                 tag = variant_tag(grid, variant)
@@ -548,8 +634,8 @@ def generate(
                         "overrides": {k: (list(v) if isinstance(v, tuple) else v)
                                       for k, v in sorted(variant.items())},
                         "swept": {k: variant[k] for k in axes},
-                        "checkpoint_dir": f"{CHECKPOINT_ROOT}/{name}",
-                        "config": (CONFIGS_DIR / f"{name}.yaml").relative_to(REPO_ROOT).as_posix(),
+                        "checkpoint_dir": f"{paths.checkpoints}/{name}",
+                        "config": (paths.configs / f"{name}.yaml").relative_to(REPO_ROOT).as_posix(),
                     })
 
     if dry_run:
@@ -560,8 +646,8 @@ def generate(
             print(f"  {run['name']:<64} {settings}")
         return []
 
-    CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
-    SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    paths.configs.mkdir(parents=True, exist_ok=True)
+    paths.scripts.mkdir(parents=True, exist_ok=True)
 
     written: list[Path] = []
     job_scripts: list[Path] = []
@@ -575,7 +661,7 @@ def generate(
             seed=run["seed"],
             checkpoint_dir=run["checkpoint_dir"],
         )
-        script_path = SCRIPTS_DIR / f"{run['name']}.sh"
+        script_path = paths.scripts / f"{run['name']}.sh"
         write_job_script(
             script_path,
             config_rel=run["config"],
@@ -587,10 +673,10 @@ def generate(
         job_scripts.append(script_path)
         written.append(script_path)
 
-    submit_all = SCRIPTS_DIR / "run_all.sh"
-    write_submit_all(submit_all, job_scripts)
-    manifest = SCRIPTS_DIR / "manifest.json"
-    write_manifest(manifest, plan)
+    submit_all = paths.scripts / "run_all.sh"
+    write_submit_all(submit_all, job_scripts, paths.logs)
+    manifest = paths.scripts / "manifest.json"
+    write_manifest(manifest, plan, paths.checkpoints, experiment)
     return written + [submit_all, manifest]
 
 
@@ -598,12 +684,21 @@ def main() -> None:
     real_solvers = set(solver_choices())
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--experiment", choices=sorted(EXPERIMENT_DIRS), default="main",
+                    help="'main': the SOLVERS grid. 'capacity': the same training swept "
+                         "over mixture components / discretization bins (--capacities), "
+                         "into configs/scripts/data/sequential_capacity")
+    ap.add_argument("--capacities", nargs="+", type=int, default=list(CAPACITIES),
+                    metavar="K",
+                    help="--experiment capacity: the component / bin counts to sweep "
+                         f"(default: {' '.join(map(str, CAPACITIES))})")
     ap.add_argument("--games", nargs="+", default=list(DEFAULT_GAMES),
                     help="base sequential configs; each run's config is one of these with "
                          "the variant folded in (game: block comes from here)")
-    ap.add_argument("--solvers", nargs="+", default=sorted(SOLVERS), choices=sorted(SOLVERS),
-                    help="which SOLVERS entries to generate; aliases (e.g. sac) map via "
-                         "SOLVER_ALIASES to a real train.solver")
+    ap.add_argument("--solvers", nargs="+", default=None,
+                    help="which SOLVERS entries to generate (default: all of the "
+                         "experiment's); aliases (e.g. sac) map via SOLVER_ALIASES to a "
+                         "real train.solver")
     ap.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS),
                     help="one run per seed -- each gets its own config, script and directory")
     ap.add_argument("--time", type=int, default=DEFAULT_TIME_H, dest="time_h",
@@ -615,10 +710,22 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="print the plan and write nothing")
     args = ap.parse_args()
 
-    missing = [solver for solver in args.solvers if solver not in SOLVERS]
+    # The capacity experiment is SOLVERS with one key per solver turned into an axis, so
+    # it also decides which solvers there are to run: only the two that have a capacity.
+    solver_grids = (capacity_solvers(args.capacities) if args.experiment == "capacity"
+                    else SOLVERS)
+    solvers = args.solvers if args.solvers is not None else sorted(solver_grids)
+    if args.experiment != "capacity" and args.capacities != list(CAPACITIES):
+        print(f"note: --capacities is ignored for --experiment {args.experiment}")
+
+    missing = [solver for solver in solvers if solver not in solver_grids]
     if missing:
-        raise SystemExit(f"no entry for {missing}; add one to SOLVERS in {Path(__file__).name} "
-                         "(an empty dict means 'COMMON alone')")
+        raise SystemExit(
+            f"no entry for {missing} in the {args.experiment} experiment "
+            f"(it has {sorted(solver_grids)}); add one to "
+            + ("CAPACITY_AXIS" if args.experiment == "capacity" else "SOLVERS")
+            + f" in {Path(__file__).name}")
+    args.solvers = solvers
     bad_alias = [f"{alias}->{target}" for alias, target in SOLVER_ALIASES.items()
                  if alias in args.solvers and target not in real_solvers]
     if bad_alias:
@@ -635,16 +742,22 @@ def main() -> None:
         memory_g=args.memory_g,
         gpu=args.gpu,
         dry_run=args.dry_run,
+        experiment=args.experiment,
+        solver_grids=solver_grids,
     )
     if not written:
         return
+    paths = Paths(args.experiment)
     runs = (len(written) - 2) // 2
     print(f"wrote {runs} configs + {runs} job scripts (one training run each) "
           f"+ run_all.sh + manifest.json")
-    print(f"  configs    : {CONFIGS_DIR.relative_to(REPO_ROOT)}")
-    print(f"  scripts    : {SCRIPTS_DIR.relative_to(REPO_ROOT)}")
-    print(f"  checkpoints: {CHECKPOINT_ROOT}/{{run_name}}")
-    print(f"\nsubmit: bash {(SCRIPTS_DIR / 'run_all.sh').relative_to(REPO_ROOT)}")
+    print(f"  configs    : {paths.configs.relative_to(REPO_ROOT)}")
+    print(f"  scripts    : {paths.scripts.relative_to(REPO_ROOT)}")
+    print(f"  checkpoints: {paths.checkpoints}/{{run_name}}")
+    print(f"\nsubmit: bash {(paths.scripts / 'run_all.sh').relative_to(REPO_ROOT)}")
+    if args.experiment != "main":
+        print(f"score : python rci_scripts/generate_sequential_sweep_score.py "
+              f"--experiment {args.experiment}")
 
 
 if __name__ == "__main__":
