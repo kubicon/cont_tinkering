@@ -26,6 +26,7 @@ uv.lock
 *.npz
 *.msgpack
 *.png
+*.mp4
 *.jsonl
 
 scripts/
