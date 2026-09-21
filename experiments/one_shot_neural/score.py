@@ -27,7 +27,11 @@ for those methods the averaged iterate is the one their theory is about.
 `--plot` / `--plot-only` draw those two axes for one `--game`, or, when `--game` is
 omitted, for every game present in the tree: mean exploitability across seeds with a
 95% CI band, one curve per run. Budget on the primary plot is `payoff_evals`
-(the shared cost unit), not iteration count.
+(the shared cost unit), not iteration count. Colours, dash patterns, markers and legend
+names come from `plot_style.py` at the repo root, shared with the sequential sweep's
+plots; so does `EXCLUDED_BASELINES`, which keeps the methods that have a plot of their
+own (Discrete MMD) out of the baseline comparison -- name one in `--methods` to plot it
+anyway, and its capacity cells are never dropped.
 
 A "run" here is a run *directory*, not a method: `run_cell.py --label` lets one method
 appear as several cells, which is how the capacity sweep stores `mixture__k4` next to
@@ -36,6 +40,10 @@ against the number of mixture components / grid bins, at a fixed budget:
 
     python experiments/one_shot_neural/score.py --out data/one_shot_neural_capacity \\
         --plot --plot-capacity
+
+It draws two lines per method -- the final checkpoint solid, each run's best checkpoint
+dashed -- and ``--capacity-which final`` / ``best`` keeps just one of them, drawn solid
+and labelled with the method name alone.
 """
 
 from __future__ import annotations
@@ -53,23 +61,45 @@ sys.path.insert(0, str(HERE.parents[1]))
 
 import numpy as np  # noqa: E402
 
+import plot_style  # noqa: E402
 from baselines.common import GridOracle, StrategyPair, effective_support, load_game  # noqa: E402
+from plot_style import (  # noqa: E402
+    BAND_ALPHA,
+    LINEWIDTH,
+    MARKERSIZE,
+    SECONDARY_BAND_ALPHA,
+    display_name,
+    style_axes,
+    style_of,
+)
 
-# Display names for the plot legend; methods not listed here show their raw name.
-METHOD_LABELS: dict[str, str] = {
-    "mixture": "Mixture",
-    "mmd_discrete": "Discrete MMD",
-    "nfsp": "NFSP",
-    "psro": "PSRO",
-    "rpn_pathwise": "Randomized policy networks",
-    "sisa": "SISA",
-    "spg": "Randomized policy (black-box)",
-    "jpspg": "JPSPG",
-}
+# Legend names, colours, dash patterns and markers all come from `plot_style` at the
+# repo root, which `rci_scripts/plot_sequential_sweep.py` reads too -- so a method looks
+# the same in the one-shot and the sequential figures. Add a method there, not here.
 # What a capacity cell's directory is called: `run_cell.py --label`. The capacity itself
 # is read from the run's `meta.json`, never parsed back out of this -- the suffix is for
 # the legend, and a run whose label does not match still plots under its own name.
 CAPACITY_LABEL_RE = re.compile(r"^(?P<method>.+)__k(?P<capacity>\d+)$")
+# Which checkpoint the capacity plot reads off, and how that series is drawn:
+# (linestyle, line alpha, legend suffix). Drawn on its own, a series is the primary one
+# -- solid, opaque, and named after the method alone, because there is no second line
+# for the legend to tell it apart from.
+CAPACITY_SERIES = {"final": ("-", 1.0, ""), "best": ("--", 0.6, " (best checkpoint)")}
+CAPACITY_SOLO = ("-", 1.0, "")
+CAPACITY_WHICH = ("both", "final", "best")
+
+# These runs are minutes long, not hours, so the wall-clock axis stays in seconds --
+# `plot_style.WALL_TIME_UNITS` has the other units. Type sizes come from `plot_style`
+# too: turn FONT_SCALE up there to enlarge every label in both experiments at once.
+WALL_TIME_UNIT = "seconds"
+WALL_TIME_LABEL, WALL_TIME_PER_SECOND = plot_style.wall_time_axis(WALL_TIME_UNIT)
+
+
+def capacity_series(which: str) -> list[tuple[str, str, float, str]]:
+    """`[(key, linestyle, alpha, suffix)]` for one `--capacity-which` setting."""
+    if which == "both":
+        return [(key, *CAPACITY_SERIES[key]) for key in CAPACITY_SERIES]
+    return [(which, *CAPACITY_SOLO)]
 
 
 def run_label(meta: dict) -> str:
@@ -81,13 +111,30 @@ def run_label(meta: dict) -> str:
     return meta.get("label") or meta.get("method") or "?"
 
 
-def pretty_label(label: str) -> str:
+def split_capacity(label: str) -> tuple[str, int | None]:
+    """``mixture__k8`` -> ``("mixture", 8)``; a plain label keeps a capacity of None."""
     match = CAPACITY_LABEL_RE.match(label)
-    if match:
-        method = METHOD_LABELS.get(match["method"], match["method"])
-        unit = "bins" if match["method"] == "mmd_discrete" else "components"
-        return f"{method} ({match['capacity']} {unit})"
-    return METHOD_LABELS.get(label, label)
+    return (match["method"], int(match["capacity"])) if match else (label, None)
+
+
+def pretty_label(label: str) -> str:
+    method, capacity = split_capacity(label)
+    if capacity is None:
+        return display_name(method)
+    return plot_style.capacity_label(method, capacity)
+
+
+def style_for(label: str) -> tuple[object, object, str | None]:
+    """``(colour, linestyle, marker)`` for one plotted run label.
+
+    A capacity cell takes a shade of its method's own ramp and no marker: ten curves of
+    one method are told apart by darkness, and ten marker shapes would only add noise.
+    """
+    method, capacity = split_capacity(label)
+    if capacity is None:
+        style = style_of(method)
+        return style["color"], style["linestyle"], style["marker"]
+    return plot_style.capacity_color(method, capacity), style_of(method)["linestyle"], None
 
 
 def find_runs(out_root: Path) -> list[Path]:
@@ -208,7 +255,10 @@ def select(curves: dict, game: str, methods: list[str] | None) -> dict[str, list
     """One game's scored runs, grouped by the name they plot under.
 
     `methods` filters on either name, so `--methods mixture` keeps the plain `mixture`
-    runs and every `mixture__k*` cell of a capacity sweep.
+    runs and every `mixture__k*` cell of a capacity sweep. Naming a method explicitly
+    also overrides `plot_style.EXCLUDED_BASELINES`, which otherwise drops the methods
+    that have a plot of their own (Discrete MMD) from the baseline comparison -- their
+    capacity cells are kept either way.
     """
     by_label: dict[str, list[dict]] = defaultdict(list)
     for entry in curves.values():
@@ -217,6 +267,10 @@ def select(curves: dict, game: str, methods: list[str] | None) -> dict[str, list
             continue
         label = run_label(meta)
         if methods and label not in methods and meta.get("method") not in methods:
+            continue
+        method, capacity = split_capacity(label)
+        if not methods and plot_style.excluded_baseline(
+                method, meta.get("capacity") if capacity is None else capacity):
             continue
         by_label[label].append(entry)
     return by_label
@@ -233,9 +287,12 @@ def games_in(curves: dict, game: str | None) -> list[str]:
 
 
 def label_sort_key(label: str) -> tuple:
-    """Group a method's capacity cells together and order them by K, not by string."""
-    match = CAPACITY_LABEL_RE.match(label)
-    return (match["method"], int(match["capacity"])) if match else (label, -1)
+    """Group a method's capacity cells together and order them by K, not by string.
+
+    The order is `plot_style`'s, so a legend lists the methods the same way here as in
+    the sequential plots.
+    """
+    return plot_style.sort_key(*split_capacity(label))
 
 
 def _final_expl(scores: list[dict], which: str) -> float | None:
@@ -285,16 +342,14 @@ def plot_game(curves: dict, game: str, out_path: Path,
         raise SystemExit(f"no scored runs for game {game!r} in curves")
 
     method_names = sorted(by_method, key=label_sort_key)
-    cmap = plt.get_cmap("tab10")
-    colors = {m: cmap(i % 10) for i, m in enumerate(method_names)}
 
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4), sharey=True)
     panels = (
-        (axes[0], "payoff_evals", "Environment interactions"),
-        (axes[1], "wall_time", "Wall-time (s)"),
+        (axes[0], "payoff_evals", plot_style.SAMPLES_LABEL, 1.0),
+        (axes[1], "wall_time", WALL_TIME_LABEL, WALL_TIME_PER_SECOND),
     )
 
-    for ax, x_key, xlabel in panels:
+    for ax, x_key, xlabel, x_scale in panels:
         for method in method_names:
             series = []
             for entry in by_method[method]:
@@ -305,15 +360,19 @@ def plot_game(curves: dict, game: str, out_path: Path,
             if band is None:
                 continue
             x, mean, lo, hi = band
-            color = colors[method]
-            ax.fill_between(x, lo, hi, color=color, alpha=0.18, linewidth=0)
-            ax.plot(x, mean, color=color, label=pretty_label(method), linewidth=1.8)
+            x = x * x_scale
+            color, linestyle, marker = style_for(method)
+            ax.fill_between(x, lo, hi, color=color, alpha=BAND_ALPHA, linewidth=0)
+            # Sparse markers keep the marker a secondary cue without cluttering.
+            ax.plot(x, mean, color=color, linestyle=linestyle, marker=marker,
+                    markersize=MARKERSIZE, markevery=plot_style.markevery(len(x)),
+                    markeredgecolor="white", markeredgewidth=0.8,
+                    linewidth=LINEWIDTH, label=pretty_label(method))
 
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("Exploitability")
+        plot_style.label_axes(ax, xlabel, "Exploitability")
         # ax.set_title(f"{game}: expl vs {x_key if x_key != 'payoff_evals' else 'budget'}")
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8, frameon=False)
+        style_axes(ax)
+        plot_style.legend(ax)
 
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -330,10 +389,12 @@ def plot_games(curves: dict, out_root: Path, game: str | None = None,
 
 
 def plot_capacity_games(curves: dict, out_root: Path, game: str | None = None,
-                        methods: list[str] | None = None) -> list[Path]:
+                        methods: list[str] | None = None,
+                        which: str = "both") -> list[Path]:
     paths = []
     for tag in games_in(curves, game):
-        path = plot_capacity(curves, tag, out_root / f"{tag}_capacity.png", methods=methods)
+        path = plot_capacity(curves, tag, out_root / f"{tag}_capacity.png",
+                             methods=methods, which=which)
         if path is None:
             # Every capacity plot is empty in a tree of runs that did not sweep one, so
             # say which game was skipped rather than finishing with no output at all.
@@ -344,7 +405,8 @@ def plot_capacity_games(curves: dict, out_root: Path, game: str | None = None,
 
 
 def plot_capacity(curves: dict, game: str, out_path: Path,
-                  methods: list[str] | None = None) -> Path | None:
+                  methods: list[str] | None = None,
+                  which: str = "both") -> Path | None:
     """Exploitability against representation capacity for one game.
 
     The x-axis is the run's own capacity as `run_cell.py` recorded it -- components for a
@@ -354,10 +416,15 @@ def plot_capacity(curves: dict, game: str, out_path: Path,
     policy networks) are skipped rather than drawn at a made-up K.
 
     Two lines per method, because on these games they say different things: the solid one
-    is the final iterate, the dashed one the best checkpoint of the run. A gap between
+    is the final iterate, the dashed one the best checkpoint *of each run*, averaged over
+    seeds like the solid one and with a 95% CI band of its own (fainter, so the two
+    intervals stay apart). A gap between
     them is not capacity failing to help -- it is the run drifting off a solution it had
     already found, which is a training story, and only the solid line answers "what does
     K components get you when the budget runs out".
+
+    `which` is "both", or "final" / "best" for that series alone -- which is then drawn
+    as the primary line and labelled with the method name only.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -374,14 +441,12 @@ def plot_capacity(curves: dict, game: str, out_path: Path,
     if not by_method:
         return None
 
-    method_names = sorted(by_method)
-    cmap = plt.get_cmap("tab10")
-    colors = {m: cmap(i % 10) for i, m in enumerate(method_names)}
+    method_names = sorted(by_method, key=lambda m: plot_style.sort_key(m))
 
     fig, ax = plt.subplots(figsize=(6.0, 4.4))
     for method in method_names:
         capacities = sorted(by_method[method])
-        for key, style, suffix in (("final", "-", ""), ("best", "--", " (best checkpoint)")):
+        for key, style, alpha, suffix in capacity_series(which):
             xs, means, los, his = [], [], [], []
             for k in capacities:
                 values = [_final_expl(e["scores"], key) for e in by_method[method][k]]
@@ -397,12 +462,19 @@ def plot_capacity(curves: dict, game: str, out_path: Path,
                 his.append(values.mean() + half)
             if not xs:
                 continue
-            color = colors[method]
-            if key == "final":
-                ax.fill_between(xs, los, his, color=color, alpha=0.18, linewidth=0)
-            ax.plot(xs, means, style, color=color, marker="o", markersize=4, linewidth=1.8,
-                    alpha=1.0 if key == "final" else 0.6,
-                    label=METHOD_LABELS.get(method, method) + suffix)
+            # The method's own colour and marker, exactly as the training-curve plots
+            # draw it. Linestyle is spent here on final vs best, so it is the one cue
+            # this plot does not share with them.
+            color = style_of(method)["color"]
+            ax.fill_between(xs, los, his, color=color, linewidth=0,
+                            alpha=BAND_ALPHA if alpha == 1.0 else SECONDARY_BAND_ALPHA)
+            ax.plot(xs, means, style, color=color, marker=style_of(method)["marker"],
+                    markersize=MARKERSIZE, linewidth=LINEWIDTH,
+                    markeredgecolor="white", markeredgewidth=0.8, alpha=alpha,
+                    # A qualifier already follows the name here, so it takes the short
+                    # form; alone, it keeps the full legend name.
+                    label=(plot_style.short_name(method) if suffix
+                           else display_name(method)) + suffix)
 
     from matplotlib import ticker
 
@@ -412,10 +484,10 @@ def plot_capacity(curves: dict, game: str, out_path: Path,
     ax.set_xticks(sorted({k for ks in by_method.values() for k in ks}))
     ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.xaxis.set_minor_formatter(ticker.NullFormatter())
-    ax.set_xlabel("Capacity (mixture components / grid bins)")
-    ax.set_ylabel("Exploitability")
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8, frameon=False)
+    plot_style.label_axes(ax, "Capacity",
+                          "Exploitability")
+    style_axes(ax)
+    plot_style.legend(ax)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
@@ -444,6 +516,11 @@ def main() -> None:
                     help="also plot exploitability against capacity (mixture components / "
                          "grid bins) for every run that recorded one -- the capacity "
                          "sweep's plot; see generate_one_shot_neural.py --experiment capacity")
+    ap.add_argument("--capacity-which", choices=CAPACITY_WHICH, default="both",
+                    dest="capacity_which",
+                    help="which checkpoint --plot-capacity reads off: 'both' (final "
+                         "solid, best dashed), or 'final' / 'best' alone -- a single "
+                         "series is drawn solid and its legend drops the qualifier")
     args = ap.parse_args()
 
     out_root = Path(args.out)
@@ -461,7 +538,9 @@ def main() -> None:
         for path in plot_games(curves, out_root, args.game, methods=args.methods):
             print(f"plot -> {path}")
         if args.plot_capacity:
-            for path in plot_capacity_games(curves, out_root, args.game, methods=args.methods):
+            for path in plot_capacity_games(curves, out_root, args.game,
+                                            methods=args.methods,
+                                            which=args.capacity_which):
                 print(f"plot -> {path}")
         return
 
@@ -515,7 +594,8 @@ def main() -> None:
         for path in plot_games(curves, out_root, args.game, methods=args.methods):
             print(f"plot -> {path}")
     if args.plot_capacity:
-        for path in plot_capacity_games(curves, out_root, args.game, methods=args.methods):
+        for path in plot_capacity_games(curves, out_root, args.game, methods=args.methods,
+                                        which=args.capacity_which):
             print(f"plot -> {path}")
 
 

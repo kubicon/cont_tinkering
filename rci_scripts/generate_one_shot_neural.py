@@ -248,6 +248,7 @@ GAMES: dict[str, dict[str, Any]] = {
 # commented out rather than deleted, so a run that wants them is one edit away).
 DEFAULT_METHODS = (
     "mixture",
+    "ppo",
     "mmd_discrete",
     "nfsp",
     "psro",
@@ -269,6 +270,9 @@ SHARED_SETTINGS: dict[str, object] = {
 # `network.num_components` in the generated YAML.
 METHOD_SETTINGS: dict[str, dict[str, object]] = {
     "mixture": {},
+    # Vanilla PPO: the mixture's config with `num_components: 1` and both magnet KL
+    # coefficients at 0, forced by `run_cell.run_ppo` -- nothing to set here.
+    "ppo": {},
     # `bins` is not set here: `settings_flags` matches it to each game's
     # `num_components`, so the discrete grid has the mixture's capacity.
     "mmd_discrete": {},

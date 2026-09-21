@@ -59,7 +59,7 @@ from training.mixture import sample_mixture_actions  # noqa: E402
 from training.mixture_trainer import MixtureSelfPlayPPOTrainer  # noqa: E402
 
 # The default grid: what `run_all.py` runs when `--methods` is not given.
-METHODS = ("mixture", "mmd_discrete", "nfsp", "psro", "rpn_pathwise", "sisa")
+METHODS = ("mixture", "ppo", "mmd_discrete", "nfsp", "psro", "rpn_pathwise", "sisa")
 
 # Still implemented and still runnable -- `--method spg`, or `run_all.py --methods spg
 # jpspg` -- just no longer part of the default grid. `rpn_pathwise` carries the
@@ -80,6 +80,7 @@ ALL_METHODS = METHODS + OPTIONAL_METHODS
 # black-box payoff oracle.
 ACCESS_MODEL = {
     "mixture": "sampled payoffs, policy gradients",
+    "ppo": "sampled payoffs, policy gradients",
     "mmd_discrete": "sampled payoffs, policy gradients",
     "nfsp": "sampled payoffs, policy gradients",
     "psro": "sampled payoffs, policy gradients",
@@ -98,8 +99,8 @@ ACCESS_MODEL = {
 # rather than one flag is that the methods do not share a parametrization: K Gaussians and
 # K grid bins are the same claim about capacity made in two different policy classes.
 # Methods absent from here have no such knob -- `psro`'s support grows with its rounds
-# (i.e. with the budget), and `rpn_pathwise`/`spg`/`jpspg` carry a continuous randomized
-# policy whose capacity is not a count at all.
+# (i.e. with the budget), `ppo` is pinned to a single Gaussian, and `rpn_pathwise`/`spg`/
+# `jpspg` carry a continuous randomized policy whose capacity is not a count at all.
 CAPACITY_SETTING = {
     "mixture": "num_components",
     "mmd_discrete": "bins",
@@ -207,7 +208,8 @@ def plan_units(method: str, budget: int, settings: Settings, batch_size: int) ->
 
     The cost formulas, all in scored action pairs:
 
-      mixture, mmd_discrete   one self-play rollout per iteration      `batch`
+      mixture, ppo,           one self-play rollout per iteration      `batch`
+      mmd_discrete
       spg, jpspg              `utility_samples` per utility evaluation, and
                               `perturbation_batch` evaluations (joint) or twice that
                               (separate) per iteration
@@ -222,7 +224,7 @@ def plan_units(method: str, budget: int, settings: Settings, batch_size: int) ->
     Sampling for checkpoints and for the metric is excluded on purpose: instrumentation
     is not the algorithm, and counting it would penalize whichever method logs most.
     """
-    if method in ("mixture", "mmd_discrete"):
+    if method in ("mixture", "ppo", "mmd_discrete"):
         per = batch_size
         return {"iterations": max(int(budget // per), 1), "evals_per_unit": per}
     if method in ("spg", "jpspg"):
@@ -381,6 +383,22 @@ def run_mixture(game, oracle, config, plan, settings, seed, writer, score):
     return {"history": writer.history, "train_seconds": train_seconds, "compile_seconds": 0.0}
 
 
+def run_ppo(game, oracle, config, plan, settings, seed, writer, score):
+    """Vanilla PPO: the mixture trainer with one Gaussian and no magnet.
+
+    Every other hyperparameter is the game config's, so the gap between this and
+    `mixture` is exactly what the mixture head and the magnet KL buy. The trust-region KL
+    and the entropy bonus stay, since they are part of PPO rather than of MMD. The
+    overrides are applied here, after `run_cell`'s own `num_components`, so a
+    `--num-components` passed to this method is ignored rather than silently turning it
+    back into a mixture.
+    """
+    config.network.num_components = 1
+    config.ppo.magnet_category_kl_coef = 0.0
+    config.ppo.magnet_gaussian_kl_coef = 0.0
+    return run_mixture(game, oracle, config, plan, settings, seed, writer, score)
+
+
 def run_mmd_discrete(game, oracle, config, plan, settings, seed, writer, score):
     class _Args:
         lr = batch = entropy = magnet_kl = trpo_kl = magnet_interval = None
@@ -468,6 +486,7 @@ def run_sisa(game, oracle, config, plan, settings, seed, writer, score):
 
 RUNNERS = {
     "mixture": run_mixture,
+    "ppo": run_ppo,
     "mmd_discrete": run_mmd_discrete,
     "nfsp": run_nfsp,
     "psro": run_psro,
