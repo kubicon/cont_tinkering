@@ -15,13 +15,20 @@ line per solver configuration (seeds pooled) against three x-axes:
 The x-values come from the ``wall_time`` / ``episodes_train`` / ``env_steps``
 arrays the scorer copies out of each run's ``metrics.jsonl``. Checkpoint 0 is
 the untrained policy, saved before the clock starts, so its missing values
-are taken as 0.
+are taken as 0. Any best response in ``{run}/br/{step}.json`` that the pickle does
+not list is added too, with its x-values read from ``metrics.jsonl``.
 
-Seeds are pooled per checkpoint, with no resampling or fitting: for each
-checkpoint index that every seed has, the point is (mean x over seeds, mean
-exploitability over seeds), and the band is the 95% confidence interval of that
-mean, mean +- t_{0.975, n-1} * std(ddof=1) / sqrt(n). Consecutive points are
-joined by straight lines. Kuhn plots the exact
+Seeds are pooled with no fitting. When every seed scored the same checkpoints
+(self_play, sac, discrete_mmd: fixed-length runs subsampled the same way), each
+point is (mean x over seeds, mean exploitability over seeds) at one checkpoint.
+PSRO / NFSP stop on a wall-time budget, so their seeds have different numbers of
+checkpoints and the scorer subsamples different ids per seed; there every seed
+keeps its own points at its own samples / wall-time, each seed's straight-line
+curve is read off at the union of all seeds' x-values within that seed's range,
+and each point pools the seeds that reach it (``--min-seeds`` drops points fewer
+seeds reach). The band is the 95% confidence interval of the mean,
+mean +- t_{0.975, n-1} * std(ddof=1) / sqrt(n), n being the seeds at that point.
+Consecutive points are joined by straight lines. Kuhn plots the exact
 exploitability; Leduc / Blotto plot the RL lower bound, which can be <= 0 --
 such points vanish on the default log y-axis, so pass ``--linear-y`` to see
 them.
@@ -54,6 +61,7 @@ them, drawn solid and labelled with the solver name alone.
 from __future__ import annotations
 
 import argparse
+import json
 import pickle
 import re
 import sys
@@ -84,6 +92,7 @@ from plot_style import (  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = REPO_ROOT / "data" / "sequential_sweep"
 RESULT_FILENAME = "exploitability.pkl"
+BR_DIRNAME = "br"   # score_sequential_sweep.py's saved best responses, {step}.json
 SEED_SUFFIX_RE = re.compile(r"__seed\d+$")
 # A capacity run: one solver at one representation size, as
 # `generate_sequential_sweep.py --experiment capacity` names it -- `self_play__num_components8`
@@ -176,8 +185,59 @@ def load_results(out_root: Path, games: list[str] | None,
         if solvers is not None and not any(s in config for s in solvers):
             continue
         result["_config"] = config
+        add_saved_best_responses(result, path.parent)
         results.append(result)
     return results
+
+
+def metrics_by_step(run_dir: Path) -> dict[int, dict]:
+    """``{t: row}`` from the run's ``history.json``, or the ``metrics.jsonl`` stream."""
+    history = run_dir / "history.json"
+    if history.exists():
+        rows = json.loads(history.read_text())
+    elif (run_dir / "metrics.jsonl").exists():
+        rows = [json.loads(line) for line in
+                (run_dir / "metrics.jsonl").read_text().splitlines() if line.strip()]
+    else:
+        return {}
+    return {int(row["t"]): row for row in rows if "t" in row}
+
+
+def add_saved_best_responses(result: dict, run_dir: Path) -> None:
+    """Append every ``br/{step}.json`` the pickle does not already list.
+
+    The scorer saves each approximate BR it trains beside the run; one scored in a
+    later or separate pass would otherwise never reach the plot. Its x-values come
+    from the run's metrics row for that checkpoint, as the scorer's own do.
+    """
+    br_dir = run_dir / (result.get("br_dir") or BR_DIRNAME)
+    if result["exact"] or not br_dir.is_dir():
+        return
+    known = {int(step) for step in result["steps"]}
+    extra = []
+    for path in br_dir.glob("*.json"):
+        if not path.stem.isdigit() or int(path.stem) in known:
+            continue
+        record = json.loads(path.read_text())
+        if "expl_lb" in record:
+            extra.append((int(path.stem), float(record["expl_lb"])))
+    if not extra:
+        return
+    rows = metrics_by_step(run_dir)
+    extra.sort()
+    steps = [step for step, _ in extra]
+    columns = {
+        "expl_lb": [expl_lb for _, expl_lb in extra],
+        "wall_time": [rows.get(step, {}).get("wall_time", np.nan) for step in steps],
+        "episodes_train": [rows.get(step, {}).get("episodes", np.nan) for step in steps],
+        "env_steps": [rows.get(step, {}).get("env_steps", np.nan) for step in steps],
+    }
+    result["steps"] = np.concatenate([result["steps"], np.asarray(steps, dtype=np.int32)])
+    for key in ("expl", "target_expl", *columns):
+        if key in result:
+            values = columns.get(key, [np.nan] * len(steps))
+            result[key] = np.concatenate([np.asarray(result[key], dtype=np.float64),
+                                          np.asarray(values, dtype=np.float64)])
 
 
 def run_curve(result: dict, x_axis: str, samples: str,
@@ -206,30 +266,50 @@ def run_curve(result: dict, x_axis: str, samples: str,
     return steps[keep][order], x[keep][order], y[keep][order]
 
 
-def pool_seeds(curves: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> dict | None:
-    """Group seeds by checkpoint: mean x, mean exploitability and its t-based CI.
+def pool_seeds(curves: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+               min_seeds: int = 1) -> dict | None:
+    """Pool seeds into mean x, mean exploitability and its t-based CI.
 
-    Only checkpoints every seed has are kept, so each point averages all seeds.
+    When every seed scored the same checkpoints (a fixed-length run subsampled the
+    same way), seeds are grouped by checkpoint: the point is (mean x, mean y).
+
+    Otherwise -- PSRO / NFSP stop on a wall-time budget, so each seed has its own
+    number of checkpoints and the scorer's subsample picks different ids -- every
+    seed keeps its own scored points at their own x. Each seed is read off its
+    straight-line curve (what ``--show-seeds`` draws) at the union of all seeds'
+    x-values inside its own range, and each point pools the seeds that reach it,
+    keeping points at least ``min_seeds`` seeds reach.
     """
     curves = [c for c in curves if len(c[0]) >= 1]
     if not curves:
         return None
-    common = curves[0][0]
-    for steps, _, _ in curves[1:]:
-        common = np.intersect1d(common, steps)
-    if len(common) == 0:
-        return None
-    xs = np.stack([x[np.searchsorted(steps, common)] for steps, x, _ in curves])
-    ys = np.stack([y[np.searchsorted(steps, common)] for steps, _, y in curves])
     n = len(curves)
-    mean = ys.mean(axis=0)
-    if n > 1:
-        sem = ys.std(axis=0, ddof=1) / np.sqrt(n)
-        half = stats.t.ppf(0.5 + CI_LEVEL / 2, df=n - 1) * sem
+
+    if all(np.array_equal(curves[0][0], steps) for steps, _, _ in curves[1:]):
+        grid = np.stack([x for _, x, _ in curves]).mean(axis=0)
+        ys = np.stack([y for _, _, y in curves])
     else:
-        half = np.zeros_like(mean)
-    return {"x": xs.mean(axis=0), "mean": mean, "lo": mean - half,
-            "hi": mean + half, "n": n}
+        grid = np.unique(np.concatenate([x for _, x, _ in curves]))
+        ys = np.full((n, len(grid)), np.nan)
+        for i, (_, x, y) in enumerate(curves):
+            order = np.argsort(x, kind="stable")
+            x, y = x[order], y[order]
+            inside = (grid >= x[0]) & (grid <= x[-1])
+            ys[i, inside] = np.interp(grid[inside], x, y)
+
+    n_at = np.isfinite(ys).sum(axis=0)
+    keep = n_at >= min(max(min_seeds, 1), n)
+    if not keep.any():
+        return None
+    grid, ys, n_at = grid[keep], ys[:, keep], n_at[keep]
+    mean = np.nanmean(ys, axis=0)
+    half = np.zeros_like(mean)
+    multi = n_at > 1
+    if multi.any():
+        sem = np.nanstd(ys[:, multi], axis=0, ddof=1) / np.sqrt(n_at[multi])
+        half[multi] = stats.t.ppf(0.5 + CI_LEVEL / 2, df=n_at[multi] - 1) * sem
+    return {"x": grid, "mean": mean, "lo": mean - half,
+            "hi": mean + half, "n": n, "n_at": n_at}
 
 
 def x_label(x_axis: str, samples: str) -> str:
@@ -247,11 +327,12 @@ def y_label(exact: bool, target: bool) -> str:
 
 
 def draw_panel(ax, by_config: dict[str, list[dict]], x_axis: str, *, samples: str,
-               target: bool, linear_y: bool, show_seeds: bool) -> None:
+               target: bool, linear_y: bool, show_seeds: bool,
+               min_seeds: int = 1) -> None:
     panels = []
     for config in sorted(by_config, key=sort_key):
         curves = [run_curve(r, x_axis, samples, target) for r in by_config[config]]
-        pooled = pool_seeds(curves)
+        pooled = pool_seeds(curves, min_seeds)
         if pooled is not None:
             panels.append((config, curves, pooled))
 
@@ -394,7 +475,7 @@ def draw_capacity_panel(ax, by_config: dict[str, list[dict]], *, samples: str, t
     ax.set_xticks(sorted({k for *_, xs, _, _, _ in lines for k in xs}))
     ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.xaxis.set_minor_formatter(ticker.NullFormatter())
-    plot_style.label_axes(ax, "Representation size (mixture components / grid bins)")
+    plot_style.label_axes(ax, "Representation size")
     if not linear_y:
         ax.set_yscale("log", nonpositive="mask")
         if floor is not None:
@@ -432,6 +513,9 @@ def main() -> None:
                     help="linear y-axis (shows lower bounds <= 0; default is log)")
     ap.add_argument("--show-seeds", action="store_true",
                     help="also draw each seed as a faint line")
+    ap.add_argument("--min-seeds", type=int, default=1,
+                    help="where seeds scored different checkpoints (PSRO, NFSP), drop "
+                         "points fewer than this many seeds reach (default: 1, keep all)")
     ap.add_argument("--capacity", action="store_true",
                     help="also write {game}__capacity: final (and best) exploitability "
                          "against the number of mixture components / bins, for the runs "
@@ -461,7 +545,8 @@ def main() -> None:
     games = group_by_game(results)
     plot_dir.mkdir(parents=True, exist_ok=True)
     panel_kwargs = dict(samples=args.samples, target=args.target,
-                        linear_y=args.linear_y, show_seeds=args.show_seeds)
+                        linear_y=args.linear_y, show_seeds=args.show_seeds,
+                        min_seeds=args.min_seeds)
     game_names = sorted(games)
 
     for game in game_names:
@@ -476,7 +561,7 @@ def main() -> None:
             # ax.set_title(f"{title}: mean over seeds, band = 95% CI",
             #              color=plot_style.TEXT, fontsize=plot_style.TITLE_SIZE,
             #              loc="left")
-            plot_style.legend(ax, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+            plot_style.legend(ax)
             fig.tight_layout()
             path = plot_dir / f"{game}__{x_axis}.{args.format}"
             fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -503,7 +588,7 @@ def main() -> None:
             if draw_capacity_panel(ax, by_config, samples=args.samples, target=args.target,
                                    linear_y=args.linear_y, which=args.capacity_which):
                 plot_style.label_axes(ax, ylabel=y_label(exact, args.target))
-                plot_style.legend(ax, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+                plot_style.legend(ax)
                 fig.tight_layout()
                 path = plot_dir / f"{game}__capacity.{args.format}"
                 fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -528,8 +613,7 @@ def main() -> None:
                     ax, ylabel=f"{GAME_TITLES.get(game, game)}\n"
                                f"{y_label(exact, args.target)}",
                     fontsize=SMALL_AXIS_LABEL_SIZE)
-        plot_style.legend(axes[row][-1], fontsize=SMALL_LEGEND_SIZE, loc="upper left",
-                          bbox_to_anchor=(1.01, 1.0))
+        plot_style.legend(axes[row][-1], fontsize=SMALL_LEGEND_SIZE)
     fig.tight_layout()
     path = plot_dir / f"overview.{args.format}"
     fig.savefig(path, dpi=150, bbox_inches="tight")

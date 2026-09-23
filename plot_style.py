@@ -10,8 +10,8 @@ import it and neither keeps a palette of its own.
 **Edit ``METHOD_STYLES``; that is the interface.** One entry per method:
 
     "mixture": {
-        "label": "MGPO (ours)",      # legend name
-        "short_label": "MGPO",       # used where the name already takes a qualifier
+        "label": "MMPO (ours)",      # legend name
+        "short_label": "MMPO",       # used where the name already takes a qualifier
         "color": "#eb6834",          # the line, the band and the marker face
         "linestyle": "-",            # second encoding, so colour is never alone
         "marker": "o",               # third; drawn sparsely on training curves
@@ -100,7 +100,7 @@ DISCRETE_MMD_BLUES = {1: "#c3dbf7", 2: "#a5c9f3", 3: "#95c0f1", 4: "#86b6ef", 6:
 
 METHOD_STYLES: dict[str, dict] = {
     "mixture": {
-        "label": "MGPO (ours)", "short_label": "MGPO",
+        "label": "MMPO (ours)", "short_label": "MMPO",
         "color": "#eb6834", "linestyle": "-", "marker": "o",
         "ramp": MIXTURE_ORANGES, "capacity_unit": "components",
         "aliases": ("self_play",),
@@ -170,7 +170,7 @@ def display_name(method: str) -> str:
 def short_name(method: str) -> str:
     """The name to use where a qualifier already follows it.
 
-    A capacity cell reads "MGPO (8 components)", not "MGPO (ours) (8 components)": the
+    A capacity cell reads "MMPO (8 components)", not "MMPO (ours) (8 components)": the
     "(ours)" belongs on the baseline legend, where the reader is comparing methods, and
     only clutters a legend that is already one method's ramp.
     """
