@@ -89,6 +89,23 @@ class NetworkConfig:
     # Pulls a mean that drifts out of the box back to its edge; only bites with
     # `clip_means` on. See `training.mixture.mean_box_excess`.
     mean_box_penalty_coef: float = 1.0
+    # Where the Gaussian mixture starts. By default the component means are evenly
+    # spread over the whole action box, which in a symmetric game (`circle` with
+    # more components than harmonics, `matching_pennies` with one) is already a
+    # Nash -- so a training curve starts at ~0 exploitability and shows nothing.
+    # `init_mean_range: [lo, hi]` spreads them over that fraction of the box
+    # instead (`[0, 1]` is the default; a single component sits at its middle),
+    # and `init_std_scale` multiplies the default initial std (box width over
+    # twice the component count). The means part is ignored under `bucket_means`.
+    init_mean_range: tuple[float, float] | None = None
+    init_std_scale: float = 1.0
+    # Explicit initial means in action units, overriding `init_mean_range`: the
+    # shapes `idealized.init_means` takes -- `(K,)` scalar means shared by both
+    # players, `(K, d)` shared, or `(2, K, d)` one block per player -- so a PPO
+    # run can start where its idealized / sampled sibling does (e.g. `(0.3, 0)`
+    # against `(0, 0.3)`, off both the Nash and the x=y manifold). `null` keeps
+    # the spread init. Resolved per player in `training.hyperparams`.
+    init_means: Any = None
 
     # `policy: exp_family` only -- the fixed basis; see `training.expfam.build_basis`.
     grid_points: int = 256          # bins the piecewise-constant density lives on
@@ -495,6 +512,22 @@ def _check_sigma_bounds(network: NetworkConfig) -> NetworkConfig:
     return dataclasses.replace(network, **bounds)
 
 
+def _check_init(network: NetworkConfig) -> NetworkConfig:
+    """Coerce `init_mean_range` to a float pair inside `[0, 1]` and `init_std_scale` to a
+    positive float."""
+    scale = float(network.init_std_scale)
+    if not scale > 0.0:
+        raise ValueError(f"network.init_std_scale must be positive, got {scale}")
+    bounds = network.init_mean_range
+    if bounds is not None:
+        bounds = tuple(float(x) for x in bounds)
+        if len(bounds) != 2 or not 0.0 <= bounds[0] <= bounds[1] <= 1.0:
+            raise ValueError(
+                f"network.init_mean_range must be [lo, hi] with 0 <= lo <= hi <= 1, got {bounds}"
+            )
+    return dataclasses.replace(network, init_mean_range=bounds, init_std_scale=scale)
+
+
 def run_config_from_dict(raw: dict) -> RunConfig:
     """Builds a `RunConfig` from an already-parsed config dict (e.g. `yaml.safe_load`'s
     output, or one produced by `sweep.py` for a single sweep combination).
@@ -521,6 +554,7 @@ def run_config_from_dict(raw: dict) -> RunConfig:
     if network.policy not in POLICIES:
         raise ValueError(f"unknown network.policy {network.policy!r}, choices: {sorted(POLICIES)}")
     network = _check_sigma_bounds(network)
+    network = _check_init(network)
     ppo = _build_dataclass(PPOConfig, raw.get("ppo", {}) or {})
     if not 0.0 <= float(ppo.explore_eps) < 1.0:
         raise ValueError(f"ppo.explore_eps must lie in [0, 1), got {ppo.explore_eps}")

@@ -49,13 +49,28 @@ def _action_width(low: chex.Array, high: chex.Array) -> chex.Array:
     return jnp.maximum(high - low, MIN_ACTION_WIDTH)
 
 
-def _spread_bias_init(low: chex.Array, high: chex.Array, num_components: int) -> Callable:
+def _spread_bias_init(
+    low: chex.Array,
+    high: chex.Array,
+    num_components: int,
+    mean_range: tuple[float, float] | None = None,
+    means: tuple[tuple[float, ...], ...] | None = None,
+) -> Callable:
     """Bias initializer spreading each component's mean evenly across `[low, high]`.
+
+    `mean_range = (lo, hi)` restricts the spread to that fraction of the box --
+    component `k` of `K` starts at fraction `lo + (hi - lo) * (k + 1/2) / K` --
+    which is how a run starts off-equilibrium in a game whose evenly spread
+    mixture is already a Nash. `None` is `(0, 1)`, the whole box. `means`, a
+    `(K, d)` array in action units, overrides both.
     """
+    lo, hi = (0.0, 1.0) if mean_range is None else mean_range
 
     def init_fn(key: chex.PRNGKey, shape: tuple[int, ...], dtype=jnp.float32) -> chex.Array:
         del key
-        fractions = (jnp.arange(num_components, dtype=dtype) + 0.5) / num_components
+        if means is not None:
+            return jnp.asarray(means, dtype=dtype).reshape(shape)
+        fractions = lo + (hi - lo) * (jnp.arange(num_components, dtype=dtype) + 0.5) / num_components
         values = low[None, :] + fractions[:, None] * (high - low)[None, :]
         return values.reshape(shape).astype(dtype)
 
@@ -139,6 +154,7 @@ def _scale_bias_init(
     scale_parameterization: str = "linear",
     sigma_min: float | None = None,
     sigma_max: float | None = None,
+    std_scale: float = 1.0,
 ) -> Callable:
     """Bias initializer for `scale_head`, scaled to the action range.
 
@@ -148,6 +164,7 @@ def _scale_bias_init(
     carries `log std` and the off-diagonal stays at zero, which is exactly the
     `S = 0` that makes `I + S` the identity. That std is clipped into
     `[sigma_min, sigma_max]`, so the raw head starts inside its own clamp.
+    `std_scale` multiplies that std before the clip.
     """
     action_dim = low.shape[0]
     slots = diagonal_slots(action_dim, full_covariance)
@@ -157,6 +174,7 @@ def _scale_bias_init(
     def init_fn(key: chex.PRNGKey, shape: tuple[int, ...], dtype=jnp.float32) -> chex.Array:
         del key
         std = jnp.maximum(_action_width(low, high) / (2 * num_components), MIN_ACTION_WIDTH)
+        std = std * std_scale
         std = jnp.clip(std, lo, hi)
         diag = jnp.log(std) if scale_parameterization == "log" else std
         row = jnp.zeros((size,), dtype=dtype).at[slots].set(diag.astype(dtype))
@@ -219,6 +237,12 @@ class MixtureActorCritic(nn.Module):
     # box is then a change of component weights -- which the categorical head
     # makes non-locally -- rather than a Gaussian mean crossing the box.
     bucket_means: bool = False
+    # Initial policy: means spread over this fraction of the box (`None`: all of
+    # it), std times `init_std_scale`. See `_spread_bias_init` / `_scale_bias_init`.
+    init_mean_range: tuple[float, float] | None = None
+    init_std_scale: float = 1.0
+    # Explicit `(K, d)` initial means; overrides `init_mean_range`.
+    init_means: tuple[tuple[float, ...], ...] | None = None
 
     @nn.compact
     def __call__(
@@ -241,7 +265,8 @@ class MixtureActorCritic(nn.Module):
             # Bucketed: a zero raw output is `sigmoid(0) = 1/2`, the bucket's center.
             bias_init=(
                 nn.initializers.zeros if self.bucket_means
-                else _spread_bias_init(self.low, self.high, self.num_components)
+                else _spread_bias_init(self.low, self.high, self.num_components,
+                                       self.init_mean_range, self.init_means)
             ),
             name="means_head",
         )(torso)
@@ -266,6 +291,7 @@ class MixtureActorCritic(nn.Module):
             bias_init=_scale_bias_init(
                 self.low, self.high, self.num_components, self.full_covariance,
                 self.scale_parameterization, self.sigma_min, self.sigma_max,
+                self.init_std_scale,
             ),
             name="scale_head",
         )(torso)
@@ -1637,4 +1663,7 @@ def build_mixture_network(hyperparams: MixturePPOHyperparams) -> MixtureActorCri
         sigma_min=hyperparams.sigma_min,
         sigma_max=hyperparams.sigma_max,
         bucket_means=hyperparams.bucket_means,
+        init_mean_range=hyperparams.init_mean_range,
+        init_std_scale=hyperparams.init_std_scale,
+        init_means=hyperparams.init_means,
     )

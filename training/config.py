@@ -102,6 +102,15 @@ class MixturePPOHyperparams(PPOHyperparams):
     # One fixed bucket of `[low, high]` per component, its mean kept inside it
     # and started at its center; see `training.mixture.MixtureActorCritic`.
     bucket_means: bool = False
+    # Initial policy (see `training.mixture._spread_bias_init` / `_scale_bias_init`):
+    # the component means start evenly spread over this `(lo, hi)` fraction of
+    # `[low, high]` -- `None` is the whole box -- and each component's std starts at
+    # `init_std_scale` times the default. Ignored by the means under `bucket_means`.
+    init_mean_range: tuple[float, float] | None = None
+    init_std_scale: float = 1.0
+    # This player's explicit initial means, `(K, action_dim)` in action units;
+    # overrides `init_mean_range` when set. See `NetworkConfig.init_means`.
+    init_means: tuple[tuple[float, ...], ...] | None = None
     # Off-policy exploration (sequential self-play only): with this probability
     # the action is a uniform draw -- a legal kind uniformly, then a component,
     # then a value on `[low, high]` (that component's bucket under
@@ -171,6 +180,10 @@ class MixturePPOHyperparams(PPOHyperparams):
         data["hidden_dims"] = tuple(data["hidden_dims"])
         data["low"] = tuple(data["low"])
         data["high"] = tuple(data["high"])
+        if data.get("init_mean_range") is not None:
+            data["init_mean_range"] = tuple(data["init_mean_range"])
+        if data.get("init_means") is not None:
+            data["init_means"] = tuple(tuple(row) for row in data["init_means"])
         return cls(**data)
 
 

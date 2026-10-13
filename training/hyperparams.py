@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
+import numpy as np
 
 from games.base import ZeroSumGame
 from games.spaces import ActionSpace, BoxSpace, HybridSpace
@@ -38,6 +39,25 @@ def _num_atoms(space: ActionSpace) -> int:
     return space.num_atoms if isinstance(space, HybridSpace) else 0
 
 
+def _init_means(raw, player: int, num_components: int,
+                dim: int) -> tuple[tuple[float, ...], ...] | None:
+    """`NetworkConfig.init_means` for `player`, as a `(K, dim)` tuple; the shape
+    conventions of `run_idealized`'s `idealized.init_means`."""
+    if raw is None:
+        return None
+    arr = np.asarray(raw, dtype=float)
+    if arr.ndim == 3:                  # (2, K, d): one block per player
+        arr = arr[player]
+    elif arr.ndim == 1:                # (K,) scalar means, shared by both players
+        arr = arr[:, None]
+    if arr.shape != (num_components, dim):
+        raise ValueError(
+            f"network.init_means gives player {player} shape {arr.shape}, expected "
+            f"(num_components, dim) = ({num_components}, {dim})"
+        )
+    return tuple(tuple(float(x) for x in row) for row in arr)
+
+
 def build_hyperparams(game: ZeroSumGame, player: int, config: RunConfig) -> MixturePPOHyperparams:
     space = game.action_space(player)
     low, high = action_bounds(space)
@@ -62,6 +82,10 @@ def build_hyperparams(game: ZeroSumGame, player: int, config: RunConfig) -> Mixt
         sigma_min=network.sigma_min,
         sigma_max=network.sigma_max,
         bucket_means=network.bucket_means,
+        init_mean_range=network.init_mean_range,
+        init_std_scale=network.init_std_scale,
+        init_means=_init_means(network.init_means, player, network.num_components,
+                               space.shape[0]),
         num_atoms=_num_atoms(space),
         clip_means=network.clip_means,
         mean_box_penalty_coef=network.mean_box_penalty_coef,
