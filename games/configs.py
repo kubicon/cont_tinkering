@@ -18,8 +18,6 @@ import jax.numpy as jnp
 
 from .base import ZeroSumGame
 from .disk_sumo import DiskSumo
-from .disk_sumo_v2 import DiskSumoV2
-from .disk_sumo_v3 import DiskSumoV3
 from .mjx_sumo import MjxAntSumo, MjxBugSumo, MjxSpiderSumo, MjxSumo
 from .examples import (
     AllPayAuctionGame,
@@ -326,69 +324,17 @@ class DiskSumoConfig:
     margin_weight: float = 0.0
     # Dense potential-based shaping on the same distance gap; 0 is terminal-only.
     shaping_weight: float = 0.0
+    # Control steps by which each player's view of the opponent's disk lags
+    # (position, velocity, edge margin, stamina); own disk and clock stay
+    # current. Zero is the fully observed game.
+    observation_delay: int = 0
+    # Sightings of the opponent in the observation: the newest, which is
+    # `observation_delay` old, and `observation_frames - 1` older ones, one
+    # control step apart. 1 is the single sighting; more is a memory.
+    observation_frames: int = 1
 
     def build(self) -> SequentialZeroSumGame:
         return DiskSumo(**dataclasses.asdict(self))
-
-
-@dataclasses.dataclass
-class DiskSumoV2Config:
-    """`disk_sumo` with a random archetype per seat, optionally hidden from the opponent.
-
-    See `games.disk_sumo_v2`. Stamina is always on. `archetypes` selects the
-    enabled subset (null: all of `DEFAULT_ARCHETYPES`); `archetype_traits`
-    overrides individual traits, e.g. `{quick: {force: 0.9}}`, or defines a new
-    archetype.
-    """
-
-    horizon: int = 100
-    ring_radius: float = 1.0
-    disk_radius: float = 0.15
-    start_distance: float = 0.45
-    start_jitter: float = 0.04
-    random_orientation: bool = True
-    random_start: bool = False
-    egocentric: bool = True
-    dt: float = 0.1
-    substeps: int = 10
-    mass: float = 1.0
-    max_force: float = 1.0
-    stamina_drain_rate: float = 0.5
-    stamina_recovery_rate: float = 0.25
-    stamina_min_force: float = 0.25
-    drag: float = 0.5
-    stiffness: float = 400.0
-    contact_damping: float = 10.0
-    margin_weight: float = 0.0
-    shaping_weight: float = 0.0
-    archetypes: list[str] | None = None
-    archetype_traits: dict[str, dict[str, float]] | None = None
-    # False turns the opponent's archetype one-hot into zeros.
-    observe_opponent_archetype: bool = True
-    # Null follows `observe_opponent_archetype`: stamina leaks the drain rate.
-    observe_opponent_stamina: bool | None = None
-    # Append both disks' velocity change over the last control step, the
-    # single-frame evidence a memoryless policy has about a hidden archetype.
-    observe_velocity_change: bool = False
-
-    def build(self) -> SequentialZeroSumGame:
-        return DiskSumoV2(**dataclasses.asdict(self))
-
-
-@dataclasses.dataclass
-class DiskSumoV3Config(DiskSumoV2Config):
-    """`disk_sumo_v2` with three archetypes that counter each other in a cycle.
-
-    See `games.disk_sumo_v3`: rammer beats grinder, grinder beats anchor, anchor
-    beats rammer. `archetype_traits` also accepts `top_speed`, `impact_brace`
-    and `brace_speed`.
-    """
-
-    # Width of the grip cut-out around `top_speed`, as a fraction of it.
-    grip_width: float = 0.05
-
-    def build(self) -> SequentialZeroSumGame:
-        return DiskSumoV3(**dataclasses.asdict(self))
 
 
 @dataclasses.dataclass
@@ -567,8 +513,6 @@ GAME_CONFIGS: dict[str, type] = {
     "leduc": LeducConfig,
     "sequential_blotto": SequentialBlottoConfig,
     "disk_sumo": DiskSumoConfig,
-    "disk_sumo_v2": DiskSumoV2Config,
-    "disk_sumo_v3": DiskSumoV3Config,
     "mjx_sumo": MjxSumoConfig,
     "mjx_ant_sumo": MjxAntSumoConfig,
     "mjx_bug_sumo": MjxBugSumoConfig,

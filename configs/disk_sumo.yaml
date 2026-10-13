@@ -59,6 +59,19 @@ game:
   #                     bootstrapping estimator (`ppo.advantage: vtrace`) uses.
   margin_weight: 0.0
   shaping_weight: 0.0
+  # Control steps by which each player's view of the *opponent's* disk lags
+  # (position, velocity, edge margin, stamina); their own disk and the clock
+  # stay current, and the egocentric frame points at the delayed position. 0 is
+  # the fully observed game. The delayed velocity is seen too, so steady motion
+  # can be extrapolated; what a delay of `d` steps really hides is the change
+  # of course, at most `0.5 * (max_force / mass) * (d * dt)^2` either way. Here
+  # that is 0.045 at d = 3 and 0.32 at d = 8, against a contact width of
+  # `2 * disk_radius = 0.3`.
+  observation_delay: 0
+  # Sightings of the opponent shown: the newest (`observation_delay` old) and
+  # `observation_frames - 1` older ones, one control step apart, appended to
+  # the observation as position and velocity. 1 is the single sighting.
+  observation_frames: 1
 
 network:
   policy: gaussian_mixture  # the only policy a sequential game supports

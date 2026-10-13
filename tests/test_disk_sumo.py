@@ -118,6 +118,177 @@ def test_a_symmetric_start_looks_identical_from_both_seats():
         )
 
 
+# ---- observation delay ------------------------------------------------------
+
+
+def _control_step(game: DiskSumo, state: DiskSumoState, force_0, force_1) -> DiskSumoState:
+    key = jax.random.PRNGKey(0)
+    return game.step(game.step(state, _force(*force_0), key), _force(*force_1), key)
+
+
+def _trajectory(game: DiskSumo, moves) -> list[DiskSumoState]:
+    """The states at the start of every control step of a bout playing `moves`."""
+    states = [game.initial_state(jax.random.PRNGKey(0))]
+    for force_0, force_1 in moves:
+        states.append(_control_step(game, states[-1], force_0, force_1))
+    return states
+
+
+# Distinct every step and for each seat, so no two control steps look alike.
+_MOVES = [((0.9, 0.3), (0.2, -0.8)), ((0.1, -0.6), (1.0, 0.0)), ((-0.4, 0.7), (0.5, 0.5)),
+          ((1.0, 0.0), (-0.3, 0.2)), ((0.6, -0.6), (0.0, 1.0)), ((0.0, 0.4), (0.8, -0.1))]
+
+
+@pytest.mark.parametrize("delay", [1, 3])
+def test_a_delayed_opponent_is_seen_as_it_was(delay):
+    game = _deterministic(egocentric=False, observation_delay=delay)
+    states = _trajectory(game, _MOVES)
+    for t, state in enumerate(states):
+        seen = states[max(t - delay, 0)]
+        for own, opp in ((0, 1), (1, 0)):
+            obs = np.asarray(game.observation(own, state))
+            np.testing.assert_allclose(obs[0:2], np.asarray(state.pos[own]), atol=1e-6)
+            np.testing.assert_allclose(obs[2:4], np.asarray(state.vel[own]) / game._speed_scale, atol=1e-6)
+            np.testing.assert_allclose(obs[4:6], np.asarray(seen.pos[opp]), atol=1e-6)
+            np.testing.assert_allclose(obs[6:8], np.asarray(seen.vel[opp]) / game._speed_scale, atol=1e-6)
+            assert obs[8] == pytest.approx(1.0 - np.linalg.norm(np.asarray(state.pos[own])), abs=1e-6)
+            assert obs[9] == pytest.approx(1.0 - np.linalg.norm(np.asarray(seen.pos[opp])), abs=1e-6)
+            assert obs[10] == pytest.approx(1.0 - t / game.horizon)
+
+
+def test_the_delay_changes_what_is_seen_but_not_the_physics():
+    live = _trajectory(_deterministic(egocentric=False), _MOVES)
+    delayed = _trajectory(_deterministic(egocentric=False, observation_delay=3), _MOVES)
+    for a, b in zip(live, delayed):
+        np.testing.assert_array_equal(np.asarray(a.pos), np.asarray(b.pos))
+        np.testing.assert_array_equal(np.asarray(a.vel), np.asarray(b.vel))
+    # The start is all there is to see, so the first observation is the live one...
+    live_game, delayed_game = _deterministic(), _deterministic(observation_delay=3)
+    np.testing.assert_array_equal(
+        np.asarray(live_game.observation(0, live_game.initial_state(jax.random.PRNGKey(0)))),
+        np.asarray(delayed_game.observation(0, delayed_game.initial_state(jax.random.PRNGKey(0)))),
+    )
+    # ...and a later one is not.
+    assert not np.allclose(
+        np.asarray(_deterministic(egocentric=False).observation(0, live[-1])),
+        np.asarray(_deterministic(egocentric=False, observation_delay=3).observation(0, delayed[-1])),
+    )
+
+
+def test_the_egocentric_frame_points_at_the_delayed_opponent():
+    """`(1, 0)` charges where the opponent was seen, in observation and action alike."""
+    delay = 2
+    game = _deterministic(drag=0.5, observation_delay=delay)
+    # Both sidestep hard, so the line of centres turns between sighting and now.
+    states = _trajectory(game, [((0.0, 1.0), (0.0, 1.0))] * 6)
+    state, seen = states[-1], states[-1 - delay]
+    for own, opp in ((0, 1), (1, 0)):
+        towards = np.asarray(seen.pos[opp] - state.pos[own])
+        towards = towards / np.linalg.norm(towards)
+        truly = np.asarray(state.pos[opp] - state.pos[own])
+        assert not np.allclose(towards, truly / np.linalg.norm(truly), atol=1e-3)
+
+        obs = np.asarray(game.observation(own, state))
+        # The seen opponent sits dead ahead: relative position along +x only.
+        np.testing.assert_allclose((obs[4:6] - obs[0:2])[1], 0.0, atol=1e-6)
+        assert (obs[4:6] - obs[0:2])[0] > 0.0
+
+        force, effort = game._world_force(state, own, jnp.asarray([1.0, 0.0]))
+        np.testing.assert_allclose(np.asarray(force), game.max_force * towards, atol=1e-6)
+        assert float(effort) == pytest.approx(1.0)
+
+
+def test_the_opponents_stamina_is_delayed_and_ones_own_is_not():
+    delay = 2
+    game = _deterministic(stamina_enabled=True, observation_delay=delay)
+    # Player 0 charges throughout and player 1 rests, so the two levels part.
+    states = _trajectory(game, [((1.0, 0.0), (1.0, 0.0))] * 2 + [((1.0, 0.0), (0.0, 0.0))] * 3)
+    state, seen = states[-1], states[-1 - delay]
+    assert float(state.stamina[0]) != pytest.approx(float(seen.stamina[0]))
+    assert float(state.stamina[1]) != pytest.approx(float(seen.stamina[1]))
+    np.testing.assert_allclose(
+        np.asarray(game.observation(0, state)[-2:]), [state.stamina[0], seen.stamina[1]], atol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(game.observation(1, state)[-2:]), [state.stamina[1], seen.stamina[0]], atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("delay, frames", [(3, 1), (2, 3), (0, 3)])
+def test_older_sightings_follow_the_observation_newest_first(delay, frames):
+    game = _deterministic(egocentric=False, observation_delay=delay, observation_frames=frames)
+    plain = _deterministic(egocentric=False, observation_delay=delay)
+    assert game.obs_dim(0) == game.obs_dim(1) == 11 + 4 * (frames - 1)
+    states, plain_states = _trajectory(game, _MOVES), _trajectory(plain, _MOVES)
+    for t, state in enumerate(states):
+        for own, opp in ((0, 1), (1, 0)):
+            obs = np.asarray(game.observation(own, state))
+            # The memory is appended: what one sighting showed is where it was.
+            np.testing.assert_array_equal(obs[:11], np.asarray(plain.observation(own, plain_states[t])))
+            for frame in range(1, frames):
+                seen = states[max(t - delay - frame, 0)]
+                sighting = obs[11 + 4 * (frame - 1): 11 + 4 * frame]
+                np.testing.assert_allclose(sighting[0:2], np.asarray(seen.pos[opp]), atol=1e-6)
+                np.testing.assert_allclose(
+                    sighting[2:4], np.asarray(seen.vel[opp]) / game._speed_scale, atol=1e-6
+                )
+
+
+def test_older_sightings_are_drawn_in_the_current_frame():
+    delay, frames = 1, 3
+    game = _deterministic(drag=0.5, observation_delay=delay, observation_frames=frames)
+    states = _trajectory(game, [((0.0, 1.0), (0.0, 1.0))] * 6)
+    state = states[-1]
+    for own, opp in ((0, 1), (1, 0)):
+        obs = np.asarray(game.observation(own, state))
+        rotation = np.asarray(game._frame(state.pos[own], states[-1 - delay].pos[opp]))
+        for frame in range(1, frames):
+            seen = states[-1 - delay - frame]
+            sighting = obs[11 + 4 * (frame - 1): 11 + 4 * frame]
+            np.testing.assert_allclose(sighting[0:2], rotation @ np.asarray(seen.pos[opp]), atol=1e-6)
+            np.testing.assert_allclose(
+                sighting[2:4], rotation @ np.asarray(seen.vel[opp]) / game._speed_scale, atol=1e-6
+            )
+        # The frame turned between sightings, so an old one is no longer dead ahead.
+        assert abs((obs[11:13] - obs[0:2])[1]) > 1e-3
+
+
+def test_older_sightings_carry_the_opponents_stamina():
+    delay, frames = 1, 3
+    game = _deterministic(stamina_enabled=True, observation_delay=delay, observation_frames=frames)
+    assert game.obs_dim(0) == 13 + 5 * (frames - 1)
+    states = _trajectory(game, [((1.0, 0.0), (1.0, 0.0))] * 2 + [((1.0, 0.0), (0.0, 0.0))] * 3)
+    state = states[-1]
+    obs = np.asarray(game.observation(0, state))
+    np.testing.assert_allclose(obs[11:13], [state.stamina[0], states[-1 - delay].stamina[1]], atol=1e-6)
+    older = [float(obs[13 + 5 * (frame - 1) + 4]) for frame in range(1, frames)]
+    np.testing.assert_allclose(
+        older, [float(states[-1 - delay - frame].stamina[1]) for frame in range(1, frames)], atol=1e-6
+    )
+    assert older[0] != pytest.approx(older[1])
+
+
+def test_a_delayed_bout_keeps_its_shapes_and_plays_to_the_end():
+    game = _game(horizon=20, observation_delay=3, observation_frames=4)
+    state = game.initial_state(jax.random.PRNGKey(0))
+    # Three steps of delay and three older sightings behind the newest.
+    assert state.past_pos.shape == (6, 2, 2) and state.past_stamina.shape == (6, 2)
+    assert _game(observation_delay=3).initial_state(jax.random.PRNGKey(0)).past_pos.shape == (3, 2, 2)
+    assert _game().initial_state(jax.random.PRNGKey(0)).past_pos.shape == (0, 2, 2)
+    stepped = _control_step(game, state, (0.3, -0.2), (1.0, 0.0))
+    for before, after in zip(jax.tree_util.tree_leaves(state), jax.tree_util.tree_leaves(stepped)):
+        assert before.shape == after.shape and before.dtype == after.dtype
+    assert game.observation(0, stepped).shape == (game.obs_dim(0),) == (23,)
+
+    final, payoffs = jax.vmap(
+        lambda key: game.play_episode(
+            (game.random_action_fn(0), game.random_action_fn(1)), key
+        )
+    )(jax.random.split(jax.random.PRNGKey(1), BATCH))
+    assert np.all(np.isfinite(np.asarray(payoffs)))
+    assert np.all(np.abs(np.asarray(payoffs)) <= 1.0)
+
+
 # ---- rules ------------------------------------------------------------------
 
 
@@ -161,15 +332,9 @@ def test_diagonal_forces_are_no_stronger_than_straight_ones():
 
 def test_contact_conserves_momentum_without_drag_or_forces():
     game = _deterministic(drag=0.0, contact_damping=0.0)
-    state = DiskSumoState(
+    state = game.initial_state(jax.random.PRNGKey(0)).replace(
         pos=jnp.asarray([[-0.2, 0.0], [0.2, 0.05]], dtype=jnp.float32),
         vel=jnp.asarray([[1.0, 0.0], [-0.5, 0.0]], dtype=jnp.float32),
-        pending=jnp.zeros((2,), dtype=jnp.float32),
-        pending_effort=jnp.zeros((), dtype=jnp.float32),
-        force_multiplier=jnp.ones((2,), dtype=jnp.float32),
-        stamina=jnp.ones((2,), dtype=jnp.float32),
-        result=jnp.zeros((), dtype=jnp.float32),
-        done=jnp.zeros((), dtype=bool),
         turn=jnp.asarray(1, dtype=jnp.int32),  # player 1 to act: the next step resolves
     )
     stepped = game.step(state, _force(0.0, 0.0), jax.random.PRNGKey(0))
@@ -183,15 +348,9 @@ def test_contact_conserves_momentum_without_drag_or_forces():
 
 def test_the_disk_that_leaves_first_loses_a_simultaneous_exit():
     game = _deterministic(drag=0.0)
-    state = DiskSumoState(
+    state = game.initial_state(jax.random.PRNGKey(0)).replace(
         pos=jnp.asarray([[-0.95, 0.0], [0.92, 0.0]], dtype=jnp.float32),
         vel=jnp.asarray([[-1.0, 0.0], [1.0, 0.0]], dtype=jnp.float32),
-        pending=jnp.zeros((2,), dtype=jnp.float32),
-        pending_effort=jnp.zeros((), dtype=jnp.float32),
-        force_multiplier=jnp.ones((2,), dtype=jnp.float32),
-        stamina=jnp.ones((2,), dtype=jnp.float32),
-        result=jnp.zeros((), dtype=jnp.float32),
-        done=jnp.zeros((), dtype=bool),
         turn=jnp.asarray(1, dtype=jnp.int32),
     )
     stepped = game.step(state, _force(0.0, 0.0), jax.random.PRNGKey(0))
@@ -329,6 +488,8 @@ def test_random_play_is_fair_on_average():
     dict(force_asymmetry=-0.1), dict(force_asymmetry=1.0),
     dict(stamina_drain_rate=-0.1), dict(stamina_recovery_rate=-0.1),
     dict(stamina_min_force=-0.1), dict(stamina_min_force=1.1),
+    dict(observation_delay=-1), dict(observation_delay=1.5),
+    dict(observation_frames=0), dict(observation_frames=2.5),
 ])
 def test_invalid_parameters_are_rejected(kwargs):
     with pytest.raises(ValueError):

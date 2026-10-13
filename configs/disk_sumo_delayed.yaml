@@ -1,0 +1,145 @@
+# python train.py configs/disk_sumo_delayed.yaml
+#
+# `configs/disk_sumo.yaml` with each player seeing the opponent's disk late
+# (`observation_delay`, see `games/disk_sumo.py`) and the physics sped up to
+# match. The training setup is that config's; only the `game` block and the
+# checkpoint directory differ, so the two runs compare like for like.
+#
+# What the delay hides is the opponent's change of course: over `d` control
+# steps at most `0.5 * (max_force / mass) * (d * dt)^2` either way, to be read
+# against the contact width `2 * disk_radius = 0.3`. At the base physics d = 6
+# hides only 0.18. Here the base game is played at double speed -- `max_force`
+# x4, `drag` x2, `stiffness` x4, `contact_damping` x2, which is exactly
+# `dt: 0.2` in the old units -- so d = 6 hides 0.72, what d = 12 would there, in
+# half as many decisions. Drag is doubled rather than quadrupled on purpose:
+# `mass / drag` is the momentum a run-up carries, and the base config found
+# that without it nobody can be moved.
+#
+# The policy has no memory of its own, so `observation_frames` gives it the
+# opponent's last four sightings rather than one. Its own recent forces it
+# still does not get.
+#
+# Measure the checkpoint with
+# `python best_response.py configs/disk_sumo_delayed_br.yaml`.
+
+game:
+  name: disk_sumo
+  horizon: 50              # control steps; 2 * horizon decisions. 5 s, the base bout at double speed
+  ring_radius: 1.0
+  disk_radius: 0.15
+  start_distance: 0.6     # centre-to-centre at the start
+  start_jitter: 0.05      # per-coordinate start noise
+  random_orientation: true
+  # Place both disks uniformly in the ring every bout, rather than facing each
+  # other across the centre. A symmetric start invites a symmetric stalemate --
+  # two equal disks pushing head-on cannot gain ground on each other, whatever
+  # the horizon -- and a policy trained only on it has never played from the
+  # rim. Measured: random play decides 36% of bouts from random starts against
+  # 8% from the facing start. `start_distance`, `start_jitter` and
+  # `random_orientation` are then unused (they still place the fallback start).
+  random_start: true
+  egocentric: true
+  dt: 0.1                 # seconds per control step
+  substeps: 20            # the contact spring is 4x stiffer; same resolution per oscillation
+  mass: 1.0
+  # Acceleration 4 (base: 1): a disk at rest shifts its own width in 0.39 s.
+  max_force: 4.0
+  # `mass / drag` is how long a disk keeps its speed: 1 s against a 5 s bout,
+  # the base config's ratio. Top speed (`max_force / drag`) is 4.
+  drag: 1.0
+  # The base contact (400, 10) rescaled with the forces: same squash, same
+  # 0.35 damping ratio.
+  stiffness: 1600.0
+  contact_damping: 20.0
+  # Random play decides ~64% of bouts under the start and physics above (it was
+  # ~7% with the facing start and drag 1), so the two terms below are now a
+  # refinement rather than the only signal there is. Both act on the same
+  # distance gap `phi = (d_1 - d_0) / ring_radius` (distances from the centre):
+  #   margin_weight  -- a terminal tie-breaker, `margin_weight * phi`, paid only
+  #                     when nobody is pushed out. Keep it below 1.
+  #   shaping_weight -- dense potential-based shaping, `w * (phi' - phi)` per
+  #                     step. Undiscounted it telescopes to the same kind of
+  #                     terminal term, but arrives as it happens -- which only a
+  #                     bootstrapping estimator (`ppo.advantage: vtrace`) uses.
+  margin_weight: 0.0
+  shaping_weight: 0.0
+  # Control steps by which each player's view of the *opponent's* disk lags
+  # (position, velocity, edge margin, stamina); their own disk and the clock
+  # stay current, and the egocentric frame points at the delayed position.
+  # 6 steps is 0.6 s and hides a change of course of up to 0.72 either way.
+  observation_delay: 6
+  # Sightings of the opponent shown: the newest (`observation_delay` old) and
+  # `observation_frames - 1` older ones, one control step apart, appended to
+  # the observation as position and velocity. Four of them are the opponent
+  # 0.6, 0.7, 0.8 and 0.9 s ago: nothing newer than the delay allows, but
+  # enough to see a turn in progress. The observation is 11 + 3 * 4 = 23 wide.
+  observation_frames: 4
+
+network:
+  policy: gaussian_mixture  # the only policy a sequential game supports
+  hidden_dims: [128, 128]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 4
+  # Per-component covariance. The action is 2-D, so a full covariance can tilt a
+  # component's ellipse; diagonal keeps it axis-aligned.
+  full_covariance: false
+  scale_parameterization: log   # "log" or "linear"
+  max_correlation: 0.0          # full_covariance + log only; 0 = unbounded
+  sigma_min: 0.1               # null = built-in floor (1e-3)
+  sigma_max: null               # null = box width
+  # Confine each component to its own bucket of the box (equal-area boxes, any
+  # num_components; a regular grid for 1, 4, 9, ...). Pair with sigma_min ~
+  # bucket/4, a bucket being ~ box width / sqrt(num_components) across.
+  bucket_means: false
+  clip_means: true        # keep the means in the [-1, 1]^2 force box
+  mean_box_penalty_coef: 1.0    # pulls drifted means back to the box edge
+
+optimizer:
+  learning_rate: 0.0003
+  max_grad_norm: 0.5
+  optimizer: adam         # see training/optimizers.py for the choices
+  weight_decay: 0.0       # only used by adamw / muon
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 4000
+
+  # With this probability a sampled force is replaced by a uniform draw on the
+  # box (on the component's bucket under `network.bucket_means`); V-trace
+  # importance-weights it back to the policy. 0 disables.
+  explore_eps: 0.0
+
+  # V-trace over each player's own decisions (`training/vtrace.py`). gamma 1
+  # keeps the zero-sum objective; lambda < 1 is the variance reduction. The
+  # importance weights correct a player's own exploration (`explore_eps`) and
+  # any drift over `ppo_epochs`; `vtrace_opponent_correction` handles the opponent's.
+  advantage: vtrace
+  gamma: 1.0
+  vtrace_lambda: 0.95
+  vtrace_rho_bar: 2.0
+  vtrace_c_bar: 1.0
+  # Correct the opponent's exploration after each own decision; not before it.
+  # The delay makes the past matter (it shapes beliefs), so `future_and_past`
+  # is worth trying here; see training/vtrace.py.
+  vtrace_opponent_correction: future
+
+  # No atoms: the categorical head only picks which force component to use.
+  category_entropy_coef: 0.04
+  gaussian_entropy_coef: 0.04
+
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  mode: self_play         # the only mode a sequential game supports
+  steps: 10               # outer steps: each logs and writes a checkpoint
+  epochs: 4000             # training iterations per outer step
+  checkpoint_dir: data/disk_sumo_delayed
+  seed: 0

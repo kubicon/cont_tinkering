@@ -33,3 +33,4 @@ scripts/
 configs/num_components/
 configs/one_shot_neural/
 configs/sequential_sweep/
+paper/

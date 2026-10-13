@@ -78,6 +78,34 @@ velocities) and the clock -- this is a stochastic game with simultaneous moves,
 not a game of hidden cards, and the only thing withheld is the opponent's
 current force. Past actions influence the future only through the state they
 produced, so observing the state is also what perfect recall asks for here.
+
+**Optional observation delay.** With `observation_delay=d > 0` a player sees
+the *opponent's* disk as it was `d` control steps ago -- position, velocity,
+edge margin and stamina -- while their own disk and the clock stay current.
+For the first `d` control steps that is the opponent's start. The opponent's
+last `d` moves are then hidden for as long as they take to arrive, instead of
+for a single control step, so a feint or a sidestep can no longer be answered
+the moment it shows: whoever commits has to guess. Three things follow.
+
+  * The egocentric frame is built from what the player sees, so its x-axis
+    points at the opponent's *delayed* position, and the action is read in that
+    same frame. "Charge" `(1, 0)` aims at where the opponent was; a frame on the
+    true position would aim for the player and undo the delay. The frame swings
+    round quickly when a player crosses the spot the opponent has just left;
+    `egocentric=False` has no such artefact.
+  * Contact is still felt at once, through the player's own velocity.
+  * The observation is no longer a sufficient statistic: the player's own
+    recent forces and the opponent's earlier sightings carry information that a
+    memoryless policy does not get. `observation_frames` hands over the latter.
+
+**Optional sighting memory.** `observation_frames=k > 1` shows the opponent's
+last `k` sightings instead of one: the opponent `d`, `d + 1`, ..., `d + k - 1`
+control steps ago. Nothing newer is revealed -- the delay is still `d` -- but a
+run of sightings shows how the opponent has been turning, which one position
+and velocity cannot. Each older sighting appends the opponent's position and
+velocity (and stamina, when that is on) to the end of the observation, newest
+first and all in the player's *current* frame, so the first 11 entries keep
+their meaning. It works without a delay too, as plain frame stacking.
 """
 
 from __future__ import annotations
@@ -112,6 +140,12 @@ class DiskSumoState:
     the live control step wait in `pending` / `pending_effort` until player 1
     has chosen theirs; neither is part of either observation.
 
+    `past_pos`, `past_vel` and `past_stamina` hold the last
+    `observation_delay + observation_frames - 1` control steps, newest first:
+    index `k` is the state `k + 1` control steps ago, so the opponent is shown
+    entry `observation_delay - 1` and, with more frames, the ones after it.
+    They have length zero when there is neither a delay nor a memory.
+
     `result` is `+1`/`-1` once somebody has been pushed out and `0` otherwise;
     `done` marks that the bout ended early, including by the simultaneous-exit
     draw, which leaves `result` at `0`.
@@ -123,6 +157,9 @@ class DiskSumoState:
     pending_effort: chex.Array  # () float32, hidden player-0 effort in [0, 1]
     force_multiplier: chex.Array  # (2,) float32, per-bout actuator strengths
     stamina: chex.Array  # (2,) float32 in [0, 1]
+    past_pos: chex.Array  # (history, 2, 2) float32
+    past_vel: chex.Array  # (history, 2, 2) float32
+    past_stamina: chex.Array  # (history, 2) float32
     result: chex.Array  # () float32 in {-1, 0, +1}, from player 0's side
     done: chex.Array  # () bool, the bout ended before the time limit
     turn: chex.Array  # () int32 in [0, 2 * horizon]
@@ -155,9 +192,21 @@ class DiskSumo(SequentialZeroSumGame):
         contact_damping: float = 5.0,
         margin_weight: float = 0.0,
         shaping_weight: float = 0.0,
+        observation_delay: int = 0,
+        observation_frames: int = 1,
     ):
         if horizon < 1:
             raise ValueError(f"horizon must be at least 1, got {horizon}")
+        if observation_delay < 0 or int(observation_delay) != observation_delay:
+            raise ValueError(
+                f"observation_delay must be a non-negative whole number of control steps, "
+                f"got {observation_delay}"
+            )
+        if observation_frames < 1 or int(observation_frames) != observation_frames:
+            raise ValueError(
+                f"observation_frames must be a whole number of sightings, at least 1, "
+                f"got {observation_frames}"
+            )
         if substeps < 1:
             raise ValueError(f"substeps must be at least 1, got {substeps}")
         for name, value in (("ring_radius", ring_radius), ("disk_radius", disk_radius),
@@ -217,6 +266,10 @@ class DiskSumo(SequentialZeroSumGame):
         self.contact_damping = float(contact_damping)
         self.margin_weight = float(margin_weight)
         self.shaping_weight = float(shaping_weight)
+        self.observation_delay = int(observation_delay)
+        self.observation_frames = int(observation_frames)
+        # Control steps of the past a state carries: up to the oldest sighting.
+        self._history = self.observation_delay + self.observation_frames - 1
         # Speed a lone disk settles at under full force: the natural velocity
         # scale for the observation. Drag-free physics falls back to what full
         # force reaches in one control step.
@@ -237,7 +290,9 @@ class DiskSumo(SequentialZeroSumGame):
         # Disabled optional mechanics preserve old checkpoint input widths.
         # Strength and stamina must be visible so the policy can condition its
         # attacking/defending behavior on the current role and resources.
-        return 11 + 2 * (self.force_asymmetry > 0.0) + 2 * self.stamina_enabled
+        # Each older sighting is a position and a velocity, plus stamina when on.
+        memory = (self.observation_frames - 1) * (4 + self.stamina_enabled)
+        return 11 + 2 * (self.force_asymmetry > 0.0) + 2 * self.stamina_enabled + memory
 
     # ---- the game tree ------------------------------------------------------
 
@@ -249,13 +304,19 @@ class DiskSumo(SequentialZeroSumGame):
         force_multiplier = jnp.where(
             jnp.arange(2) == strong_player, strong, weak
         ).astype(jnp.float32)
+        pos = pos.astype(jnp.float32)
+        history = self._history
         return DiskSumoState(
-            pos=pos.astype(jnp.float32),
+            pos=pos,
             vel=jnp.zeros((2, 2), dtype=jnp.float32),
             pending=jnp.zeros((2,), dtype=jnp.float32),
             pending_effort=jnp.zeros((), dtype=jnp.float32),
             force_multiplier=force_multiplier,
             stamina=jnp.ones((2,), dtype=jnp.float32),
+            # Before the bout there is only the start to have seen.
+            past_pos=jnp.broadcast_to(pos, (history, 2, 2)),
+            past_vel=jnp.zeros((history, 2, 2), dtype=jnp.float32),
+            past_stamina=jnp.ones((history, 2), dtype=jnp.float32),
             result=jnp.zeros((), dtype=jnp.float32),
             done=jnp.zeros((), dtype=bool),
             turn=jnp.zeros((), dtype=jnp.int32),
@@ -329,17 +390,29 @@ class DiskSumo(SequentialZeroSumGame):
         `state.pending` is deliberately not read: it is player 0's force for the
         live control step, and showing it to player 1 would turn the
         simultaneous move into a sequential one.
+
+        With `observation_delay` everything about the opponent -- position,
+        velocity, edge margin, stamina, and so the frame -- is
+        `observation_delay` control steps old.
+
+        With `observation_frames > 1` the older sightings follow at the very
+        end, newest first: the opponent's position and velocity (then stamina,
+        if enabled) one control step further back each time, scaled as above
+        and rotated into the same, current frame.
         """
         own, opp = player, 1 - player
-        rotation = self._frame(state.pos[own], state.pos[opp])
-        radii = jnp.linalg.norm(state.pos, axis=-1) / self.ring_radius
+        own_pos = state.pos[own]
+        opp_pos, opp_vel, opp_stamina = self._seen_opponent(state, player)
+        rotation = self._frame(own_pos, opp_pos)
+        own_radius = jnp.linalg.norm(own_pos) / self.ring_radius
+        opp_radius = jnp.linalg.norm(opp_pos) / self.ring_radius
         time_left = 1.0 - (state.turn // 2).astype(jnp.float32) / self.horizon
         observation = jnp.concatenate([
-            rotation @ state.pos[own] / self.ring_radius,
+            rotation @ own_pos / self.ring_radius,
             rotation @ state.vel[own] / self._speed_scale,
-            rotation @ state.pos[opp] / self.ring_radius,
-            rotation @ state.vel[opp] / self._speed_scale,
-            jnp.stack([1.0 - radii[own], 1.0 - radii[opp], time_left]),
+            rotation @ opp_pos / self.ring_radius,
+            rotation @ opp_vel / self._speed_scale,
+            jnp.stack([1.0 - own_radius, 1.0 - opp_radius, time_left]),
         ])
         if self.force_asymmetry > 0.0:
             observation = jnp.concatenate([
@@ -349,9 +422,38 @@ class DiskSumo(SequentialZeroSumGame):
         if self.stamina_enabled:
             observation = jnp.concatenate([
                 observation,
-                jnp.stack([state.stamina[own], state.stamina[opp]]),
+                jnp.stack([state.stamina[own], opp_stamina]),
             ])
+        for frame in range(1, self.observation_frames):
+            past_pos, past_vel, past_stamina = self._seen_opponent(state, player, frame)
+            sighting = [
+                rotation @ past_pos / self.ring_radius,
+                rotation @ past_vel / self._speed_scale,
+            ]
+            if self.stamina_enabled:
+                sighting.append(past_stamina[None])
+            observation = jnp.concatenate([observation, *sighting])
         return observation
+
+    def _seen_opponent(self, state: DiskSumoState, player, frame: int = 0):
+        """`(pos, vel, stamina)` of `player`'s opponent as `player` sees it.
+
+        `frame` 0 is the newest sighting, `observation_delay` control steps
+        old -- the live state when there is no delay -- and each further frame
+        is one control step older.
+        """
+        opp = 1 - player
+        age = self.observation_delay + frame
+        if age == 0:
+            return state.pos[opp], state.vel[opp], state.stamina[opp]
+        return (
+            state.past_pos[age - 1, opp], state.past_vel[age - 1, opp],
+            state.past_stamina[age - 1, opp],
+        )
+
+    def _remember(self, past: chex.Array, current: chex.Array) -> chex.Array:
+        """Shift `current` into the front of a history buffer, dropping its oldest entry."""
+        return jnp.concatenate([current[None], past])[: self._history]
 
     def action_mask(self, player: int, state: DiskSumoState) -> chex.Array:
         """`(1,)` all-`True`: pushing is the only kind, and every force is legal."""
@@ -402,6 +504,15 @@ class DiskSumo(SequentialZeroSumGame):
             pending_effort=jnp.where(resolves, jnp.zeros_like(effort), effort),
             force_multiplier=state.force_multiplier,
             stamina=jnp.where(resolves, next_stamina, state.stamina),
+            past_pos=jnp.where(
+                resolves, self._remember(state.past_pos, state.pos), state.past_pos
+            ),
+            past_vel=jnp.where(
+                resolves, self._remember(state.past_vel, state.vel), state.past_vel
+            ),
+            past_stamina=jnp.where(
+                resolves, self._remember(state.past_stamina, state.stamina), state.past_stamina
+            ),
             result=jnp.where(resolves, result, state.result),
             done=jnp.where(resolves, done, state.done),
             turn=state.turn + 1,
@@ -416,8 +527,11 @@ class DiskSumo(SequentialZeroSumGame):
         norm is the `effort`), rotated out of the egocentric frame, and scaled by
         the actuator multiplier and stamina. Shared with `scripts/render_disk_sumo.py`,
         which has to recompute player 1's force: it is never stored in a state.
+
+        The frame is the one `observation` uses, so under `observation_delay`
+        its x-axis points at the opponent's delayed position, not the true one.
         """
-        own, opp = state.pos[player], state.pos[1 - player]
+        own, opp = state.pos[player], self._seen_opponent(state, player)[0]
         # Keep the state's dtype: a float64 action (x64 on) would otherwise
         # promote `pending`, `pos` and `vel`, and break the scans that carry them.
         local = self._space.box.clip(value).astype(state.pos.dtype)

@@ -35,9 +35,7 @@ def _config(path: str = "configs/kuhn_classic.yaml", policy_override: str | None
         "configs/leduc_classic.yaml",
         "configs/sequential_blotto.yaml",
         "configs/disk_sumo.yaml",
-        "configs/disk_sumo_v2.yaml",
-        "configs/disk_sumo_v2_hidden.yaml",
-        "configs/disk_sumo_v3.yaml",
+        "configs/disk_sumo_delayed.yaml",
         "configs/mjx_sumo.yaml",
         "configs/mjx_ant_sumo.yaml",
         "configs/mjx_bug_sumo.yaml",
@@ -50,7 +48,7 @@ def test_the_shipped_sequential_configs_load_and_build(path):
 
 
 SEQUENTIAL_GAMES = {
-    "kuhn", "leduc", "sequential_blotto", "disk_sumo", "disk_sumo_v2", "disk_sumo_v3",
+    "kuhn", "leduc", "sequential_blotto", "disk_sumo",
     "mjx_sumo", "mjx_ant_sumo", "mjx_bug_sumo", "mjx_spider_sumo",
 }
 
