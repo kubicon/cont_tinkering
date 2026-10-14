@@ -289,6 +289,141 @@ def test_a_delayed_bout_keeps_its_shapes_and_plays_to_the_end():
     assert np.all(np.abs(np.asarray(payoffs)) <= 1.0)
 
 
+# ---- limited sensing --------------------------------------------------------
+
+
+def _sector_of(obs, bins: int, frame: int = 0) -> int:
+    """The sector a `"bearing"` observation without extras shows for sighting `frame`."""
+    one_hot = np.asarray(obs)[8 + frame * bins: 8 + (frame + 1) * bins]
+    assert one_hot.sum() == pytest.approx(1.0)
+    return int(np.argmax(one_hot))
+
+
+@pytest.mark.parametrize("kwargs, width", [
+    (dict(opponent_sensing="none"), 8),
+    (dict(opponent_sensing="bearing"), 12),
+    (dict(opponent_sensing="bearing", bearing_bins=8, bearing_noise=0.3,
+          observation_delay=2, observation_frames=3), 32),
+    (dict(opponent_sensing="bearing", stamina_enabled=True, force_asymmetry=0.2), 15),
+])
+def test_a_sensing_bout_keeps_its_shapes_and_plays_to_the_end(kwargs, width):
+    game = _game(horizon=20, **kwargs)
+    state = game.initial_state(jax.random.PRNGKey(0))
+    stepped = _control_step(game, state, (0.3, -0.2), (1.0, 0.0))
+    for before, after in zip(jax.tree_util.tree_leaves(state), jax.tree_util.tree_leaves(stepped)):
+        assert before.shape == after.shape and before.dtype == after.dtype
+    assert game.observation(0, stepped).shape == (game.obs_dim(0),) == (width,)
+
+    final, payoffs = jax.vmap(
+        lambda key: game.play_episode(
+            (game.random_action_fn(0), game.random_action_fn(1)), key
+        )
+    )(jax.random.split(jax.random.PRNGKey(1), BATCH))
+    assert np.all(np.isfinite(np.asarray(payoffs)))
+    assert np.all(np.abs(np.asarray(payoffs)) <= 1.0)
+
+
+@pytest.mark.parametrize("opp, sector", [
+    ((0.8, 0.0), 0),   # farther out than me
+    ((0.4, 0.4), 1),   # to my left
+    ((0.0, 0.0), 2),   # between me and the centre
+    ((0.4, -0.4), 3),  # to my right
+])
+def test_the_bearing_sector_is_read_in_the_radial_frame(opp, sector):
+    game = _deterministic(opponent_sensing="bearing")
+    for angle in (0.0, 1.0, -2.5):
+        # Rotating the whole position about the centre changes nothing it senses.
+        c, s = np.cos(angle), np.sin(angle)
+        rotate = np.array([[c, -s], [s, c]], dtype=np.float32)
+        pos = np.stack([rotate @ np.array([0.4, 0.0]), rotate @ np.array(opp)]).astype(np.float32)
+        state = game.initial_state(jax.random.PRNGKey(0)).replace(pos=jnp.asarray(pos))
+        assert _sector_of(game.observation(0, state), 4) == sector
+
+
+def test_nothing_but_the_sector_of_the_opponent_is_sensed():
+    for sensing in ("bearing", "none"):
+        game = _deterministic(opponent_sensing=sensing, stamina_enabled=True)
+        base = game.initial_state(jax.random.PRNGKey(0))
+        # Same own disk; the opponent moved, sped up and tired, but still inward.
+        moved = base.replace(
+            pos=base.pos.at[1].set(jnp.asarray([0.1, 0.05])),
+            vel=base.vel.at[1].set(jnp.asarray([2.0, -1.0])),
+            stamina=base.stamina.at[1].set(0.2),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(game.observation(0, base)), np.asarray(game.observation(0, moved))
+        )
+
+
+def test_the_bearing_sector_is_delayed_and_remembered():
+    delay, frames = 2, 3
+    game = _deterministic(egocentric=False, opponent_sensing="bearing", bearing_bins=8,
+                          observation_delay=delay, observation_frames=frames)
+    states = _trajectory(game, _MOVES)
+    for t, state in enumerate(states):
+        for frame in range(frames):
+            seen = states[max(t - delay - frame, 0)]
+            towards = np.asarray(seen.pos[1] - state.pos[0])
+            angle = np.arctan2(towards[1], towards[0])
+            expected = int(np.floor(angle / (2 * np.pi / 8) + 0.5)) % 8
+            assert _sector_of(game.observation(0, state), 8, frame) == expected
+
+
+def test_the_bearing_error_is_redrawn_every_control_step_and_shared_within_it():
+    game = _game(opponent_sensing="bearing", bearing_noise=0.5)
+    state = game.initial_state(jax.random.PRNGKey(0))
+    parked = game.step(state, _force(0.0, 0.0), jax.random.PRNGKey(1))
+    np.testing.assert_array_equal(np.asarray(parked.bearing_error), np.asarray(state.bearing_error))
+    resolved = game.step(parked, _force(0.0, 0.0), jax.random.PRNGKey(2))
+    assert not np.allclose(np.asarray(resolved.bearing_error), np.asarray(state.bearing_error))
+    # Without noise, or without a bearing to blur, there is no error at all.
+    for kwargs in (dict(opponent_sensing="bearing"), dict(bearing_noise=0.5)):
+        quiet = _game(**kwargs).initial_state(jax.random.PRNGKey(0))
+        np.testing.assert_array_equal(np.asarray(quiet.bearing_error), 0.0)
+
+
+def test_a_large_bearing_error_makes_the_sector_uninformative():
+    game = _deterministic(opponent_sensing="bearing", bearing_noise=100.0)
+    sectors = jax.vmap(
+        lambda key: jnp.argmax(game.observation(0, game.initial_state(key))[8:12])
+    )(jax.random.split(jax.random.PRNGKey(0), 4000))
+    counts = np.bincount(np.asarray(sectors), minlength=4) / 4000
+    np.testing.assert_allclose(counts, 0.25, atol=0.03)
+
+
+def test_the_touch_sensor_feels_contact_and_nothing_else():
+    # The charge is driven in the world frame (player 0 starts on -x, facing +x);
+    # the radial frame is only used to read it back.
+    states = _trajectory(
+        _deterministic(opponent_sensing="none", egocentric=False, max_force=4.0),
+        [((1.0, 0.0), (0.0, 0.0))] * 10,
+    )
+    game = _deterministic(opponent_sensing="none", max_force=4.0)
+    assert np.all(np.asarray(states[0].touch) == 0.0)
+    touched = [s for s in states if np.linalg.norm(np.asarray(s.touch[0])) > 0.0]
+    assert touched, "charging player 0 never reached player 1"
+    for state in touched:
+        # Newton's third law, and both observe it in their own radial frame.
+        np.testing.assert_allclose(np.asarray(state.touch[0]), -np.asarray(state.touch[1]), atol=1e-4)
+        for own in (0, 1):
+            rotation = np.asarray(game._radial_frame(state.pos[own]))
+            np.testing.assert_allclose(
+                np.asarray(game.observation(own, state))[4:6],
+                rotation @ np.asarray(state.touch[own]) / game.max_force, atol=1e-5,
+            )
+
+
+def test_limited_sensing_acts_in_the_radial_frame():
+    """`(-1, 0)` pushes towards the centre, wherever the disk is and wherever the opponent."""
+    game = _deterministic(opponent_sensing="bearing")
+    state = game.initial_state(jax.random.PRNGKey(0)).replace(
+        pos=jnp.asarray([[0.0, 0.5], [0.6, 0.0]], dtype=jnp.float32)
+    )
+    force, effort = game._world_force(state, 0, jnp.asarray([-1.0, 0.0]))
+    np.testing.assert_allclose(np.asarray(force), [0.0, -game.max_force], atol=1e-6)
+    assert float(effort) == pytest.approx(1.0)
+
+
 # ---- rules ------------------------------------------------------------------
 
 
@@ -490,6 +625,9 @@ def test_random_play_is_fair_on_average():
     dict(stamina_min_force=-0.1), dict(stamina_min_force=1.1),
     dict(observation_delay=-1), dict(observation_delay=1.5),
     dict(observation_frames=0), dict(observation_frames=2.5),
+    dict(opponent_sensing="partial"), dict(bearing_bins=1), dict(bearing_bins=2.5),
+    dict(bearing_noise=-0.1), dict(opponent_sensing="none", observation_delay=1),
+    dict(opponent_sensing="none", observation_frames=2),
 ])
 def test_invalid_parameters_are_rejected(kwargs):
     with pytest.raises(ValueError):

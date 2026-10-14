@@ -1,6 +1,6 @@
 """Generate configs + SLURM shell scripts for experiments/one_shot_neural.
 
-Three experiments, selected with ``--experiment``:
+Four experiments, selected with ``--experiment``:
 
 ``main`` (default)
     The eval-matched grid: one job per (game, method) across the chosen seeds, via
@@ -24,6 +24,15 @@ Three experiments, selected with ``--experiment``:
     cell writes to ``<out>/<game>/<method>__k<K>/seed<N>`` (``run_all.py --label``), which
     is what keeps the K's from overwriting one another, and ``score.py --plot-capacity``
     turns the tree into exploitability-against-K.
+
+``init``
+    The mixture again, started *off* equilibrium. Its default init spreads the component
+    means evenly over the box, which on ``circle`` (4 atoms > 3 harmonics) and on
+    ``matching_pennies`` (one component at the origin) is already a Nash -- so those
+    curves start at ~0 and show no training at all. ``INIT_SETTINGS`` narrows the
+    initial means / stds per game; one job per (game, method), written into the *main*
+    tree under the label ``<method>__offset_init``, i.e. next to the default-init runs
+    and never over them. ``score.py --methods`` picks either or both for a plot.
 
 Game specs live in ``GAMES`` below -- this script writes a YAML for each under
 ``configs/one_shot_neural/`` and points every job at those files. Do not hand it
@@ -63,6 +72,11 @@ Hyperparameters come from ``SHARED_SETTINGS`` / ``METHOD_SETTINGS`` (every
     bash scripts/one_shot_neural_capacity/run_all.sh
     bash scripts/one_shot_neural_capacity/score_all.sh  # writes <game>_capacity.png
 
+    # the mixture from an off-equilibrium init, beside the main tree's runs
+    python rci_scripts/generate_one_shot_neural.py --experiment init
+    bash scripts/one_shot_neural_init/run_all.sh
+    bash scripts/one_shot_neural_init/score_all.sh
+
 The ``walltime`` scripts read ``--reference`` at *run* time to calibrate, so that tree
 must already hold finished ``--match`` and pseudo-gradient runs on the cluster. Check
 what the budgets will be before submitting:
@@ -84,6 +98,7 @@ CONFIGS_DIR = REPO_ROOT / "configs" / "one_shot_neural"
 SCRIPTS_DIR = REPO_ROOT / "scripts" / "one_shot_neural"
 SCRIPTS_DIR_WALLTIME = REPO_ROOT / "scripts" / "one_shot_neural_walltime"
 SCRIPTS_DIR_CAPACITY = REPO_ROOT / "scripts" / "one_shot_neural_capacity"
+SCRIPTS_DIR_INIT = REPO_ROOT / "scripts" / "one_shot_neural_init"
 RUN_ALL = "experiments/one_shot_neural/run_all.py"
 RUN_WALLTIME = "experiments/one_shot_neural/run_walltime_matched.py"
 RUN_CELL = REPO_ROOT / "experiments" / "one_shot_neural" / "run_cell.py"
@@ -377,6 +392,33 @@ CAPACITY_OUT = "data/one_shot_neural_capacity"
 # the main experiment's wall-time per job carries over.
 CAPACITY_TIME_H = 4
 
+# --- init experiment ---------------------------------------------------------------
+# `run_cell.Settings` init knobs per game, in fractions of the action box: the means
+# are spread evenly over `[init_mean_lo, init_mean_hi]` and every std is
+# `init_std_scale` times the default (box width / (2 K)). Only the games whose default
+# init is already a Nash are here; add a game to run it too.
+#   circle (box [0, 1], K=4): means 0.09, 0.28, 0.47, 0.66 -- three quarters of the
+#     circle instead of all of it, std 0.0625 -- so the first harmonic is no longer
+#     cancelled. Rough start: expl ~0.6, against ~0 for the default init.
+#   matching_pennies (box [-1, 1], K=1): the one mean at 0.3 instead of 0, std 0.5.
+#     Rough start: expl = |E a1| + |E a2| ~0.55.
+INIT_SETTINGS: dict[str, dict[str, float]] = {
+    "circle": {"init_mean_lo": 0.0, "init_mean_hi": 0.75, "init_std_scale": 0.5},
+    "matching_pennies": {"init_mean_lo": 0.6, "init_mean_hi": 0.7, "init_std_scale": 0.5},
+}
+INIT_METHODS = ("mixture",)
+# The main tree on purpose: the runs sit beside the default-init ones under their own
+# label, so one `score.py` pass plots both, and `--methods` picks either.
+INIT_OUT = DEFAULT_OUT
+INIT_TIME_H = 4
+
+
+def init_label(method: str) -> str:
+    """The init experiment's cell directory under `<out>/<game>/` -- distinct from the
+    method's own, which is what keeps the default-init runs from being skipped or
+    overwritten."""
+    return f"{method}__offset_init"
+
 
 def capacity_settings() -> dict[str, str]:
     """`run_cell.CAPACITY_SETTING`: the `Settings` field that is each method's capacity.
@@ -624,8 +666,14 @@ def generate(
 
     walltime = experiment == "walltime"
     capacity = experiment == "capacity"
-    scripts_dir = {"walltime": SCRIPTS_DIR_WALLTIME,
-                   "capacity": SCRIPTS_DIR_CAPACITY}.get(experiment, SCRIPTS_DIR)
+    init = experiment == "init"
+    if init:
+        missing = [g for g in games if g not in INIT_SETTINGS]
+        if missing:
+            raise SystemExit(f"no INIT_SETTINGS for {missing}; add them or choose from "
+                             f"{sorted(INIT_SETTINGS)}")
+    scripts_dir = {"walltime": SCRIPTS_DIR_WALLTIME, "capacity": SCRIPTS_DIR_CAPACITY,
+                   "init": SCRIPTS_DIR_INIT}.get(experiment, SCRIPTS_DIR)
     log_dir = f"logs/{scripts_dir.name}"
     CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -679,7 +727,8 @@ def generate(
     for tag in games:
         game_config = game_configs[tag]
         for method in methods:
-            path = scripts_dir / f"{job_name(tag, method)}.sh"
+            label = init_label(method) if init else None
+            path = scripts_dir / f"{job_name(tag, label or method)}.sh"
             if walltime:
                 write_walltime_job_script(
                     path,
@@ -707,7 +756,11 @@ def generate(
                     time_h=time_h,
                     memory_g=memory_g,
                     gpu=gpu,
-                    settings=settings_flags(method, tag, settings_extra),
+                    settings=settings_flags(
+                        method, tag,
+                        [f"{k}={v}" for k, v in INIT_SETTINGS[tag].items()] + list(settings_extra)
+                        if init else settings_extra),
+                    label=label,
                 )
             job_scripts.append(path)
             written.append(path)
@@ -734,11 +787,14 @@ def generate(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--experiment", choices=("main", "walltime", "capacity"), default="main",
+    ap.add_argument("--experiment", choices=("main", "walltime", "capacity", "init"),
+                    default="main",
                     help="'main': the eval-matched run_all.py grid. 'walltime': the "
                          "wall-time-matched spg/jpspg re-run (no --budget; it is derived "
                          "per cell from --reference). 'capacity': the same eval-matched "
-                         "training once per mixture-component / bin count (--capacities)")
+                         "training once per mixture-component / bin count (--capacities). "
+                         "'init': the mixture from INIT_SETTINGS' off-equilibrium init, "
+                         "into the main tree as <method>__offset_init")
     ap.add_argument("--games", nargs="+", default=None, choices=sorted(GAMES),
                     metavar="TAG",
                     help="subset of GAMES to generate; default is every key in GAMES")
@@ -784,15 +840,16 @@ def main() -> None:
     # cheap methods, into its own tree, and derives its budget rather than taking one.
     walltime = args.experiment == "walltime"
     capacity = args.experiment == "capacity"
-    games = list(GAMES)
-    methods = list({"walltime": WALLTIME_METHODS, "capacity": CAPACITY_METHODS}
-                   .get(args.experiment, DEFAULT_METHODS))
+    games = list(INIT_SETTINGS) if args.experiment == "init" else list(GAMES)
+    methods = list({"walltime": WALLTIME_METHODS, "capacity": CAPACITY_METHODS,
+                    "init": INIT_METHODS}.get(args.experiment, DEFAULT_METHODS))
     seeds = list(DEFAULT_SEEDS)
     budget = DEFAULT_BUDGET
-    out = {"walltime": WALLTIME_OUT, "capacity": CAPACITY_OUT}.get(args.experiment,
-                                                                   DEFAULT_OUT)
+    out = {"walltime": WALLTIME_OUT, "capacity": CAPACITY_OUT,
+           "init": INIT_OUT}.get(args.experiment, DEFAULT_OUT)
     max_parallel = DEFAULT_MAX_PARALLEL
-    time_h = {"walltime": WALLTIME_TIME_H, "capacity": CAPACITY_TIME_H}.get(
+    time_h = {"walltime": WALLTIME_TIME_H, "capacity": CAPACITY_TIME_H,
+              "init": INIT_TIME_H}.get(
         args.experiment, DEFAULT_TIME_H)
     memory_g = DEFAULT_MEMORY_G
     gpu = DEFAULT_GPU
@@ -870,8 +927,8 @@ def main() -> None:
         score_time_h=score_time_h,
         capacities=capacities,
     )
-    scripts_dir = {"walltime": SCRIPTS_DIR_WALLTIME,
-                   "capacity": SCRIPTS_DIR_CAPACITY}.get(args.experiment, SCRIPTS_DIR)
+    scripts_dir = {"walltime": SCRIPTS_DIR_WALLTIME, "capacity": SCRIPTS_DIR_CAPACITY,
+                   "init": SCRIPTS_DIR_INIT}.get(args.experiment, SCRIPTS_DIR)
     n_configs = len(games)
     n_jobs = (len(capacity_cells(games, methods, capacities)) if capacity
               else len(games) * len(methods))

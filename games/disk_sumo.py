@@ -106,6 +106,33 @@ and velocity cannot. Each older sighting appends the opponent's position and
 velocity (and stamina, when that is on) to the end of the observation, newest
 first and all in the player's *current* frame, so the first 11 entries keep
 their meaning. It works without a delay too, as plain frame stacking.
+
+**Optional limited sensing.** `opponent_sensing` sets how much of the opponent
+a player perceives at all. `"full"` (the default) is everything above.
+`"bearing"` and `"none"` withdraw the opponent's position, velocity, edge
+margin and stamina; what is left is the player's own disk, the clock and a
+touch sensor -- the mean contact force on their own disk over the last control
+step -- and, under `"bearing"`, a rough direction to the opponent. Without the
+opponent's position a player can no longer be predicted from the state, only
+from their policy, so a deterministic policy is one a best response can walk up
+to and ambush; whoever wants not to be read has to randomize.
+  * The egocentric frame can no longer point at the opponent, so it is the
+    *radial* frame instead: x-axis from the ring centre out through the
+    player's own disk, y its left-hand perpendicular. "Push towards the
+    centre" is then the constant action `(-1, 0)`. `egocentric=False` keeps the
+    world frame, as before.
+  * The bearing is the angle to the opponent in that frame, plus a Gaussian
+    error of `bearing_noise` radians, cut into `bearing_bins` equal sectors and
+    shown one-hot. Sector 0 is centred on +x (opponent farther out than me),
+    and they count anticlockwise, so with 4 bins: outward, left, inward,
+    right. Without the error a change of sector would mark the moment the
+    opponent crosses a sector boundary, an exact bearing; the error, drawn
+    afresh every control step and the same for both decisions in it, blurs
+    those crossings.
+  * `observation_delay` delays the bearing, and `observation_frames > 1`
+    appends the older sectors, each with the error drawn at its time and read
+    in the current frame. Under `"none"` there is nothing to delay or
+    remember, and both are rejected.
 """
 
 from __future__ import annotations
@@ -130,6 +157,9 @@ _START_ATTEMPTS = 16
 # computation must not produce a NaN on the way to being discarded).
 _EPS = 1e-6
 
+# How much of the opponent a player perceives; see "Optional limited sensing".
+_SENSING = ("full", "bearing", "none")
+
 
 @chex.dataclass(frozen=True)
 class DiskSumoState:
@@ -145,6 +175,11 @@ class DiskSumoState:
     index `k` is the state `k + 1` control steps ago, so the opponent is shown
     entry `observation_delay - 1` and, with more frames, the ones after it.
     They have length zero when there is neither a delay nor a memory.
+    `past_bearing_error` is the same buffer for `bearing_error`.
+
+    `touch` is the mean contact force each disk felt over the last control
+    step, and `bearing_error` the angular error each player's bearing carries
+    this control step. Both are only observed under limited `opponent_sensing`.
 
     `result` is `+1`/`-1` once somebody has been pushed out and `0` otherwise;
     `done` marks that the bout ended early, including by the simultaneous-exit
@@ -160,6 +195,9 @@ class DiskSumoState:
     past_pos: chex.Array  # (history, 2, 2) float32
     past_vel: chex.Array  # (history, 2, 2) float32
     past_stamina: chex.Array  # (history, 2) float32
+    touch: chex.Array  # (2, 2) float32, world-frame mean contact force on each disk
+    bearing_error: chex.Array  # (2,) float32, radians, one per observing player
+    past_bearing_error: chex.Array  # (history, 2) float32
     result: chex.Array  # () float32 in {-1, 0, +1}, from player 0's side
     done: chex.Array  # () bool, the bout ended before the time limit
     turn: chex.Array  # () int32 in [0, 2 * horizon]
@@ -194,6 +232,9 @@ class DiskSumo(SequentialZeroSumGame):
         shaping_weight: float = 0.0,
         observation_delay: int = 0,
         observation_frames: int = 1,
+        opponent_sensing: str = "full",
+        bearing_bins: int = 4,
+        bearing_noise: float = 0.0,
     ):
         if horizon < 1:
             raise ValueError(f"horizon must be at least 1, got {horizon}")
@@ -206,6 +247,19 @@ class DiskSumo(SequentialZeroSumGame):
             raise ValueError(
                 f"observation_frames must be a whole number of sightings, at least 1, "
                 f"got {observation_frames}"
+            )
+        if opponent_sensing not in _SENSING:
+            raise ValueError(
+                f"opponent_sensing must be one of {_SENSING}, got {opponent_sensing!r}"
+            )
+        if bearing_bins < 2 or int(bearing_bins) != bearing_bins:
+            raise ValueError(f"bearing_bins must be a whole number, at least 2, got {bearing_bins}")
+        if bearing_noise < 0.0:
+            raise ValueError(f"bearing_noise must be non-negative, got {bearing_noise}")
+        if opponent_sensing == "none" and (observation_delay > 0 or observation_frames > 1):
+            raise ValueError(
+                "opponent_sensing='none' shows nothing of the opponent to delay or remember; "
+                f"got observation_delay={observation_delay}, observation_frames={observation_frames}"
             )
         if substeps < 1:
             raise ValueError(f"substeps must be at least 1, got {substeps}")
@@ -268,6 +322,9 @@ class DiskSumo(SequentialZeroSumGame):
         self.shaping_weight = float(shaping_weight)
         self.observation_delay = int(observation_delay)
         self.observation_frames = int(observation_frames)
+        self.opponent_sensing = str(opponent_sensing)
+        self.bearing_bins = int(bearing_bins)
+        self.bearing_noise = float(bearing_noise)
         # Control steps of the past a state carries: up to the oldest sighting.
         self._history = self.observation_delay + self.observation_frames - 1
         # Speed a lone disk settles at under full force: the natural velocity
@@ -290,6 +347,12 @@ class DiskSumo(SequentialZeroSumGame):
         # Disabled optional mechanics preserve old checkpoint input widths.
         # Strength and stamina must be visible so the policy can condition its
         # attacking/defending behavior on the current role and resources.
+        if self.opponent_sensing != "full":
+            # Own pos, vel and touch, own edge margin, time left; then the
+            # sector one-hots, the newest and each older one; own stamina only.
+            sectors = self.bearing_bins * (self.opponent_sensing == "bearing")
+            return (8 + 2 * (self.force_asymmetry > 0.0) + self.stamina_enabled
+                    + self.observation_frames * sectors)
         # Each older sighting is a position and a velocity, plus stamina when on.
         memory = (self.observation_frames - 1) * (4 + self.stamina_enabled)
         return 11 + 2 * (self.force_asymmetry > 0.0) + 2 * self.stamina_enabled + memory
@@ -317,6 +380,9 @@ class DiskSumo(SequentialZeroSumGame):
             past_pos=jnp.broadcast_to(pos, (history, 2, 2)),
             past_vel=jnp.zeros((history, 2, 2), dtype=jnp.float32),
             past_stamina=jnp.ones((history, 2), dtype=jnp.float32),
+            touch=jnp.zeros((2, 2), dtype=jnp.float32),
+            bearing_error=self._draw_bearing_error(jax.random.fold_in(key, 2)),
+            past_bearing_error=jnp.zeros((history, 2), dtype=jnp.float32),
             result=jnp.zeros((), dtype=jnp.float32),
             done=jnp.zeros((), dtype=bool),
             turn=jnp.zeros((), dtype=jnp.int32),
@@ -399,7 +465,11 @@ class DiskSumo(SequentialZeroSumGame):
         end, newest first: the opponent's position and velocity (then stamina,
         if enabled) one control step further back each time, scaled as above
         and rotated into the same, current frame.
+
+        Under limited `opponent_sensing` the layout is `_sensed_observation`'s.
         """
+        if self.opponent_sensing != "full":
+            return self._sensed_observation(player, state)
         own, opp = player, 1 - player
         own_pos = state.pos[own]
         opp_pos, opp_vel, opp_stamina = self._seen_opponent(state, player)
@@ -434,6 +504,65 @@ class DiskSumo(SequentialZeroSumGame):
                 sighting.append(past_stamina[None])
             observation = jnp.concatenate([observation, *sighting])
         return observation
+
+    def _sensed_observation(self, player: int, state: DiskSumoState) -> chex.Array:
+        """`(8,)` and extras: what a player perceives without seeing the opponent.
+
+        Own position, velocity and touch (the mean contact force on the own
+        disk, in units of `max_force`), all in the radial frame; own edge
+        margin; time left. Then both force multipliers and own stamina when
+        those mechanics are on, and under `"bearing"` the opponent's sector,
+        one-hot, newest first for each of the `observation_frames` sightings.
+        """
+        own = player
+        own_pos = state.pos[own]
+        rotation = self._radial_frame(own_pos)
+        time_left = 1.0 - (state.turn // 2).astype(jnp.float32) / self.horizon
+        observation = jnp.concatenate([
+            rotation @ own_pos / self.ring_radius,
+            rotation @ state.vel[own] / self._speed_scale,
+            rotation @ state.touch[own] / self.max_force,
+            jnp.stack([1.0 - jnp.linalg.norm(own_pos) / self.ring_radius, time_left]),
+        ])
+        if self.force_asymmetry > 0.0:
+            observation = jnp.concatenate([
+                observation,
+                jnp.stack([state.force_multiplier[own], state.force_multiplier[1 - own]]),
+            ])
+        if self.stamina_enabled:
+            observation = jnp.concatenate([observation, state.stamina[own][None]])
+        if self.opponent_sensing == "bearing":
+            observation = jnp.concatenate([
+                observation,
+                *(self._sector(state, player, frame) for frame in range(self.observation_frames)),
+            ])
+        return observation
+
+    def _sector(self, state: DiskSumoState, player, frame: int = 0) -> chex.Array:
+        """`(bearing_bins,)` one-hot: the sector `player` senses the opponent in.
+
+        The opponent is the one `_seen_opponent` returns for `frame`, the error
+        the one drawn at that time, and the frame the current radial one.
+        """
+        own_pos = state.pos[player]
+        opp_pos = self._seen_opponent(state, player, frame)[0]
+        age = self.observation_delay + frame
+        error = (
+            state.bearing_error[player] if age == 0
+            else state.past_bearing_error[age - 1, player]
+        )
+        towards = self._radial_frame(own_pos) @ (opp_pos - own_pos)
+        width = 2.0 * jnp.pi / self.bearing_bins
+        angle = jnp.arctan2(towards[1], towards[0]) + error
+        # Sector 0 is centred on +x; `%` wraps negative angles round.
+        index = jnp.floor(angle / width + 0.5).astype(jnp.int32) % self.bearing_bins
+        return jax.nn.one_hot(index, self.bearing_bins, dtype=jnp.float32)
+
+    def _draw_bearing_error(self, key: chex.PRNGKey) -> chex.Array:
+        """`(2,)`: this control step's bearing error for each observing player."""
+        if self.opponent_sensing != "bearing" or self.bearing_noise == 0.0:
+            return jnp.zeros((2,), dtype=jnp.float32)
+        return self.bearing_noise * jax.random.normal(key, (2,), dtype=jnp.float32)
 
     def _seen_opponent(self, state: DiskSumoState, player, frame: int = 0):
         """`(pos, vel, stamina)` of `player`'s opponent as `player` sees it.
@@ -477,14 +606,15 @@ class DiskSumo(SequentialZeroSumGame):
         return jnp.clip((radii[1] - radii[0]) / self.ring_radius, -1.0, 1.0)
 
     def _step(self, state: DiskSumoState, action: HybridAction, key: chex.PRNGKey) -> DiskSumoState:
-        del key  # the physics is deterministic; the only chance is the start
+        # The physics is deterministic; besides the start, the only chance is
+        # the bearing error, drawn afresh for the next control step.
         player = state.turn % 2
         force, effort = self._world_force(state, player, action.value)
         efforts = jnp.stack([state.pending_effort, effort])
 
         # Player 0 only parks their force; player 1's choice closes the control
         # step, and both branches are computed because `player` is traced.
-        pos, vel, result, done = self._integrate(
+        pos, vel, result, done, touch = self._integrate(
             state, state.pos, state.vel, jnp.stack([state.pending, force]), efforts
         )
         resolves = player == 1
@@ -513,6 +643,15 @@ class DiskSumo(SequentialZeroSumGame):
             past_stamina=jnp.where(
                 resolves, self._remember(state.past_stamina, state.stamina), state.past_stamina
             ),
+            touch=jnp.where(resolves, touch, state.touch),
+            bearing_error=jnp.where(
+                resolves, self._draw_bearing_error(key), state.bearing_error
+            ),
+            past_bearing_error=jnp.where(
+                resolves,
+                self._remember(state.past_bearing_error, state.bearing_error),
+                state.past_bearing_error,
+            ),
             result=jnp.where(resolves, result, state.result),
             done=jnp.where(resolves, done, state.done),
             turn=state.turn + 1,
@@ -529,9 +668,9 @@ class DiskSumo(SequentialZeroSumGame):
         which has to recompute player 1's force: it is never stored in a state.
 
         The frame is the one `observation` uses, so under `observation_delay`
-        its x-axis points at the opponent's delayed position, not the true one.
+        its x-axis points at the opponent's delayed position, not the true one,
+        and under limited `opponent_sensing` it is the radial frame.
         """
-        own, opp = state.pos[player], self._seen_opponent(state, player)[0]
         # Keep the state's dtype: a float64 action (x64 on) would otherwise
         # promote `pending`, `pos` and `vel`, and break the scans that carry them.
         local = self._space.box.clip(value).astype(state.pos.dtype)
@@ -542,12 +681,19 @@ class DiskSumo(SequentialZeroSumGame):
             1.0,
         )
         force = self.max_force * state.force_multiplier[player] * stamina_scale * (
-            self._frame(own, opp).T @ local
+            self._player_frame(state, player).T @ local
         )
         return force, jnp.linalg.norm(local)
 
+    def _player_frame(self, state: DiskSumoState, player) -> chex.Array:
+        """`(2, 2)`: the frame `player` observes and acts in, whichever sensing is on."""
+        own = state.pos[player]
+        if self.opponent_sensing != "full":
+            return self._radial_frame(own)
+        return self._frame(own, self._seen_opponent(state, player)[0])
+
     def _integrate(self, state: DiskSumoState, pos, vel, forces, efforts):
-        """Advance one control step from `pos, vel`; return `(pos, vel, result, done)`.
+        """Advance one control step from `pos, vel`; return `(pos, vel, result, done, touch)`.
 
         `state` supplies the bodies and `efforts` is `(2,)`. Both disks are
         identical here, so this is `_simulate`; subclasses with per-disk bodies
@@ -574,20 +720,38 @@ class DiskSumo(SequentialZeroSumGame):
         left = jnp.stack([-forward[1], forward[0]])
         return jnp.stack([forward, left])
 
+    def _radial_frame(self, own: chex.Array) -> chex.Array:
+        """`(2, 2)`: x outward from the ring centre through `own`; the identity unless `egocentric`.
+
+        At the very centre the direction is undefined and the world x-axis
+        stands in.
+        """
+        if not self.egocentric:
+            return jnp.eye(2, dtype=jnp.float32)
+        radius = jnp.linalg.norm(own)
+        outward = jnp.where(
+            radius > _EPS,
+            own / jnp.maximum(radius, _EPS),
+            jnp.array([1.0, 0.0], dtype=own.dtype),
+        )
+        return jnp.stack([outward, jnp.stack([-outward[1], outward[0]])])
+
     def _simulate(self, pos: chex.Array, vel: chex.Array, forces: chex.Array):
-        """Advance one control step; return `(pos, vel, result, done)`.
+        """Advance one control step; return `(pos, vel, result, done, touch)`.
 
         Semi-implicit Euler over `substeps` substeps of `dt / substeps`. The
         contact is a spring-damper along the line of centres, active only while
         the disks overlap and never pulling them together. A disk is out once
         its centre is beyond the ring; the substep at which each disk first went
         out is tracked, so a simultaneous exit is settled by who left first.
+        `touch` is the `(2, 2)` contact force on each disk, averaged over the
+        substeps.
         """
         h = self.dt / self.substeps
         never = self.substeps
 
         def body(i, carry):
-            pos, vel, exit_at = carry
+            pos, vel, exit_at, touch = carry
             delta = pos[1] - pos[0]
             distance = jnp.linalg.norm(delta)
             normal = delta / jnp.maximum(distance, _EPS)
@@ -603,10 +767,12 @@ class DiskSumo(SequentialZeroSumGame):
             pos = pos + h * vel
             out = jnp.linalg.norm(pos, axis=-1) > self.ring_radius
             exit_at = jnp.where(out & (exit_at == never), i, exit_at)
-            return pos, vel, exit_at
+            return pos, vel, exit_at, touch + contact
 
         exit_at = jnp.full((2,), never, dtype=jnp.int32)
-        pos, vel, exit_at = jax.lax.fori_loop(0, self.substeps, body, (pos, vel, exit_at))
+        pos, vel, exit_at, touch = jax.lax.fori_loop(
+            0, self.substeps, body, (pos, vel, exit_at, jnp.zeros_like(vel))
+        )
 
         out_0, out_1 = exit_at[0] < never, exit_at[1] < never
         # `exit_at` is `never` for a disk still inside, so one comparison covers
@@ -614,4 +780,4 @@ class DiskSumo(SequentialZeroSumGame):
         result = jnp.where(
             exit_at[0] < exit_at[1], -1.0, jnp.where(exit_at[1] < exit_at[0], 1.0, 0.0)
         ).astype(jnp.float32)
-        return pos, vel, result, out_0 | out_1
+        return pos, vel, result, out_0 | out_1, touch / self.substeps

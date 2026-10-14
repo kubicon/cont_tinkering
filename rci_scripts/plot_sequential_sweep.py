@@ -331,7 +331,12 @@ def draw_panel(ax, by_config: dict[str, list[dict]], x_axis: str, *, samples: st
                min_seeds: int = 1) -> None:
     panels = []
     for config in sorted(by_config, key=sort_key):
-        curves = [run_curve(r, x_axis, samples, target) for r in by_config[config]]
+        # An excluded method's capacity cells are kept for `{game}__capacity`, but
+        # stay off the training-curve panels like its plain runs.
+        capacity = capacity_of(config)
+        if capacity is not None and plot_style.excluded_baseline(capacity[0]):
+            continue
+        curves =[run_curve(r, x_axis, samples, target) for r in by_config[config]]
         pooled = pool_seeds(curves, min_seeds)
         if pooled is not None:
             panels.append((config, curves, pooled))

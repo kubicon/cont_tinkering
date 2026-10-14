@@ -1,0 +1,125 @@
+# python train.py configs/disk_sumo_ablation/k4_magnet.yaml
+#
+# One cell of the disk-sumo ablation: PPO self-play with
+# `num_components` in {1, 4} x magnet in {on, off}. This one: 4 components, magnet on (both magnet KL coefficients 0.2).
+#
+# The physics is `configs/disk_sumo_delayed.yaml`'s with the bout three times as long
+# (`horizon: 150`, 300 decisions, 15 s), but the opponent is not seen: only a
+# touch sensor and a noisy 4-sector bearing (`opponent_sensing: bearing`), from
+# the facing start. The four cells differ only in
+# `network.num_components`, `ppo.magnet_category_kl_coef`,
+# `ppo.magnet_gaussian_kl_coef` and `train.checkpoint_dir`. With one component
+# the categorical head has a single entry, so only the Gaussian magnet acts.
+#
+# Measure the checkpoint with
+# `python best_response.py configs/disk_sumo_ablation/k4_magnet_br.yaml`.
+
+game:
+  name: disk_sumo
+  horizon: 150             # control steps; 2 * horizon decisions. 15 s, three times the `disk_sumo_delayed` bout
+  ring_radius: 1.0
+  disk_radius: 0.15
+  start_distance: 0.6     # centre-to-centre at the start
+  start_jitter: 0.05      # per-coordinate start noise
+  random_orientation: true
+  # The facing start, on purpose. Each player knows where the other begins, so
+  # the only uncertainty about the opponent is the one their policy creates.
+  # A random start would hide the opponent by chance instead, and that outside
+  # noise could stand in for the mixing this ablation is trying to measure.
+  random_start: false
+  egocentric: true        # under limited sensing: the radial frame, x out through the own disk
+  dt: 0.1                 # seconds per control step
+  substeps: 20            # the contact spring is 4x stiffer; same resolution per oscillation
+  mass: 1.0
+  # Acceleration 4 (base: 1): a disk at rest shifts its own width in 0.39 s.
+  max_force: 4.0
+  # `mass / drag` is how long a disk keeps its speed: 1 s against a 15 s bout (5 s in
+  # `disk_sumo_delayed`). Top speed (`max_force / drag`) is 4.
+  drag: 1.0
+  # The base contact (400, 10) rescaled with the forces: same squash, same
+  # 0.35 damping ratio.
+  stiffness: 1600.0
+  contact_damping: 20.0
+  # Pure sumo: a push-out is worth 1 and a timeout nothing.
+  margin_weight: 0.0
+  shaping_weight: 0.0
+  # The opponent is not seen. A player perceives their own disk, the clock, a
+  # touch sensor (the contact force on their own disk) and the opponent's rough
+  # direction: one of 4 sectors of the radial frame -- outward, left, inward,
+  # right. The bearing gets a fresh 0.3 rad (~17 deg) Gaussian error every
+  # control step before it is binned, so a change of sector does not give away
+  # the exact angle. The observation is 8 + 4 = 12 wide.
+  opponent_sensing: bearing
+  bearing_bins: 4
+  bearing_noise: 0.3
+  observation_delay: 0
+  observation_frames: 1
+
+network:
+  policy: gaussian_mixture  # the only policy a sequential game supports
+  hidden_dims: [128, 128]
+  activation: gelu
+  normalization: rms_norm
+  num_components: 4
+  # Per-component covariance. The action is 2-D, so a full covariance can tilt a
+  # component's ellipse; diagonal keeps it axis-aligned.
+  full_covariance: false
+  scale_parameterization: log   # "log" or "linear"
+  max_correlation: 0.0          # full_covariance + log only; 0 = unbounded
+  sigma_min: 0.1               # null = built-in floor (1e-3)
+  sigma_max: null               # null = box width
+  # Confine each component to its own bucket of the box (equal-area boxes, any
+  # num_components; a regular grid for 1, 4, 9, ...). Pair with sigma_min ~
+  # bucket/4, a bucket being ~ box width / sqrt(num_components) across.
+  bucket_means: false
+  clip_means: true        # keep the means in the [-1, 1]^2 force box
+  mean_box_penalty_coef: 1.0    # pulls drifted means back to the box edge
+
+optimizer:
+  learning_rate: 0.0003
+  max_grad_norm: 0.5
+  optimizer: adam         # see training/optimizers.py for the choices
+  weight_decay: 0.0       # only used by adamw / muon
+
+ppo:
+  clip_eps: 0.1
+  value_coef: 0.5
+  batch_size: 512
+  ppo_epochs: 1
+  target_tau: 0.001
+  magnet_interval: 4000
+
+  # With this probability a sampled force is replaced by a uniform draw on the
+  # box (on the component's bucket under `network.bucket_means`); V-trace
+  # importance-weights it back to the policy. 0 disables.
+  explore_eps: 0.0
+
+  # V-trace over each player's own decisions (`training/vtrace.py`). gamma 1
+  # keeps the zero-sum objective; lambda < 1 is the variance reduction. The
+  # importance weights correct a player's own exploration (`explore_eps`) and
+  # any drift over `ppo_epochs`; `vtrace_opponent_correction` handles the opponent's.
+  advantage: vtrace
+  gamma: 1.0
+  vtrace_lambda: 0.95
+  vtrace_rho_bar: 2.0
+  vtrace_c_bar: 1.0
+  # Correct the opponent's exploration after each own decision; not before it.
+  # The delay makes the past matter (it shapes beliefs), so `future_and_past`
+  # is worth trying here; see training/vtrace.py.
+  vtrace_opponent_correction: future
+
+  # No atoms: the categorical head only picks which force component to use.
+  category_entropy_coef: 0.04
+  gaussian_entropy_coef: 0.04
+
+  trpo_category_kl_coef: 0.05
+  trpo_gaussian_kl_coef: 0.05
+  magnet_category_kl_coef: 0.2
+  magnet_gaussian_kl_coef: 0.2
+
+train:
+  mode: self_play         # the only mode a sequential game supports
+  steps: 15               # outer steps: each logs and writes a checkpoint
+  epochs: 4000             # training iterations per outer step
+  checkpoint_dir: data/disk_sumo_ablation/k4_magnet
+  seed: 0

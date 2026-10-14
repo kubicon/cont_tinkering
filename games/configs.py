@@ -332,6 +332,14 @@ class DiskSumoConfig:
     # `observation_delay` old, and `observation_frames - 1` older ones, one
     # control step apart. 1 is the single sighting; more is a memory.
     observation_frames: int = 1
+    # How much of the opponent a player perceives: "full" (everything above),
+    # "bearing" (only a rough direction to them, plus a touch sensor) or "none"
+    # (the touch sensor alone). Limited sensing switches to the radial frame.
+    opponent_sensing: str = "full"
+    # Under "bearing": sectors the direction is cut into, and the Gaussian
+    # error in radians added to the true bearing before it is binned.
+    bearing_bins: int = 4
+    bearing_noise: float = 0.0
 
     def build(self) -> SequentialZeroSumGame:
         return DiskSumo(**dataclasses.asdict(self))

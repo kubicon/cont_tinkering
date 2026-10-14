@@ -22,6 +22,15 @@ sequentially; parallelism comes only from SLURM running many jobs at once.
     bash scripts/failing_gaussian_rerun/run_all.sh
     bash scripts/failing_gaussian_rerun/run_all_score.sh    # once training is done
     bash scripts/failing_gaussian_rerun/plot.sh
+
+`--offset-init` generates the same for the 6 `ppo` cells only, started at the cell's
+`idealized.init_means` rather than the box midpoint (the Nash; see `run_cell.py`), into
+`scripts/failing_gaussian_rerun_offset_init/` and `data/failing_gaussian_rerun_offset_init`:
+
+    python rci_scripts/generate_failing_gaussian_rerun.py --offset-init
+    bash scripts/failing_gaussian_rerun_offset_init/run_all.sh
+    bash scripts/failing_gaussian_rerun_offset_init/run_all_score.sh
+    bash scripts/failing_gaussian_rerun_offset_init/plot.sh
 """
 
 from __future__ import annotations
@@ -35,11 +44,12 @@ from utils import prepare_default_script
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_DIR = REPO_ROOT / "experiments" / "failing_gaussian_wo_magnet" / "rerun"
 SCRIPTS_DIR = REPO_ROOT / "scripts" / "failing_gaussian_rerun"
-LOG_DIR = "logs/failing_gaussian_rerun"
+SCRIPTS_DIR_OFFSET_INIT = REPO_ROOT / "scripts" / "failing_gaussian_rerun_offset_init"
 RUN_CELL = "experiments/failing_gaussian_wo_magnet/rerun/run_cell.py"
 PLOT = "experiments/failing_gaussian_wo_magnet/rerun/plot.py"
 
 DEFAULT_OUT = "data/failing_gaussian_rerun_seeds"
+OFFSET_INIT_OUT = "data/failing_gaussian_rerun_offset_init"
 DEFAULT_SEEDS = (0, 1, 2, 3, 4)
 DEFAULT_MEMORY_G = 16
 DEFAULT_GPU = False
@@ -102,13 +112,14 @@ def write_script(path: Path, text: str) -> None:
 
 
 def write_train_job(path: Path, cell: str, seeds: list[int], out: str, memory_g: int,
-                    gpu: bool) -> None:
+                    gpu: bool, offset_init: bool) -> None:
     seeds_str = " ".join(str(s) for s in seeds)
+    flags = " \\\n  --offset-init" if offset_init else ""
     body = f"""
 export PYTHONUNBUFFERED=1
 python {RUN_CELL} {cell} \\
   --seeds {seeds_str} \\
-  --out {out}
+  --out {out}{flags}
 """
     write_script(path, header(train_hours(cell, len(seeds)), memory_g, gpu) + body)
 
@@ -125,13 +136,14 @@ python {PLOT} --out {out} --cells {cell} --no-plots{flags}
 
 
 def write_submit_all(path: Path, jobs: list[Path], note: str = "") -> None:
+    log_dir = f"logs/{path.parent.name}"
     lines = ["#!/bin/sh", ""]
     if note:
         lines += [f"# {note}", ""]
-    lines += [f"mkdir -p {LOG_DIR}", ""]
+    lines += [f"mkdir -p {log_dir}", ""]
     for job in jobs:
-        lines.append(f"sbatch -o {LOG_DIR}/{job.stem}.log {job.relative_to(REPO_ROOT).as_posix()}")
-    lines += ["", f'echo "submitted {len(jobs)} jobs; logs in {LOG_DIR}"']
+        lines.append(f"sbatch -o {log_dir}/{job.stem}.log {job.relative_to(REPO_ROOT).as_posix()}")
+    lines += ["", f'echo "submitted {len(jobs)} jobs; logs in {log_dir}"']
     write_script(path, "\n".join(lines) + "\n")
 
 
@@ -151,9 +163,16 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cells", nargs="+", default=None, choices=all_cells(), metavar="CELL",
-                    help="subset of the grid (default: all 18)")
+                    help="subset of the grid (default: all 18, or the 6 ppo cells under "
+                         "--offset-init)")
     ap.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
-    ap.add_argument("--out", default=DEFAULT_OUT, help="checkpoint tree, passed to run_cell.py")
+    ap.add_argument("--offset-init", action="store_true",
+                    help="ppo cells started at idealized.init_means instead of the Nash, "
+                         f"into {SCRIPTS_DIR_OFFSET_INIT.relative_to(REPO_ROOT)}/ and "
+                         f"{OFFSET_INIT_OUT}")
+    ap.add_argument("--out", default=None,
+                    help=f"checkpoint tree, passed to run_cell.py (default: {DEFAULT_OUT}, "
+                         f"or {OFFSET_INIT_OUT} under --offset-init)")
     ap.add_argument("--memory", type=int, default=DEFAULT_MEMORY_G, dest="memory_g")
     ap.add_argument("--gpu", action="store_true", default=DEFAULT_GPU)
     ap.add_argument("--with-std", dest="no_std", action="store_false", default=DEFAULT_NO_STD,
@@ -161,23 +180,29 @@ def main() -> None:
                          "and plot.sh pass --no-std (every sigma set to 0)")
     args = ap.parse_args()
 
-    cells = args.cells or all_cells()
+    offset_init = args.offset_init
+    cells = args.cells or [c for c in all_cells() if not offset_init or c.endswith("_ppo")]
+    if offset_init and (bad := [c for c in cells if not c.endswith("_ppo")]):
+        raise SystemExit(f"--offset-init is for ppo cells only; the idealized / sampled ones "
+                         f"already start at idealized.init_means: {bad}")
+    scripts_dir = SCRIPTS_DIR_OFFSET_INIT if offset_init else SCRIPTS_DIR
+    out = args.out or (OFFSET_INIT_OUT if offset_init else DEFAULT_OUT)
     train_jobs, score_jobs = [], []
     for cell in cells:
-        path = SCRIPTS_DIR / f"{cell}.sh"
-        write_train_job(path, cell, cell_seeds(cell, args.seeds), args.out,
-                        args.memory_g, args.gpu)
+        path = scripts_dir / f"{cell}.sh"
+        write_train_job(path, cell, cell_seeds(cell, args.seeds), out,
+                        args.memory_g, args.gpu, offset_init)
         train_jobs.append(path)
-        path = SCRIPTS_DIR / f"score_{cell}.sh"
-        write_score_job(path, cell, args.out, args.no_std)
+        path = scripts_dir / f"score_{cell}.sh"
+        write_score_job(path, cell, out, args.no_std)
         score_jobs.append(path)
 
-    write_submit_all(SCRIPTS_DIR / "run_all.sh", train_jobs)
-    write_submit_all(SCRIPTS_DIR / "run_all_score.sh", score_jobs,
+    write_submit_all(scripts_dir / "run_all.sh", train_jobs)
+    write_submit_all(scripts_dir / "run_all_score.sh", score_jobs,
                      note="Submit only after every run_all.sh job has finished.")
-    write_plot(SCRIPTS_DIR / "plot.sh", args.out, args.no_std)
+    write_plot(scripts_dir / "plot.sh", out, args.no_std)
 
-    rel = SCRIPTS_DIR.relative_to(REPO_ROOT)
+    rel = scripts_dir.relative_to(REPO_ROOT)
     print(f"wrote {len(train_jobs)} training + {len(score_jobs)} scoring jobs under {rel}")
     for cell in cells:
         seeds = cell_seeds(cell, args.seeds)
